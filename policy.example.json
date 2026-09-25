@@ -1,0 +1,13 @@
+{
+  "allowlist": ["bcrt1qexamplemerchant"],
+  "max_per_tx_sats": 100000000,
+  "daily_budget_sats": 200000000,
+  "weekly_budget_sats": 500000000,
+  "per_counterparty_cap_sats": 100000000,
+  "velocity_max": 20,
+  "velocity_window_s": 3600,
+  "human_threshold_sats": 10000000,
+  "split_window_s": 600,
+  "approval_ttl_s": 3600,
+  "recovery_address": "bcrt1qexamplerecovery"
+}
