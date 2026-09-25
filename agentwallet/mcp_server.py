@@ -1,6 +1,6 @@
 """MCP surface. Talks only to the signer socket. No RPC, no keys.
 
-The tool list is fixed: balance, quote_payment, pay, history.
+The tool list is fixed: balance, quote_payment, pay, history, channels, xbt402_pay.
 approve and recover_vault are intentionally absent — a model cannot
 self-approve. Humans use the out-of-band agentwallet-approve CLI.
 """
@@ -15,8 +15,9 @@ from .sanitize import assert_no_key_material, sanitize
 from .signer import SignerClient
 
 # Exact MCP surface. Tests assert this set.
-MCP_TOOL_NAMES = frozenset({"balance", "quote_payment", "pay", "history"})
-FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault"})
+# Wave 2 adds channels + xbt402_pay. approve / recover_vault stay off the model.
+MCP_TOOL_NAMES = frozenset({"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"})
+FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault", "recover_treasury"})
 
 
 def _client() -> SignerClient:
@@ -64,6 +65,18 @@ def _build_server():
     def history(limit: int = 20) -> str:
         """Append-only policy audit log (decisions and commits)."""
         return _pack(_client().call("history", limit=limit))
+
+    @mcp.tool()
+    def channels() -> str:
+        """List Spillman channels: dest, cap_sats, used_sats, expiry. No keys."""
+        return _pack(_client().call("channels"))
+
+    @mcp.tool()
+    def xbt402_pay(url: str, method: str = "GET", body: str = "", max_sats: int = 1000) -> str:
+        """Pay an xbt-channel 402 through the policy engine. Keys stay in the signer."""
+        return _pack(
+            _client().call("xbt402_pay", url=url, method=method, body=body, max_sats=int(max_sats))
+        )
 
     return mcp
 

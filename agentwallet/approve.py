@@ -72,7 +72,9 @@ def main(argv: list[str] | None = None) -> int:
         signature=b2x(sig),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
-    if result.get("verdict") != "allow" or not result.get("txid"):
+    if result.get("verdict") != "allow":
+        return 1
+    if not (result.get("txid") or result.get("chan")):
         return 1
     return 0
 

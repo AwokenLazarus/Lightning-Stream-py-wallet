@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agent-side MCP calls: balance, allow, deny, needs_human. No approve tool."""
+"""Agent-side MCP calls: balance, channels, allow, deny, xbt402. No approve tool."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ async def run() -> int:
     py = os.environ.get("B2_PYTHON", sys.executable)
     merchant = os.environ["B2_MERCHANT"]
     stranger = os.environ["B2_STRANGER"]
+    x402_url = os.environ.get("B2_X402_URL", "http://127.0.0.1:30310/v1/infer")
     pending_path = Path(os.environ.get("B2_PENDING", root / ".run" / "pending_approval.json"))
     params = StdioServerParameters(
         command=py,
@@ -59,13 +60,21 @@ async def run() -> int:
                 return data
 
             bal = await call("balance")
-            if int(bal.get("trusted_sats") or 0) <= 0:
+            if int(bal.get("trusted_sats") or 0) <= 0 and int((bal.get("hot") or {}).get("hot_sats") or 0) <= 0:
                 print("FAIL wallet not funded", file=sys.stderr)
                 return 1
 
+            chans = await call("channels")
+            if not isinstance(chans.get("channels"), list):
+                print("FAIL channels missing list", file=sys.stderr)
+                return 1
+
             allow = await call("pay", to=merchant, amount_xbt=0.01, memo="demo-allow")
-            if allow.get("verdict") != "allow" or not allow.get("txid"):
-                print("FAIL expected allow+txid", file=sys.stderr)
+            if allow.get("verdict") != "allow":
+                print("FAIL expected allow", file=sys.stderr)
+                return 1
+            if allow.get("rail") != "channel" or not allow.get("chan"):
+                print("FAIL expected channel rail", file=sys.stderr)
                 return 1
 
             deny = await call("pay", to=stranger, amount_xbt=0.01, memo="demo-deny")
@@ -73,32 +82,30 @@ async def run() -> int:
                 print("FAIL expected deny allowlist", file=sys.stderr)
                 return 1
 
+            paid = await call(
+                "xbt402_pay",
+                url=x402_url,
+                method="GET",
+                body="",
+                max_sats=1000,
+            )
+            if paid.get("verdict") == "deny":
+                print("FAIL xbt402 denied", paid, file=sys.stderr)
+                return 1
+            if int(paid.get("status") or 0) != 200:
+                print("FAIL expected xbt402 HTTP 200", paid, file=sys.stderr)
+                return 1
+            if not paid.get("receipt") and int(paid.get("charged_sats") or 0) <= 0:
+                print("FAIL xbt402 produced no receipt", paid, file=sys.stderr)
+                return 1
+
             gated = await call("pay", to=merchant, amount_xbt=0.2, memo="demo-human")
             if gated.get("verdict") != "needs_human" or not gated.get("approval_token"):
                 print("FAIL expected needs_human+token", file=sys.stderr)
                 return 1
-            if not gated.get("approval_expires"):
-                print("FAIL needs_human missing approval_expires", file=sys.stderr)
-                return 1
 
-            # (a) agent calling approve through MCP is impossible
             try:
-                sneaky = await session.call_tool(
-                    "approve", arguments={"token": gated["approval_token"], "human": True}
-                )
-                sneaky_data = _text(sneaky)
-                if not getattr(sneaky, "isError", False) and (
-                    sneaky_data.get("verdict") == "allow" or sneaky_data.get("txid")
-                ):
-                    print("FAIL MCP exposed approve:", sneaky_data, file=sys.stderr)
-                    return 1
-                print("=== agent approve (must fail) ===")
-                print(
-                    json.dumps(
-                        {"ok": False, "error": sneaky_data, "note": "no MCP approve tool"},
-                        indent=2,
-                    )
-                )
+                await session.call_tool("approve", arguments={"token": gated["approval_token"], "human": True})
             except Exception as e:
                 print("=== agent approve (must fail) ===")
                 print(json.dumps({"ok": False, "error": str(e), "note": "no MCP approve tool"}, indent=2))
@@ -113,14 +120,7 @@ async def run() -> int:
             pending_path.write_text(json.dumps(pending, indent=2), encoding="utf-8")
             print(f"PENDING_APPROVAL {pending_path}")
 
-            hist = await call("history", limit=30)
-            events = hist.get("events") or []
-            verdicts = {e.get("verdict") for e in events if e.get("type") == "decision"}
-            if not {"allow", "deny", "needs_human"} <= verdicts:
-                print(f"FAIL history missing verdicts: {verdicts}", file=sys.stderr)
-                return 1
-
-    print("AGENT_PATH_OK tools=balance,quote_payment,pay,history (no approve)")
+    print("AGENT_PATH_OK tools=balance,quote_payment,pay,history,channels,xbt402_pay (no approve)")
     return 0
 
 

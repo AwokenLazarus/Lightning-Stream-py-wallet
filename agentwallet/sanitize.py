@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 _KEY_NAMES = re.compile(
-    r"(priv|wif|seed|xprv|xpub|descriptor|cookie|rpcpassword|passphrase|mnemonic|secretkey)",
+    r"(priv|wif|seed|xprv|xpub|descriptor|cookie|rpcpassword|passphrase|mnemonic|secret)",
     re.I,
 )
 # WIF / extended keys only. 64-hex is a txid and must stay in MCP responses.

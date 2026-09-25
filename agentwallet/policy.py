@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
+from urllib.parse import urlparse
 
 
 DAY_S = 24 * 3600
@@ -25,6 +26,20 @@ class Verdict(str, Enum):
     NEEDS_HUMAN = "needs_human"
 
 
+def normalize_dest(dest: str) -> str:
+    """Bech32 addresses fold case; HTTP dests collapse to origin; anything else is stripped."""
+    dest = (dest or "").strip()
+    if not dest:
+        return ""
+    if dest.lower().startswith(("bc1", "bcrt1", "tb1")):
+        return dest.lower()
+    if dest.startswith(("http://", "https://")):
+        p = urlparse(dest)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    return dest
+
+
 @dataclass(frozen=True)
 class Payment:
     dest: str
@@ -33,11 +48,8 @@ class Payment:
     ts: float = 0.0
 
     def normalized(self, now: float) -> "Payment":
-        dest = (self.dest or "").strip()
-        if dest.lower().startswith(("bc1", "bcrt1", "tb1")):
-            dest = dest.lower()
         return Payment(
-            dest=dest,
+            dest=normalize_dest(self.dest),
             amount_sats=int(self.amount_sats),
             memo=self.memo or "",
             ts=self.ts or now,
@@ -75,16 +87,22 @@ class PolicyConfig:
     human_threshold_sats: int = 10_000_000
     split_window_s: int = 600
     approval_ttl_s: int = 900
+    channel_expiry_blocks: int = 1008
+    treasury_csv: int = 4320
+    counterparties: dict = field(default_factory=dict)
 
     def normalized_allowlist(self) -> frozenset[str]:
         out = set()
         for a in self.allowlist:
-            a = (a or "").strip()
-            if a.lower().startswith(("bc1", "bcrt1", "tb1")):
-                a = a.lower()
+            a = normalize_dest(a)
             if a:
                 out.add(a)
         return frozenset(out)
+
+    def pay_to_for(self, dest: str) -> str:
+        dest = normalize_dest(dest)
+        info = (self.counterparties or {}).get(dest) or {}
+        return (info.get("pay_to") or "").strip()
 
     @classmethod
     def from_dict(cls, raw: dict) -> "PolicyConfig":
@@ -99,8 +117,12 @@ class PolicyConfig:
             "human_threshold_sats",
             "split_window_s",
             "approval_ttl_s",
+            "channel_expiry_blocks",
+            "treasury_csv",
         }
         kwargs = {k: raw[k] for k in fields if k in raw}
+        cps = raw.get("counterparties") or {}
+        kwargs["counterparties"] = {normalize_dest(k): v for k, v in cps.items()}
         return cls(allowlist=frozenset(allow), **kwargs)
 
     def to_dict(self) -> dict:

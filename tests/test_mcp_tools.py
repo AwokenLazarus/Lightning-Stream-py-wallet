@@ -1,4 +1,4 @@
-"""MCP surface is exactly balance, quote_payment, pay, history."""
+"""MCP surface is balance, quote_payment, pay, history, channels, xbt402_pay."""
 
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ from agentwallet.mcp_server import (
 
 class McpToolListTests(unittest.TestCase):
     def test_published_name_set(self):
-        self.assertEqual(MCP_TOOL_NAMES, {"balance", "quote_payment", "pay", "history"})
+        self.assertEqual(
+            MCP_TOOL_NAMES,
+            {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"},
+        )
         self.assertTrue(FORBIDDEN_MCP_TOOLS.isdisjoint(MCP_TOOL_NAMES))
 
     def test_registered_tools_match_exactly(self):
@@ -22,11 +25,14 @@ class McpToolListTests(unittest.TestCase):
         self.assertEqual(names, MCP_TOOL_NAMES)
         self.assertNotIn("approve", names)
         self.assertNotIn("recover_vault", names)
+        self.assertNotIn("recover_treasury", names)
 
     def test_fresh_server_has_no_approve(self):
         mcp = _build_server()
         names = registered_tool_names(mcp)
-        self.assertEqual(names, {"balance", "quote_payment", "pay", "history"})
+        self.assertEqual(
+            names, {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"}
+        )
 
 
 if __name__ == "__main__":

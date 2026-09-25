@@ -4,3 +4,6 @@
 __pycache__/
 *.pyc
 policy.json
+claude-session/transcript.txt
+claude-session/transcript-tools.txt
+claude-session/claude.err

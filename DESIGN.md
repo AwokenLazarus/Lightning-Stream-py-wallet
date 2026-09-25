@@ -10,10 +10,13 @@ Three process boundaries plus an out-of-band human device:
 
 1. **Policy library** (`agentwallet/policy.py`) — pure functions. Rules: allowlist, max-per-tx, daily/weekly budget, per-counterparty cap, velocity, human threshold, split-bypass (same dest in a short window). Verdicts: `allow` / `deny` / `needs_human`. Append-only JSONL audit. Tokens expire in 15 minutes (`approval_ttl_s=900`) and are single-use.
 2. **Signer process** (`agentwallet/signer.py`) — Unix socket, mode 600. Owns the Knots cookie and wallet. Re-runs policy before every `sendtoaddress`. Holds a **presigned vault** sweep to a recovery address; hex never leaves disk. Holds only the **human ed25519 public key**. `approve` requires a signature by that key over `(token, dest, amount_sats, expiry)`. A `human=` boolean in the request is ignored and is not a capability. `recover_vault` likewise requires a human signature.
-3. **MCP server** (`agentwallet/mcp_server.py`) — Python MCP SDK (`MCPServer` / `FastMCP`), stdio. Tools (exactly): `balance`, `quote_payment`, `pay`, `history`. **No `approve`. No `recover_vault`.** No RPC. Responses pass `sanitize()` (drops priv/wif/xprv/cookie fields).
+3. **MCP server** (`agentwallet/mcp_server.py`) — Python MCP SDK (`MCPServer` / `FastMCP`), stdio. Tools (exactly): `balance`, `quote_payment`, `pay`, `history`, `channels`, `xbt402_pay`. **No `approve`. No `recover_vault`.** No RPC. Responses pass `sanitize()` (drops priv/wif/xprv/cookie/secret fields).
 4. **Human device CLI** (`agentwallet-approve` / `python -m agentwallet.approve`) — runs with the human private key. The key is stored outside the agent workspace (demo: `~/xbt-rnd/b2-human-device/`, marked `THIS_IS_THE_HUMANS_DEVICE.txt`, mode 0700/0600). The CLI refuses a key path under `B2_ROOT`.
 
-Isolated Knots (binary from `~/lazarus-regtest`) on `127.0.0.1:19443`. Funding via `generatetoaddress` — no miners.
+4. **Channel-as-budget** (`agentwallet/channels.py`, `hot.py`, `treasury.py`) — each allowlisted counterparty gets a B1 Spillman channel. Cap = `per_counterparty_cap_sats`, expiry = `channel_expiry_blocks`. The signer holds payer keys (mode 600 `channel_keys.json`). `pay` to a channel dest is an off-chain increment under a spend lock so concurrent calls cannot exceed the cap. Fundings are signed ALL|UNIFIED (`0x21`) from a signer-owned hot key (the Knots wallet will not sign 0x21 on regtest). Treasury is P2WSH `IF 2-of-2 human/cosigner ELSE older(4320) recovery`. Socket API for XBT-060: `docs/B2_SIGNER_API.md`.
+5. **Claude session** — project-local `claude-session/.mcp.json` + `claude-session.sh` (`claude -p --strict-mcp-config`). Never edits the global Claude config.
+
+Isolated Knots **29.4.2** on `127.0.0.1:30300` / p2p `30301` / x402 `30310`, datadir `~/xbt-rnd/xbt-062/run/`. Funding via `generatetoaddress` — no miners. RDTS + `blake2b@101`.
 
 ## Why it's new
 Prior art checked: public Lazarus MCP (read-only, L0 only); an exchange's money tools (pair allowlist + confirm + JSONL, but exchange API, no on-chain keys); Coinbase x402 / L402 (payments, not a custody policy engine); Bitkey/Lazarus Key (human wallet, not agent MCP). Combining a policy engine, a key-isolated signer, **cryptographic out-of-band human approval** (ed25519 over the pending payment), split-bypass detection, and a presigned recovery vault as the agent-native wallet for XBT is not something the public pool MCP or the unbuilt-services list shipped.
@@ -23,7 +26,10 @@ The first prototype (`2218092`) used `approve(human: bool)` as an MCP tool. That
 ## Trust and attack analysis
 - Prompt injection → agent calls `pay` to an attacker: **allowlist deny**.
 - Split a large payment into many small ones: **split_bypass deny** (window sum vs max-per-tx and human threshold).
-- Agent calls `approve` itself: **impossible** — the MCP tool list is exactly `{balance, quote_payment, pay, history}`.
+- Agent calls `approve` itself: **impossible** — the MCP tool list is exactly `{balance, quote_payment, pay, history, channels, xbt402_pay}`.
+- Concurrent `pay` against one channel: **channel_cap** — increment is locked; used + amount never exceeds cap.
+- Channel increment to a stranger: **allowlist deny** (same engine as on-chain pay).
+- Treasury alone: recovery needs `older(4320)` plus a human ed25519 signature; not an MCP tool.
 - Socket client sends `approve` without a valid signature: **deny / approval_sig**. `human=true` does nothing.
 - Signature over a different dest or amount: **deny / approval_bind**.
 - Replay of a used token: **deny**.
