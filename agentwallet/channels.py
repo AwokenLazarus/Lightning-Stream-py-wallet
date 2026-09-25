@@ -10,7 +10,7 @@ import json
 import os
 import secrets
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .b1path import ensure_b1
@@ -43,6 +43,9 @@ class ChannelRecord:
     funding_sats: int = 0
     seq: int = 0
     origin: str = ""
+    # a signed hash lock whose paid response has not arrived: {hash, cipher, manifest}. The claim that
+    # pays the provider reveals k, which opens this ciphertext (Xbt402Session.recover_conditional)
+    pending_cond: dict = field(default_factory=dict)
 
     def public(self) -> dict:
         return {

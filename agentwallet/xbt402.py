@@ -23,12 +23,12 @@ from .b1path import ensure_b1
 from .channels import ChannelBook
 from .hot import HotWallet
 from .sanitize import UNTRUSTED_KEY, untrusted
-from .stream import StreamError, check_chunk, check_manifest, open_final
+from .stream import H, StreamError, check_chunk, check_manifest, open_final
 
 ensure_b1()
 from xbt402 import ecc  # noqa: E402
 from xbt402.channel import DERIVATION, ChannelError, ChannelParams, SIGHASH_ALL_UNIFIED  # noqa: E402
-from xbt402.conditional import ConditionalParams  # noqa: E402
+from xbt402.conditional import ConditionalParams, preimage_from_tx  # noqa: E402
 from xbt402.x402_channel import (  # noqa: E402
     FACILITATOR_VERIFY,
     SCHEME,
@@ -368,28 +368,65 @@ class Xbt402Session:
         t = time.time()
         url = dest + doc["chunkUrl"].replace("{i}", str(m["n"] - 1))
         st, hdrs, _ = XbtChannelClient.http("GET", url, b"")
-        acc = pick_accept(unb64json(hdrs["PAYMENT-REQUIRED"]), self.network())
-        cond = (acc.get("extra") or {}).get("conditional") or {}
-        if st != 402 or cond.get("hash") != m["lock"] or int(cond.get("amount", 0)) != m["price"]:
+        if st != 402 or "PAYMENT-REQUIRED" not in {k.upper() for k in hdrs}:
             raise StreamError("last chunk is not offered under the manifest's hash lock")
+        acc = pick_accept(unb64json({k.upper(): v for k, v in hdrs.items()}["PAYMENT-REQUIRED"]), self.network())
+        cond = (acc.get("extra") or {}).get("conditional") or {}
+        if cond.get("hash") != m["lock"] or int(cond.get("amount", 0)) != m["price"]:
+            raise StreamError("last chunk is not offered under the manifest's hash lock")
+        # AGP-005 M7: the ciphertext comes before the signature. Once the hash lock is signed the
+        # provider can close with it and claim, and the claim reveals only k: without the ciphertext
+        # already in hand, a dropped response leaves the payer paying for nothing.
+        try:
+            cipher = bytes.fromhex(cond["cipher"])
+        except (KeyError, TypeError, ValueError):
+            raise StreamError("last chunk offer carries no ciphertext; refused before signing")
+        if H(cipher).hex() != m["finalCt"]:
+            raise StreamError("last chunk offer's ciphertext does not match the committed finalCt; refused before signing")
         with self.book._lock:
             rec = self.book._records[dest]
             payer = self.book._payer_locked(rec)
             cp = ConditionalParams(payer.params, bytes.fromhex(cond["hash"]), m["price"], int(cond.get("csvDelta", 10)))
             sig = ecc.sign(payer.secret, cp.sighash(cp.state_tx(rec.used_sats))) + bytes([SIGHASH_ALL_UNIFIED])
             rec.seq += 1
+            rec.pending_cond = {"hash": cond["hash"], "cipher": cipher.hex(),
+                                "manifest": {k: m[k] for k in ("id", "n", "root", "lock", "finalCt", "lastProof")}}
             payload = {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats), "hashlock": cond["hash"], "sig": sig.hex()}
             self.book._persist()
         st, _, raw, _ = self._paid("GET", url, b"", acc, payload)
         if st != 200:
-            raise StreamError(f"conditional purchase of the last chunk failed: HTTP {st}")
-        d = json.loads(raw)
-        pt = open_final(m, bytes.fromhex(d["cipher"]), bytes.fromhex(d["preimage"]))
+            raise StreamError(f"conditional purchase of the last chunk failed: HTTP {st}; "
+                              "if the provider claims the hash lock, recover_conditional() opens the chunk")
+        try:
+            k = bytes.fromhex(json.loads(raw)["preimage"])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise StreamError("paid response carries no key; if the provider claims the hash lock, "
+                              "recover_conditional() opens the chunk")
+        pt = open_final(m, cipher, k)          # the offered ciphertext, never one the response substitutes
+        with self.book._lock:
+            self.book._records[dest].pending_cond = {}
+            self.book._persist()
         rec, sig2 = self.book.increment(dest, m["price"])
         self._verify_post(dest, acc, {"chan": rec.chan, "cum": str(rec.used_sats), "sig": sig2.hex()})
         ms = round(1000 * (time.time() - t), 1)
         _log("chunk", i=m["n"] - 1, ms=ms, chargedSat=m["price"], chan=rec.chan, cum=rec.used_sats, hashlock=cond["hash"])
         return pt, ms
+
+    def recover_conditional(self, dest: str, tx) -> bytes:
+        """The last chunk of a stream whose hash lock was signed but whose paid response never came,
+        from the provider's claim transaction (hex, bytes or Tx), which reveals k on-chain."""
+        rec = self.book.get(dest)
+        pc = rec.pending_cond if rec else {}
+        if not pc:
+            raise StreamError("no pending conditional purchase on this channel")
+        k = preimage_from_tx(tx, bytes.fromhex(pc["hash"]))
+        if not k:
+            raise StreamError("this transaction does not reveal the hash lock's key")
+        pt = open_final(pc["manifest"], bytes.fromhex(pc["cipher"]), k)
+        with self.book._lock:
+            self.book._records[dest].pending_cond = {}
+            self.book._persist()
+        return pt
 
     def close_channel(self, dest: str) -> dict:
         """Cooperative close through the signer: payer signs tagged_hash(xbt402/close, chan)."""
