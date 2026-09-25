@@ -22,12 +22,14 @@ SEC = Path.home() / "xbt-rnd" / "b1" / "tests" / "security"
 if str(SEC) not in sys.path:
     sys.path.insert(0, str(SEC))
 
+NET = "bip122:" + "11" * 16   # xbt402 v1.1 derives the payee key per network (the test providers' id)
+
 
 def funded(tmp: Path, cap: int = 100_000, close_fee: int = 600):
     book = ChannelBook(tmp / "channels.json", tmp / "channel_keys.json")
     secret = 0xA11CE
     payee = 0xB0B
-    p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 8_000, close_fee)
+    p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 8_000, close_fee, network=NET)
     p.funding_txid = "11" * 32
     p.funding_vout = 0
     p.capacity = cap

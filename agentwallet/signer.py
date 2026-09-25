@@ -231,7 +231,8 @@ class Signer:
 
         secret, payer_pub = self.channels.new_payer_key()
         expiry = self._height() + expiry_blocks
-        p = ChannelParams.derive(pay_to, payer_pub, expiry, close_fee, self.hot.spk.hex())
+        p = ChannelParams.derive(pay_to, payer_pub, expiry, close_fee, self.hot.spk.hex(),
+                                 network=self._xbt402.network())
         funded = cap + close_fee
         txid, vout = self.hot.fund(p.spk, funded)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, funded

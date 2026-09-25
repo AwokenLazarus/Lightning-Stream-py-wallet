@@ -28,6 +28,8 @@ OTHER = "bcrt1qother000000000000000000000000000000qq"
 STRANGER = "bcrt1qstranger00000000000000000000000000qq"
 API = "http://127.0.0.1:30310/v1/infer"
 
+NET = "bip122:" + "11" * 16   # xbt402 v1.1 derives the payee key per network (the test providers' id)
+
 
 class Clock:
     def __init__(self, t=1_000_000.0):
@@ -62,7 +64,7 @@ def open_chan(tmp: Path, dest: str, cap: int) -> ChannelBook:
     book = ChannelBook(tmp / "channels.json", tmp / "channel_keys.json")
     secret = secrets.randbelow(ecc.N - 1) + 1
     payee = secrets.randbelow(ecc.N - 1) + 1
-    p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 8_000, 0)
+    p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 8_000, 0, network=NET)
     p.funding_txid = "22" * 32
     p.funding_vout = 0
     p.capacity = cap

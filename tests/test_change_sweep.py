@@ -14,6 +14,8 @@ from xbt402 import ecc  # noqa: E402
 from xbt402.channel import ChannelParams  # noqa: E402
 from xbt402.tx import p2wpkh_spk  # noqa: E402
 
+NET = "bip122:" + "11" * 16   # xbt402 v1.1 derives the payee key per network (the test providers' id)
+
 
 class ChangeSweepTests(unittest.TestCase):
     def test_state_change_is_hot_spk(self):
@@ -22,7 +24,7 @@ class ChangeSweepTests(unittest.TestCase):
         hot = p2wpkh_spk(ecc.pubkey(0x0707))
         chan_spk = p2wpkh_spk(ecc.pubkey(secret))
         self.assertNotEqual(hot.hex(), chan_spk.hex())
-        p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 8_000, 600, hot.hex())
+        p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 8_000, 600, hot.hex(), network=NET)
         p.funding_txid = "22" * 32
         p.funding_vout = 0
         p.capacity = 100_000
@@ -37,7 +39,7 @@ class ChangeSweepTests(unittest.TestCase):
         book = ChannelBook(tmp / "channels.json", tmp / "channel_keys.json")
         secret = 0xA11CE
         hot = p2wpkh_spk(ecc.pubkey(0x0707)).hex()
-        p = ChannelParams.derive(ecc.pubkey(0xB0B).hex(), ecc.pubkey(secret).hex(), 8_000, 600, hot)
+        p = ChannelParams.derive(ecc.pubkey(0xB0B).hex(), ecc.pubkey(secret).hex(), 8_000, 600, hot, network=NET)
         p.funding_txid = "33" * 32
         p.funding_vout = 0
         p.capacity = 50_000

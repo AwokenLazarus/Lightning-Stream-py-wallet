@@ -112,7 +112,8 @@ class UntrustedBodyTests(unittest.TestCase):
         self.assertEqual(u["trust"], "untrusted")
         self.assertIn("untrusted", u["note"])
         self.assertEqual(u["body"].encode(), BODY)                 # verbatim: nothing redacted or dropped
-        self.assertEqual(u["receipt"]["charged"], "150")
+        self.assertEqual(u["receipt"]["extra"]["receipt"]["charged"], "150")   # a v1.1 SettlementResponse
+        self.assertEqual((u["receipt"]["extra"]["chargedAmount"], u["receipt"]["transaction"]), ("150", ""))
         self.assertNotIn("body", res)
         self.assertNotIn("receipt", res)
 

@@ -27,14 +27,16 @@ from .stream import StreamError, check_chunk, check_manifest, open_final
 
 ensure_b1()
 from xbt402 import ecc  # noqa: E402
-from xbt402.channel import ChannelParams, SIGHASH_ALL_UNIFIED  # noqa: E402
+from xbt402.channel import DERIVATION, ChannelError, ChannelParams, SIGHASH_ALL_UNIFIED  # noqa: E402
 from xbt402.conditional import ConditionalParams  # noqa: E402
 from xbt402.x402_channel import (  # noqa: E402
     FACILITATOR_VERIFY,
     SCHEME,
     XbtChannelClient,
     b64json,
+    facilitator_request,
     network_id,
+    receipt_of,
     request_digest,
     unb64json,
 )
@@ -63,6 +65,14 @@ def pick_accept(pr: dict, network: str) -> dict:
         if acc.get("scheme") == SCHEME and acc.get("network") == network:
             return acc
     raise RuntimeError("no xbt-channel offer on this network")
+
+
+def charged_of(resp, default: int) -> int:
+    """`charged` of the channel receipt inside a PAYMENT-RESPONSE SettlementResponse (xbt402 v1.1)."""
+    try:
+        return int(receipt_of(resp)["charged"])
+    except (ChannelError, KeyError, TypeError, ValueError):
+        return default
 
 
 def _log(kind, **kw):
@@ -106,6 +116,8 @@ class Xbt402Session:
 
     def open_from_offer(self, dest: str, acc: dict, cap_sats: int, expiry_blocks: int) -> dict:
         extra = acc.get("extra") or {}
+        if extra.get("derivation") != DERIVATION:  # checked before funding: a mismatch strands the coins
+            raise RuntimeError(f"provider payee-key derivation {extra.get('derivation')!r}, we speak {DERIVATION!r}")
         close_fee = int(extra.get("closeFeeSat") or 600)
         min_cap = int(extra.get("minCapacity") or 0)
         max_cap = int(extra.get("maxCapacity") or cap_sats)
@@ -118,7 +130,8 @@ class Xbt402Session:
         expiry = self.height() + blocks
         secret, payer_pub = self.book.new_payer_key()
         # Change at close returns to the signer's hot key, not the per-channel payer key.
-        params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex())
+        params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex(),
+                                      network=acc["network"])
         funded = cap + close_fee
         txid, vout = self.hot.fund(params.spk, funded)
         params.funding_txid, params.funding_vout, params.capacity = txid, vout, funded
@@ -211,7 +224,7 @@ class Xbt402Session:
         if sig:
             payload["sig"] = sig.hex()
         st2, _, out2, receipt = self._paid(method, url, body, acc, payload)
-        charged = int((receipt or {}).get("charged") or price) if st2 < 400 else 0
+        charged = charged_of(receipt, price) if st2 < 400 else 0
         _log("call", url=url, status=st2, ms=round(1000 * (time.time() - t0), 1), chargedSat=charged,
              chan=rec.chan, cum=rec.used_sats, opened=bool(opened))
         preview = out2.decode("utf-8", "replace")[:BODY_CAP]
@@ -263,7 +276,7 @@ class Xbt402Session:
                     raise StreamError(f"chunk {i}: HTTP {st}")
                 data = check_chunk(m, json.loads(raw))
             except StreamError as e:
-                charged = int((receipt or {}).get("charged") or 0)
+                charged = charged_of(receipt, 0)
                 _log("refused_chunk", i=i, reason=str(e), refusedSat=charged, chan=rec.chan, url=url)
                 return {
                     **out,
@@ -282,7 +295,7 @@ class Xbt402Session:
                 }
             parts.append(data)
             rec, sig = self.book.increment(dest, m["price"])
-            self._verify_post(dest, {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats), "sig": sig.hex()})
+            self._verify_post(dest, acc, {"chan": rec.chan, "cum": str(rec.used_sats), "sig": sig.hex()})
             spent += m["price"]
             _log("chunk", i=i, ms=round(1000 * (time.time() - t), 1), chargedSat=m["price"], chan=rec.chan, cum=rec.used_sats)
         try:
@@ -335,14 +348,19 @@ class Xbt402Session:
             },
         }
 
-    def _verify_post(self, dest, payload):
+    def _verify_post(self, dest, acc, payload):
+        """Hand the provider a signed state through /x402/verify (x402 v2 VerifyRequest/VerifyResponse)."""
         st, _, out = XbtChannelClient.http(
             "POST",
             dest + FACILITATOR_VERIFY,
-            json.dumps({"payload": payload}).encode(),
+            json.dumps(facilitator_request(acc, payload)).encode(),
             {"Content-Type": "application/json"},
         )
-        if st != 200:
+        try:
+            valid = st == 200 and json.loads(out).get("isValid") is True
+        except (ValueError, AttributeError):
+            valid = False
+        if not valid:
             raise StreamError(f"provider refused our payment state: {out[:200]!r}")
 
     def _final_chunk(self, dest, doc, m):
@@ -367,7 +385,7 @@ class Xbt402Session:
         d = json.loads(raw)
         pt = open_final(m, bytes.fromhex(d["cipher"]), bytes.fromhex(d["preimage"]))
         rec, sig2 = self.book.increment(dest, m["price"])
-        self._verify_post(dest, {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats), "sig": sig2.hex()})
+        self._verify_post(dest, acc, {"chan": rec.chan, "cum": str(rec.used_sats), "sig": sig2.hex()})
         ms = round(1000 * (time.time() - t), 1)
         _log("chunk", i=m["n"] - 1, ms=ms, chargedSat=m["price"], chan=rec.chan, cum=rec.used_sats, hashlock=cond["hash"])
         return pt, ms

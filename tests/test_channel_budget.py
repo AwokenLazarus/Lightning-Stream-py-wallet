@@ -19,12 +19,14 @@ from xbt402.x402_channel import close_message  # noqa: E402
 
 DEST = "bcrt1qmerchant0000000000000000000000000000qq"
 
+NET = "bip122:" + "11" * 16   # xbt402 v1.1 derives the payee key per network (the test providers' id)
+
 
 def funded_book(tmp: Path, cap: int = 10_000, dest: str = DEST) -> tuple[ChannelBook, int]:
     book = ChannelBook(tmp / "channels.json", tmp / "channel_keys.json")
     secret = secrets.randbelow(ecc.N - 1) + 1
     payee = secrets.randbelow(ecc.N - 1) + 1
-    p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 5_000, 0)
+    p = ChannelParams.derive(ecc.pubkey(payee).hex(), ecc.pubkey(secret).hex(), 5_000, 0, network=NET)
     p.funding_txid = "11" * 32
     p.funding_vout = 0
     p.capacity = cap
