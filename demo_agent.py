@@ -95,7 +95,7 @@ async def run() -> int:
             if int(paid.get("status") or 0) != 200:
                 print("FAIL expected xbt402 HTTP 200", paid, file=sys.stderr)
                 return 1
-            if not paid.get("receipt") and int(paid.get("charged_sats") or 0) <= 0:
+            if not (paid.get("untrusted_provider_response") or {}).get("receipt") and int(paid.get("charged_sats") or 0) <= 0:
                 print("FAIL xbt402 produced no receipt", paid, file=sys.stderr)
                 return 1
 

@@ -6,6 +6,8 @@ XBT-060's client SDK should call the same socket methods (`fund`, `sign_state`,
 Streamed results (`stream: xbt402-merkle-v1`) are bought here: signed Merkle
 manifest, verify-then-pay per chunk, hash-locked last chunk. The MCP response
 stores the full body and returns a digest + path (no 500-character cut).
+The provider's body and receipt are returned verbatim under `untrusted_provider_response`
+(labelled untrusted, not key-filtered: XBT-061 L7); only the tool's own fields are sanitized.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from urllib.parse import urlparse
 from .b1path import ensure_b1
 from .channels import ChannelBook
 from .hot import HotWallet
+from .sanitize import UNTRUSTED_KEY, untrusted
 from .stream import StreamError, check_chunk, check_manifest, open_final
 
 ensure_b1()
@@ -27,6 +30,7 @@ from xbt402 import ecc  # noqa: E402
 from xbt402.channel import ChannelParams, SIGHASH_ALL_UNIFIED  # noqa: E402
 from xbt402.conditional import ConditionalParams  # noqa: E402
 from xbt402.x402_channel import (  # noqa: E402
+    FACILITATOR_VERIFY,
     SCHEME,
     XbtChannelClient,
     b64json,
@@ -156,6 +160,13 @@ class Xbt402Session:
         return st, h, out, unb64json(h["PAYMENT-RESPONSE"]) if "PAYMENT-RESPONSE" in h else None
 
     def pay_once(self, url: str, method: str, body: bytes, max_sats: int, expiry_blocks: int, cap_sats: int) -> dict:
+        """One call. The provider's body and receipt come back only under UNTRUSTED_KEY (L7)."""
+        res = self._pay_once(url, method, body, max_sats, expiry_blocks, cap_sats)
+        if "body" in res or "receipt" in res:
+            res[UNTRUSTED_KEY] = untrusted(res.pop("body", ""), res.pop("receipt", None))
+        return res
+
+    def _pay_once(self, url: str, method: str, body: bytes, max_sats: int, expiry_blocks: int, cap_sats: int) -> dict:
         dest = origin_of(url)
         t0 = time.time()
         st, hdrs, out = XbtChannelClient.http(method, url, body or b"")
@@ -327,7 +338,7 @@ class Xbt402Session:
     def _verify_post(self, dest, payload):
         st, _, out = XbtChannelClient.http(
             "POST",
-            dest + "/verify",
+            dest + FACILITATOR_VERIFY,
             json.dumps({"payload": payload}).encode(),
             {"Content-Type": "application/json"},
         )
