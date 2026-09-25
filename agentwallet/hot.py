@@ -80,6 +80,7 @@ class HotWallet:
     def status(self) -> dict:
         return {
             "hot_address": self.address,
+            "hot_spk": self.spk.hex(),
             "hot_sats": self.balance_sats(),
             "hot_utxos": len(self._utxos),
         }

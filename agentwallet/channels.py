@@ -123,18 +123,59 @@ class ChannelBook:
                     return d
         return None
 
+    def _rec_locked(self, key: str) -> ChannelRecord:
+        if key in self._records:
+            return self._records[key]
+        for r in self._records.values():
+            if r.chan == key or r.origin == key:
+                return r
+        raise ChannelError("unknown_channel", key)
+
     def sign_close(self, dest: str) -> str:
         """Payer signature over tagged_hash('xbt402/close', chan). Keys stay here."""
         from xbt402.x402_channel import close_message
 
         with self._lock:
-            rec = self._records.get(dest)
-            if rec is None:
-                raise ChannelError("unknown_channel", dest)
+            rec = self._rec_locked(dest)
             secret = self._secrets.get(rec.chan)
             if secret is None:
                 raise ChannelError("bad_key", "signer has no key for this channel")
             return ecc.sign(secret, close_message(rec.chan)).hex()
+
+    def request_auth(self, chan: str, seq, cum, sig, req: str) -> str:
+        """H3 per-request HMAC. The ECDH channel key never leaves the signer."""
+        from xbt402.channel import channel_auth_key
+        from xbt402.x402_channel import request_auth
+
+        with self._lock:
+            rec = self._rec_locked(chan)
+            secret = self._secrets.get(rec.chan)
+            if secret is None:
+                raise ChannelError("bad_key", "signer has no key for this channel")
+            key = channel_auth_key(secret, bytes.fromhex(rec.payee_pub))
+            return request_auth(key, rec.chan, seq, cum, sig, req)
+
+    def sign_state_a3(self, chan: str, amount: int) -> bytes:
+        """H5: 0xA3 fee-input state. Output 0 is payer change; never sign a lower cum."""
+        with self._lock:
+            rec = self._rec_locked(chan)
+            if amount < rec.used_sats:
+                raise ChannelError("stale_amount", f"have {rec.used_sats}, got {amount}")
+            if amount > rec.cap_sats:
+                raise ChannelCapError(rec.used_sats, amount - rec.used_sats, rec.cap_sats)
+            payer = self._payer_locked(rec)
+            sig = payer.sign_state_a3(amount)
+            rec.used_sats = max(rec.used_sats, amount)
+            self._persist()
+            return sig
+
+    def fresh_seq(self, dest: str) -> ChannelRecord:
+        """Spend a seq without changing the signed cum (every paid request needs a new seq)."""
+        with self._lock:
+            rec = self._rec_locked(dest)
+            rec.seq += 1
+            self._persist()
+            return ChannelRecord(**asdict(rec))
 
     def new_payer_key(self) -> tuple[int, str]:
         secret = secrets.randbelow(ecc.N - 1) + 1

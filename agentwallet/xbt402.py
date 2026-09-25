@@ -31,6 +31,7 @@ from xbt402.x402_channel import (  # noqa: E402
     XbtChannelClient,
     b64json,
     network_id,
+    request_digest,
     unb64json,
 )
 
@@ -45,6 +46,12 @@ def origin_of(url: str) -> str:
     if not p.scheme or not p.netloc:
         raise ValueError("xbt402_pay needs an absolute URL")
     return f"{p.scheme}://{p.netloc}"
+
+
+def request_target(url: str) -> str:
+    """Path + query as the provider sees it (B1 request_digest / ASGI raw_path)."""
+    parts = url.split("/", 3)
+    return "/" + parts[3] if len(parts) > 3 else "/"
 
 
 def pick_accept(pr: dict, network: str) -> dict:
@@ -106,7 +113,8 @@ class Xbt402Session:
         blocks = min(max(expiry_blocks, min_exp + 6), max_exp - 1)
         expiry = self.height() + blocks
         secret, payer_pub = self.book.new_payer_key()
-        params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee)
+        # Change at close returns to the signer's hot key, not the per-channel payer key.
+        params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex())
         funded = cap + close_fee
         txid, vout = self.hot.fund(params.spk, funded)
         params.funding_txid, params.funding_vout, params.capacity = txid, vout, funded
@@ -133,7 +141,15 @@ class Xbt402Session:
         rec = self.book.add_funded(dest, secret=secret, params=params, origin=origin, cap_sats=cap)
         return rec.public()
 
+    def _with_auth(self, payload: dict, method: str, url: str, body: bytes) -> dict:
+        """H3: bind this payload to (method, path, body). The ECDH key stays in the book."""
+        pl = dict(payload)
+        req = request_digest(method, request_target(url), body or b"")
+        pl["auth"] = self.book.request_auth(pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
+        return pl
+
     def _paid(self, method, url, body, acc, payload):
+        payload = self._with_auth(payload, method, url, body or b"")
         hdr = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc, "payload": payload})}
         st, hdrs, out = XbtChannelClient.http(method, url, body or b"", hdr)
         h = {k.upper(): v for k, v in hdrs.items()}
@@ -159,6 +175,17 @@ class Xbt402Session:
         price = int(acc["amount"])
         if price > max_sats:
             return {"verdict": "deny", "rule": "max_sats", "reason": f"quoted {price} > max_sats {max_sats}"}
+        if price == 0:
+            preview = out.decode("utf-8", "replace")[:BODY_CAP]
+            stored = _store_body(out, f"free-{int(t0)}") if len(out) > BODY_CAP else {}
+            _log("call", url=url, status=st, ms=round(1000 * (time.time() - t0), 1), chargedSat=0, chan=None)
+            return {
+                "status": st,
+                "charged_sats": 0,
+                "body": preview,
+                "note": "zero-priced offer; no channel",
+                **stored,
+            }
         rec = self.book.get(dest)
         opened = None
         if rec is None:
@@ -217,7 +244,7 @@ class Xbt402Session:
         parts, spent = [], 0
         for i in range(m["n"] - 1):
             url = dest + doc["chunkUrl"].replace("{i}", str(i))
-            rec = self.book.get(dest)
+            rec = self.book.fresh_seq(dest)
             t = time.time()
             st, _, raw, receipt = self._paid("GET", url, b"", acc, {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats)})
             try:
@@ -361,5 +388,21 @@ class Xbt402Session:
                 self.mine(1)
             except Exception:
                 pass
-        _log("close", dest=dest, chan=rec.chan, txid=doc.get("txid"), cum=rec.used_sats)
-        return {"verdict": "allow", "rail": "xbt402", "dest": dest, **doc, "chan": rec.chan, "cum": rec.used_sats}
+        if doc.get("txid"):
+            try:
+                self.hot.scan_from_txid(doc["txid"])
+            except Exception:
+                pass
+        _log("close", dest=dest, chan=rec.chan, txid=doc.get("txid"), cum=rec.used_sats,
+             change_spk=rec.payer_spk, hot_spk=self.hot.spk.hex())
+        return {
+            "verdict": "allow",
+            "rail": "xbt402",
+            "dest": dest,
+            **doc,
+            "chan": rec.chan,
+            "cum": rec.used_sats,
+            "change_spk": rec.payer_spk,
+            "hot_spk": self.hot.spk.hex(),
+            "change_to_hot": rec.payer_spk == self.hot.spk.hex(),
+        }

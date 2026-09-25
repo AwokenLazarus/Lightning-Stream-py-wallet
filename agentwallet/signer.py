@@ -141,6 +141,11 @@ class Signer:
         if method == "xbt402_pay":
             with self._spend_lock:
                 return sanitize(self._xbt402_pay_locked(params))
+        if method == "xbt402_request_auth":
+            return sanitize(self._xbt402_request_auth(params))
+        if method == "xbt402_sign_state_a3":
+            with self._spend_lock:
+                return sanitize(self._xbt402_sign_state_a3(params))
         if method == "close_channel":
             with self._spend_lock:
                 return sanitize(self._close_channel_locked(params))
@@ -226,7 +231,7 @@ class Signer:
 
         secret, payer_pub = self.channels.new_payer_key()
         expiry = self._height() + expiry_blocks
-        p = ChannelParams.derive(pay_to, payer_pub, expiry, close_fee)
+        p = ChannelParams.derive(pay_to, payer_pub, expiry, close_fee, self.hot.spk.hex())
         funded = cap + close_fee
         txid, vout = self.hot.fund(p.spk, funded)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, funded
@@ -245,11 +250,34 @@ class Signer:
             raw = body.encode()
         else:
             raw = bytes(body)
-        max_sats = int(params.get("max_sats") or 0)
+        try:
+            max_sats = int(params["max_sats"]) if params.get("max_sats") is not None else 0
+        except (TypeError, ValueError):
+            return _deny("amount", "max_sats must be an integer")
         try:
             dest = origin_of(url)
         except ValueError as e:
             return _deny("dest", str(e))
+        if max_sats < 0:
+            return _deny("amount", "max_sats must be >= 0")
+        if max_sats == 0:
+            # Free-only: allowlisted dest, no channel open/update. A >0 price is refused in pay_once.
+            if dest not in self.engine.allowlist:
+                return _deny("allowlist", f"destination not on allowlist: {dest}")
+            try:
+                result = self._xbt402.pay_once(
+                    url,
+                    method,
+                    raw,
+                    max_sats=0,
+                    expiry_blocks=self.config.channel_expiry_blocks,
+                    cap_sats=self.config.per_counterparty_cap_sats,
+                )
+            except Exception as e:
+                return _deny("xbt402", str(e))
+            if result.get("verdict") == "deny":
+                return result
+            return {"verdict": "allow", "rule": "free", **result, "rail": "xbt402"}
         pay = Payment(dest=dest, amount_sats=max_sats, memo=f"xbt402 {method} {url}")
         d = self.engine.evaluate(pay, human=False)
         if d.verdict is not Verdict.ALLOW:
@@ -273,6 +301,33 @@ class Signer:
         if charged:
             self.engine.commit(Payment(dest=dest, amount_sats=charged, memo=pay.memo), txid=result.get("chan") or "")
         return {**d.as_dict(), **result, "rail": "xbt402"}
+
+    def _xbt402_request_auth(self, params: dict) -> dict:
+        chan = params.get("chan") or ""
+        try:
+            auth = self.channels.request_auth(
+                chan, params.get("seq"), params.get("cum"), params.get("sig") or "", params.get("req") or ""
+            )
+        except Exception as e:
+            return _deny("xbt402_request_auth", str(e))
+        return {"auth": auth}
+
+    def _xbt402_sign_state_a3(self, params: dict) -> dict:
+        chan = params.get("chan") or ""
+        dest = self.channels.find_dest(chan) or chan
+        amount = int(params.get("amount") or 0)
+        rec = self.channels.get(dest)
+        origin = rec.origin or dest if rec else dest
+        pay = Payment(dest=origin, amount_sats=max(0, amount - (rec.used_sats if rec else 0)))
+        if pay.amount_sats:
+            d = self.engine.evaluate(pay, human=False)
+            if d.verdict is not Verdict.ALLOW:
+                return d.as_dict()
+        try:
+            sig = self.channels.sign_state_a3(dest, amount)
+        except Exception as e:
+            return _deny("xbt402_sign_state_a3", str(e))
+        return {"sig": sig.hex() if isinstance(sig, bytes) else sig}
 
     def _close_channel_locked(self, params: dict) -> dict:
         raw = params.get("counterparty") or params.get("dest") or params.get("to") or ""
