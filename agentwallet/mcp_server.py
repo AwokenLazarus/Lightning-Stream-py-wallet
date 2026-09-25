@@ -1,4 +1,9 @@
-"""MCP surface. Talks only to the signer socket. No RPC, no keys."""
+"""MCP surface. Talks only to the signer socket. No RPC, no keys.
+
+The tool list is fixed: balance, quote_payment, pay, history.
+approve and recover_vault are intentionally absent — a model cannot
+self-approve. Humans use the out-of-band agentwallet-approve CLI.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,10 @@ from pathlib import Path
 
 from .sanitize import assert_no_key_material, sanitize
 from .signer import SignerClient
+
+# Exact MCP surface. Tests assert this set.
+MCP_TOOL_NAMES = frozenset({"balance", "quote_payment", "pay", "history"})
+FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault"})
 
 
 def _client() -> SignerClient:
@@ -24,13 +33,13 @@ def _pack(result) -> str:
 
 def _build_server():
     try:
-        from mcp.server.fastmcp import FastMCP
-
-        mcp = FastMCP("xbt-agent-wallet")
-    except ImportError:
         from mcp.server.mcpserver import MCPServer
 
         mcp = MCPServer("xbt-agent-wallet")
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP
+
+        mcp = FastMCP("xbt-agent-wallet")
 
     @mcp.tool()
     def balance() -> str:
@@ -44,13 +53,12 @@ def _build_server():
 
     @mcp.tool()
     def pay(to: str, amount_xbt: float, memo: str = "") -> str:
-        """Policy-checked payment. Over the human threshold returns needs_human + approval token."""
-        return _pack(_client().call("pay", to=to, amount_xbt=amount_xbt, memo=memo))
+        """Policy-checked payment. Over the human threshold returns needs_human + approval token.
 
-    @mcp.tool()
-    def approve(token: str, human: bool = False) -> str:
-        """Human-only path: consume an approval token and sign. Agents must not set human=true."""
-        return _pack(_client().call("approve", token=token, human=human))
+        The model cannot approve the token. A human must run agentwallet-approve
+        with the device private key.
+        """
+        return _pack(_client().call("pay", to=to, amount_xbt=amount_xbt, memo=memo))
 
     @mcp.tool()
     def history(limit: int = 20) -> str:
@@ -58,6 +66,13 @@ def _build_server():
         return _pack(_client().call("history", limit=limit))
 
     return mcp
+
+
+def registered_tool_names(mcp=None) -> set[str]:
+    """Synchronous tool-name set for tests (does not start stdio)."""
+    server = mcp if mcp is not None else _build_server()
+    infos = server._tool_manager.list_tools()
+    return {getattr(t, "name", t) for t in infos}
 
 
 mcp = _build_server()

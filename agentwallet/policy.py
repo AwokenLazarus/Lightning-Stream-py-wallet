@@ -50,6 +50,9 @@ class Decision:
     reason: str
     rule: str
     approval_token: str | None = None
+    approval_expires: int | None = None
+    dest: str = ""
+    amount_sats: int = 0
     residual_daily_sats: int = 0
     residual_weekly_sats: int = 0
     residual_counterparty_sats: int = 0
@@ -71,7 +74,7 @@ class PolicyConfig:
     velocity_window_s: int = 3600
     human_threshold_sats: int = 10_000_000
     split_window_s: int = 600
-    approval_ttl_s: int = 3600
+    approval_ttl_s: int = 900
 
     def normalized_allowlist(self) -> frozenset[str]:
         out = set()
@@ -237,12 +240,21 @@ class PolicyEngine:
         residual_weekly = max(0, cfg.weekly_budget_sats - weekly)
         residual_cpty = max(0, cfg.per_counterparty_cap_sats - cpty)
 
-        def decide(verdict: Verdict, rule: str, reason: str, token: str | None = None) -> Decision:
+        def decide(
+            verdict: Verdict,
+            rule: str,
+            reason: str,
+            token: str | None = None,
+            expires: int | None = None,
+        ) -> Decision:
             d = Decision(
                 verdict=verdict,
                 reason=reason,
                 rule=rule,
                 approval_token=token,
+                approval_expires=expires,
+                dest=p.dest,
+                amount_sats=p.amount_sats,
                 residual_daily_sats=residual_daily,
                 residual_weekly_sats=residual_weekly,
                 residual_counterparty_sats=residual_cpty,
@@ -316,14 +328,16 @@ class PolicyEngine:
 
         if not human and p.amount_sats >= cfg.human_threshold_sats:
             token = secrets.token_urlsafe(24)
+            expires = int(now + cfg.approval_ttl_s)
             self.store.put_approval(
                 token,
                 {
                     "dest": p.dest,
                     "amount_sats": p.amount_sats,
                     "memo": p.memo,
-                    "expires": now + cfg.approval_ttl_s,
+                    "expires": expires,
                     "ts": now,
+                    "used": False,
                 },
             )
             return decide(
@@ -331,6 +345,7 @@ class PolicyEngine:
                 "human_threshold",
                 f"{p.amount_sats} sats is at or above human_threshold {cfg.human_threshold_sats}",
                 token=token,
+                expires=expires,
             )
 
         return decide(Verdict.ALLOW, "ok", "all policy rules passed")
@@ -339,12 +354,16 @@ class PolicyEngine:
         return self.evaluate(payment, human=False)
 
     def consume_approval(self, token: str) -> Payment | None:
+        """Pop a still-valid unused token. Signature checks happen in the signer."""
         if not token:
             return None
         now = self.clock()
         payload = self.store.get_approval(token)
         if not payload:
             self.audit.append({"type": "approval_miss", "token": token, "ts": now})
+            return None
+        if payload.get("used"):
+            self.audit.append({"type": "approval_replay", "token": token, "ts": now})
             return None
         if payload.get("expires", 0) < now:
             self.store.pop_approval(token)

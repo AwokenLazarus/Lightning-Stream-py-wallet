@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Human-device entry point. Do not invoke from the MCP/agent process with its key."""
+
+from agentwallet.approve import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -11,6 +11,9 @@ export B2_RPCPORT="${B2_RPCPORT:-19443}"
 export B2_P2PPORT="${B2_P2PPORT:-19444}"
 export B2_WALLET="${B2_WALLET:-agent}"
 export B2_SIGNER_SOCK="${B2_SIGNER_SOCK:-$ROOT/.run/signer.sock}"
+# Human private key lives OUTSIDE the agent workspace (this directory).
+export B2_HUMAN_DEVICE="${B2_HUMAN_DEVICE:-$HOME/xbt-rnd/b2-human-device}"
+export B2_PENDING="${B2_PENDING:-$ROOT/.run/pending_approval.json}"
 BITCOIND="${BITCOIND:-$HOME/lazarus-regtest/prefix/bin/bitcoind}"
 BITCOIN_CLI="${BITCOIN_CLI:-$HOME/lazarus-regtest/prefix/bin/bitcoin-cli}"
 VENV="$ROOT/.venv"
@@ -90,7 +93,19 @@ STRANGER="$(cli -rpcwallet="$B2_WALLET" getnewaddress "stranger" bech32)"
 export B2_MERCHANT="$MERCHANT"
 export B2_STRANGER="$STRANGER"
 
-# Fresh policy + ledger each demo so the five calls are deterministic.
+# Fresh human device key (sibling dir, not under the agent workspace).
+"$B2_PYTHON" - <<PY
+from pathlib import Path
+from agentwallet.approval import write_human_device
+import os
+info = write_human_device(Path(os.environ["B2_HUMAN_DEVICE"]))
+Path(os.environ["B2_ROOT"], ".run", "human_pubkey.hex").write_text(info["public_hex"] + "\n")
+print("human device:", info["device_dir"])
+print("human pubkey:", info["public_hex"])
+PY
+HUMAN_PUB="$("$B2_PYTHON" -c 'from pathlib import Path; import os; print(Path(os.environ["B2_ROOT"], ".run", "human_pubkey.hex").read_text().strip())')"
+
+# Fresh policy + ledger each demo so the calls are deterministic.
 cat > "$ROOT/policy.json" <<EOF
 {
   "allowlist": ["$MERCHANT"],
@@ -102,11 +117,12 @@ cat > "$ROOT/policy.json" <<EOF
   "velocity_window_s": 3600,
   "human_threshold_sats": 10000000,
   "split_window_s": 600,
-  "approval_ttl_s": 3600,
-  "recovery_address": "$RECOVERY"
+  "approval_ttl_s": 900,
+  "recovery_address": "$RECOVERY",
+  "human_pubkey": "$HUMAN_PUB"
 }
 EOF
-rm -f "$ROOT/.run/ledger.json" "$ROOT/.run/audit.jsonl" "$ROOT/.run/vault.json"
+rm -f "$ROOT/.run/ledger.json" "$ROOT/.run/audit.jsonl" "$ROOT/.run/vault.json" "$B2_PENDING"
 
 # Fund with generatetoaddress — no miners (HL-015).
 TRUSTED="$(cli -rpcwallet="$B2_WALLET" getbalances | python3 -c 'import json,sys; print(json.load(sys.stdin)["mine"]["trusted"])')"
@@ -126,9 +142,40 @@ for _ in $(seq 40); do
 done
 [[ -S "$B2_SIGNER_SOCK" ]] || { echo "signer socket missing"; exit 1; }
 
-echo "== five MCP agent calls =="
+echo "== agent MCP path (no approve tool) =="
 "$B2_PYTHON" "$ROOT/demo_agent.py"
+
+echo "== human out-of-band approve (agentwallet-approve) =="
+TOKEN="$("$B2_PYTHON" -c 'import json,os; print(json.load(open(os.environ["B2_PENDING"]))["token"])')"
+DEST="$("$B2_PYTHON" -c 'import json,os; print(json.load(open(os.environ["B2_PENDING"]))["dest"])')"
+AMT="$("$B2_PYTHON" -c 'import json,os; print(json.load(open(os.environ["B2_PENDING"]))["amount_sats"])')"
+EXP="$("$B2_PYTHON" -c 'import json,os; print(json.load(open(os.environ["B2_PENDING"]))["expiry"])')"
+"$B2_PYTHON" -m agentwallet.approve \
+  --key "$B2_HUMAN_DEVICE/ed25519.sk" \
+  --token "$TOKEN" \
+  --dest "$DEST" \
+  --amount-sats "$AMT" \
+  --expiry "$EXP" \
+  --sock "$B2_SIGNER_SOCK" \
+  --agent-root "$ROOT"
+
+echo "== confirm human-approved tx landed =="
+"$B2_PYTHON" - <<'PY'
+import json, os
+from pathlib import Path
+from agentwallet.signer import SignerClient
+pending = json.loads(Path(os.environ["B2_PENDING"]).read_text())
+c = SignerClient(Path(os.environ["B2_SIGNER_SOCK"]))
+hist = c.call("history", limit=50)
+commits = [
+    e
+    for e in hist.get("events") or []
+    if e.get("type") == "commit" and e.get("amount_sats") == pending["amount_sats"]
+]
+assert commits, hist
+print("HUMAN_APPROVE_OK", commits[-1]["txid"])
+PY
 
 echo "== miners left running? =="
 python3 "$HOME/lazarus-regtest/killminer.py"
-echo "DEMO finished (isolated node stopped on exit; shared :18443 untouched)"
+echo "DEMO_OK (isolated node stopped on exit; shared :18443 untouched)"

@@ -1,4 +1,9 @@
-"""Signer process: owns Knots RPC + policy. MCP talks only to this socket."""
+"""Signer process: owns Knots RPC + policy. MCP talks only to this socket.
+
+Human approval is cryptographic: the signer holds only an ed25519 public key.
+`approve` and `recover_vault` require a signature by that key. There is no
+`human=` boolean. Those methods are not MCP tools.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import socket
 import threading
 from pathlib import Path
 
+from .approval import verify, verify_approval, x2b
 from .policy import Payment, PolicyConfig, PolicyEngine, PolicyStore, AuditLog, Verdict
 from .rpc import KnotsRpc, KnotsRpcError
 from .sanitize import sanitize
@@ -28,8 +34,12 @@ def sats_from_xbt(amount_xbt) -> int:
     return int(s) * XBT_SATS
 
 
+def _deny(rule: str, reason: str) -> dict:
+    return {"verdict": "deny", "rule": rule, "reason": reason}
+
+
 class Signer:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, rpc: KnotsRpc | None = None):
         self.root = Path(root)
         run = self.root / ".run"
         run.mkdir(parents=True, exist_ok=True)
@@ -44,14 +54,17 @@ class Signer:
         datadir = Path(os.environ.get("B2_DATADIR", self.root / ".regtest"))
         conf = Path(os.environ.get("B2_CONF", self.root / "bitcoin-b2.conf"))
         wallet = os.environ.get("B2_WALLET", "agent")
-        self.rpc = KnotsRpc(datadir, conf, wallet=wallet)
+        self.rpc = rpc if rpc is not None else KnotsRpc(datadir, conf, wallet=wallet)
         recovery = raw.get("recovery_address") or os.environ.get("B2_RECOVERY", "")
         self.vault = PresignedVault(run / "vault.json", self.rpc, recovery)
         self.sock_path = Path(os.environ.get("B2_SIGNER_SOCK", run / "signer.sock"))
+        pub_hex = (raw.get("human_pubkey") or "").strip()
+        self.human_pubkey = x2b(pub_hex) if pub_hex else b""
 
     def handle(self, req: dict) -> dict:
         method = req.get("method")
         params = req.get("params") or {}
+        # A boolean "human" in the request is never a capability. Ignore it.
         if method == "balance":
             bals = self.rpc.call("getbalances")
             mine = bals.get("mine") or {}
@@ -86,32 +99,114 @@ class Signer:
                 return sanitize({**d.as_dict(), "txid": txid})
             return sanitize(d.as_dict())
         if method == "approve":
-            if not params.get("human"):
-                return {"verdict": "deny", "rule": "human_only", "reason": "approve requires human=true"}
-            token = params.get("token") or ""
-            pay = self.engine.consume_approval(token)
-            if pay is None:
-                return {"verdict": "deny", "rule": "approval", "reason": "unknown or expired approval token"}
-            d = self.engine.evaluate(pay, human=True)
-            if d.verdict is not Verdict.ALLOW:
-                return sanitize(d.as_dict())
-            txid = self._send(pay)
-            self.engine.commit(pay, txid=txid)
-            try:
-                self.vault.refresh()
-            except KnotsRpcError:
-                pass
-            return sanitize({**d.as_dict(), "txid": txid, "approved": True})
+            return sanitize(self._approve_signed(params))
         if method == "history":
             limit = int(params.get("limit") or 50)
             return sanitize({"events": self.engine.audit.read(limit=limit)})
         if method == "recover_vault":
-            if not params.get("human"):
-                return {"ok": False, "reason": "recover_vault is human-only"}
-            return sanitize(self.vault.recover(human=True))
+            return sanitize(self._recover_signed(params))
         if method == "health":
             return {"ok": True, "wallet": self.rpc.wallet}
         raise ValueError(f"unknown method {method}")
+
+    def _approve_signed(self, params: dict) -> dict:
+        token = params.get("token") or ""
+        dest = (params.get("dest") or params.get("to") or "").strip()
+        if dest.lower().startswith(("bc1", "bcrt1", "tb1")):
+            dest = dest.lower()
+        if "amount_sats" in params and params["amount_sats"] is not None:
+            amount = int(params["amount_sats"])
+        else:
+            amount = sats_from_xbt(params.get("amount_xbt") or 0)
+        try:
+            expiry = int(params.get("expiry") or 0)
+        except (TypeError, ValueError):
+            expiry = 0
+        sig_hex = params.get("signature") or params.get("sig") or ""
+        try:
+            signature = x2b(sig_hex) if sig_hex else b""
+        except ValueError:
+            return _deny("approval_sig", "signature is not valid hex")
+
+        if not self.human_pubkey:
+            return _deny("approval_sig", "signer has no human public key configured")
+        if not signature or not verify_approval(self.human_pubkey, token, dest, amount, expiry, signature):
+            self.engine.audit.append(
+                {
+                    "type": "decision",
+                    "verdict": "deny",
+                    "rule": "approval_sig",
+                    "reason": "missing or invalid human signature",
+                    "dest": dest,
+                    "amount_sats": amount,
+                    "ts": self.engine.clock(),
+                }
+            )
+            return _deny("approval_sig", "missing or invalid human signature over (token, dest, amount, expiry)")
+
+        payload = self.engine.store.get_approval(token)
+        if not payload:
+            self.engine.audit.append({"type": "approval_miss", "token": token, "ts": self.engine.clock()})
+            return _deny("approval", "unknown or already-used approval token")
+        if payload.get("used"):
+            return _deny("approval_replay", "approval token already used")
+
+        now = self.engine.clock()
+        stored_exp = int(payload.get("expires") or 0)
+        if stored_exp < now or expiry < now:
+            self.engine.store.pop_approval(token)
+            self.engine.audit.append({"type": "approval_expired", "token": token, "ts": now})
+            return _deny("approval_expired", "approval token expired")
+
+        stored_dest = payload.get("dest") or ""
+        stored_amt = int(payload.get("amount_sats") or 0)
+        if dest != stored_dest or amount != stored_amt or expiry != stored_exp:
+            self.engine.audit.append(
+                {
+                    "type": "decision",
+                    "verdict": "deny",
+                    "rule": "approval_bind",
+                    "reason": "signature fields do not match pending approval",
+                    "dest": dest,
+                    "amount_sats": amount,
+                    "ts": now,
+                }
+            )
+            return _deny("approval_bind", "signature fields do not match the pending approval")
+
+        pay = self.engine.consume_approval(token)
+        if pay is None:
+            return _deny("approval", "unknown or expired approval token")
+        d = self.engine.evaluate(pay, human=True)
+        if d.verdict is not Verdict.ALLOW:
+            return d.as_dict()
+        txid = self._send(pay)
+        self.engine.commit(pay, txid=txid)
+        try:
+            self.vault.refresh()
+        except KnotsRpcError:
+            pass
+        return {**d.as_dict(), "txid": txid, "approved": True}
+
+    def _recover_signed(self, params: dict) -> dict:
+        from .approval import recover_message
+
+        try:
+            expiry = int(params.get("expiry") or 0)
+        except (TypeError, ValueError):
+            expiry = 0
+        sig_hex = params.get("signature") or ""
+        try:
+            signature = x2b(sig_hex) if sig_hex else b""
+        except ValueError:
+            return {"ok": False, "reason": "signature is not valid hex"}
+        addr = self.vault.recovery_address
+        now = self.engine.clock()
+        if not self.human_pubkey or not signature or not verify(self.human_pubkey, recover_message(addr, expiry), signature):
+            return {"ok": False, "reason": "recover_vault requires a valid human signature"}
+        if expiry < now:
+            return {"ok": False, "reason": "recover signature expired"}
+        return self.vault.recover(human=True)
 
     def _payment(self, params: dict) -> Payment:
         if "amount_sats" in params and params["amount_sats"] is not None:

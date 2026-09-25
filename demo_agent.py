@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Five scripted MCP agent calls: balance, allow, deny, needs_human, approve."""
+"""Agent-side MCP calls: balance, allow, deny, needs_human. No approve tool."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+from agentwallet.mcp_server import MCP_TOOL_NAMES
 
 
 def _text(result) -> dict:
@@ -31,27 +33,27 @@ async def run() -> int:
     py = os.environ.get("B2_PYTHON", sys.executable)
     merchant = os.environ["B2_MERCHANT"]
     stranger = os.environ["B2_STRANGER"]
+    pending_path = Path(os.environ.get("B2_PENDING", root / ".run" / "pending_approval.json"))
     params = StdioServerParameters(
         command=py,
         args=["-m", "agentwallet.mcp_server"],
         env={**os.environ, "B2_ROOT": str(root)},
         cwd=str(root),
     )
-    calls = []
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = {t.name for t in (await session.list_tools()).tools}
-            expect = {"balance", "quote_payment", "pay", "approve", "history"}
-            missing = expect - tools
-            if missing:
-                print(f"FAIL missing tools: {missing}", file=sys.stderr)
+            if tools != set(MCP_TOOL_NAMES):
+                print(f"FAIL MCP tools {tools} != {set(MCP_TOOL_NAMES)}", file=sys.stderr)
+                return 1
+            if "approve" in tools or "recover_vault" in tools:
+                print("FAIL approve/recover_vault must not be MCP tools", file=sys.stderr)
                 return 1
 
             async def call(name, **args):
                 res = await session.call_tool(name, arguments=args)
                 data = _text(res)
-                calls.append((name, data))
                 print(f"=== {name} {args} ===")
                 print(json.dumps(data, indent=2, sort_keys=True))
                 return data
@@ -75,18 +77,41 @@ async def run() -> int:
             if gated.get("verdict") != "needs_human" or not gated.get("approval_token"):
                 print("FAIL expected needs_human+token", file=sys.stderr)
                 return 1
-            token = gated["approval_token"]
-
-            # Agent cannot approve itself
-            blocked = await call("approve", token=token, human=False)
-            if blocked.get("verdict") != "deny":
-                print("FAIL agent approve should deny", file=sys.stderr)
+            if not gated.get("approval_expires"):
+                print("FAIL needs_human missing approval_expires", file=sys.stderr)
                 return 1
 
-            approved = await call("approve", token=token, human=True)
-            if not approved.get("txid") or not approved.get("approved"):
-                print("FAIL human approve should send", file=sys.stderr)
-                return 1
+            # (a) agent calling approve through MCP is impossible
+            try:
+                sneaky = await session.call_tool(
+                    "approve", arguments={"token": gated["approval_token"], "human": True}
+                )
+                sneaky_data = _text(sneaky)
+                if not getattr(sneaky, "isError", False) and (
+                    sneaky_data.get("verdict") == "allow" or sneaky_data.get("txid")
+                ):
+                    print("FAIL MCP exposed approve:", sneaky_data, file=sys.stderr)
+                    return 1
+                print("=== agent approve (must fail) ===")
+                print(
+                    json.dumps(
+                        {"ok": False, "error": sneaky_data, "note": "no MCP approve tool"},
+                        indent=2,
+                    )
+                )
+            except Exception as e:
+                print("=== agent approve (must fail) ===")
+                print(json.dumps({"ok": False, "error": str(e), "note": "no MCP approve tool"}, indent=2))
+
+            pending = {
+                "token": gated["approval_token"],
+                "dest": gated.get("dest") or merchant,
+                "amount_sats": gated.get("amount_sats") or 20_000_000,
+                "expiry": gated["approval_expires"],
+            }
+            pending_path.parent.mkdir(parents=True, exist_ok=True)
+            pending_path.write_text(json.dumps(pending, indent=2), encoding="utf-8")
+            print(f"PENDING_APPROVAL {pending_path}")
 
             hist = await call("history", limit=30)
             events = hist.get("events") or []
@@ -95,7 +120,7 @@ async def run() -> int:
                 print(f"FAIL history missing verdicts: {verdicts}", file=sys.stderr)
                 return 1
 
-    print("DEMO_OK calls=5+ (balance, pay-allow, pay-deny, pay-needs_human, approve)")
+    print("AGENT_PATH_OK tools=balance,quote_payment,pay,history (no approve)")
     return 0
 
 
