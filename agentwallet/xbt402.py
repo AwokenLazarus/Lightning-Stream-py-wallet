@@ -117,7 +117,8 @@ class Xbt402Session:
     def open_from_offer(self, dest: str, acc: dict, cap_sats: int, expiry_blocks: int) -> dict:
         extra = acc.get("extra") or {}
         if extra.get("derivation") != DERIVATION:  # checked before funding: a mismatch strands the coins
-            raise RuntimeError(f"provider payee-key derivation {extra.get('derivation')!r}, we speak {DERIVATION!r}")
+            # no provider text in the wallet's own errors: the model reads them unlabelled (AGP-005 L12)
+            raise RuntimeError(f"provider payee-key derivation is not {DERIVATION!r}; refused before funding")
         close_fee = int(extra.get("closeFeeSat") or 600)
         min_cap = int(extra.get("minCapacity") or 0)
         max_cap = int(extra.get("maxCapacity") or cap_sats)
@@ -154,7 +155,7 @@ class Xbt402Session:
         }
         st, _, out = XbtChannelClient.http("POST", open_url, json.dumps(body).encode(), {"Content-Type": "application/json"})
         if st != 200:
-            raise RuntimeError(f"open failed {st}: {out[:200]!r}")
+            raise RuntimeError(f"open failed: HTTP {st}")
         rec = self.book.add_funded(dest, secret=secret, params=params, origin=origin, cap_sats=cap)
         return rec.public()
 
@@ -361,7 +362,7 @@ class Xbt402Session:
         except (ValueError, AttributeError):
             valid = False
         if not valid:
-            raise StreamError(f"provider refused our payment state: {out[:200]!r}")
+            raise StreamError(f"provider refused our payment state (HTTP {st})")
 
     def _final_chunk(self, dest, doc, m):
         t = time.time()
@@ -407,11 +408,14 @@ class Xbt402Session:
             "POST", close_url, json.dumps(body).encode(), {"Content-Type": "application/json"}
         )
         if st != 200:
-            raise RuntimeError(f"close failed {st}: {out[:200]!r}")
+            raise RuntimeError(f"close failed: HTTP {st}")
         try:
-            doc = json.loads(out)
+            reply = json.loads(out)
         except ValueError:
-            doc = {"raw": out.decode("utf-8", "replace")[:200]}
+            reply = None
+        # the provider's reply is untrusted data: only a txid-shaped txid becomes the wallet's own field
+        txid = reply.get("txid") if isinstance(reply, dict) else None
+        doc = {"txid": txid if isinstance(txid, str) and len(txid) == 64 and all(c in "0123456789abcdef" for c in txid) else None}
         if self.mine and doc.get("txid"):
             try:
                 self.mine(1)
@@ -434,4 +438,5 @@ class Xbt402Session:
             "change_spk": rec.payer_spk,
             "hot_spk": self.hot.spk.hex(),
             "change_to_hot": rec.payer_spk == self.hot.spk.hex(),
+            UNTRUSTED_KEY: untrusted(out.decode("utf-8", "replace")[:BODY_CAP]),
         }
