@@ -120,7 +120,7 @@ async def run() -> int:
             pending_path.write_text(json.dumps(pending, indent=2), encoding="utf-8")
             print(f"PENDING_APPROVAL {pending_path}")
 
-    print("AGENT_PATH_OK tools=balance,quote_payment,pay,history,channels,xbt402_pay (no approve)")
+    print("AGENT_PATH_OK tools=balance,quote_payment,pay,history,channels,xbt402_pay,close_channel (no approve)")
     return 0
 
 

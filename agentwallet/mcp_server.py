@@ -1,8 +1,9 @@
 """MCP surface. Talks only to the signer socket. No RPC, no keys.
 
-The tool list is fixed: balance, quote_payment, pay, history, channels, xbt402_pay.
-approve and recover_vault are intentionally absent — a model cannot
-self-approve. Humans use the out-of-band agentwallet-approve CLI.
+The tool list is fixed: balance, quote_payment, pay, history, channels,
+xbt402_pay, close_channel. approve and recover_vault are intentionally
+absent — a model cannot self-approve. Humans use the out-of-band
+agentwallet-approve CLI.
 """
 
 from __future__ import annotations
@@ -15,8 +16,10 @@ from .sanitize import assert_no_key_material, sanitize
 from .signer import SignerClient
 
 # Exact MCP surface. Tests assert this set.
-# Wave 2 adds channels + xbt402_pay. approve / recover_vault stay off the model.
-MCP_TOOL_NAMES = frozenset({"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"})
+# Wave 3 adds close_channel. approve / recover_vault stay off the model.
+MCP_TOOL_NAMES = frozenset(
+    {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "close_channel"}
+)
 FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault", "recover_treasury"})
 
 
@@ -73,10 +76,19 @@ def _build_server():
 
     @mcp.tool()
     def xbt402_pay(url: str, method: str = "GET", body: str = "", max_sats: int = 1000) -> str:
-        """Pay an xbt-channel 402 through the policy engine. Keys stay in the signer."""
+        """Pay an xbt-channel 402 through the policy engine. Keys stay in the signer.
+
+        Streamed results (signed Merkle manifest) are verified and bought inside the
+        signer. The response is a digest + stored path, not a truncated body.
+        """
         return _pack(
             _client().call("xbt402_pay", url=url, method=method, body=body, max_sats=int(max_sats))
         )
+
+    @mcp.tool()
+    def close_channel(counterparty: str) -> str:
+        """Cooperative close of the Spillman channel with this counterparty. No approval tool."""
+        return _pack(_client().call("close_channel", counterparty=counterparty))
 
     return mcp
 

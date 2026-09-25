@@ -141,6 +141,9 @@ class Signer:
         if method == "xbt402_pay":
             with self._spend_lock:
                 return sanitize(self._xbt402_pay_locked(params))
+        if method == "close_channel":
+            with self._spend_lock:
+                return sanitize(self._close_channel_locked(params))
         if method == "fund_treasury":
             with self._spend_lock:
                 return sanitize(self._fund_treasury_locked(params))
@@ -270,6 +273,19 @@ class Signer:
         if charged:
             self.engine.commit(Payment(dest=dest, amount_sats=charged, memo=pay.memo), txid=result.get("chan") or "")
         return {**d.as_dict(), **result, "rail": "xbt402"}
+
+    def _close_channel_locked(self, params: dict) -> dict:
+        raw = params.get("counterparty") or params.get("dest") or params.get("to") or ""
+        dest = self.channels.find_dest(raw) or normalize_dest(raw)
+        if not dest:
+            return _deny("dest", "counterparty required")
+        if not self.channels.has(dest) and self.channels.find_dest(raw) is None:
+            return _deny("unknown_channel", f"no channel for {raw}")
+        dest = self.channels.find_dest(raw) or dest
+        try:
+            return self._xbt402.close_channel(dest)
+        except Exception as e:
+            return _deny("close_channel", str(e))
 
     def _fund_treasury_locked(self, params: dict) -> dict:
         sats = int(params.get("sats") or params.get("amount_sats") or 0)

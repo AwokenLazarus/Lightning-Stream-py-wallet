@@ -108,6 +108,34 @@ class ChannelBook:
         with self._lock:
             return dest in self._records
 
+    def find_dest(self, counterparty: str) -> str | None:
+        """Resolve an origin, dest, or channel id to the book key."""
+        from .policy import normalize_dest
+
+        dest = normalize_dest(counterparty)
+        with self._lock:
+            if dest in self._records:
+                return dest
+            if counterparty in self._records:
+                return counterparty
+            for d, r in self._records.items():
+                if r.chan == counterparty or r.origin == dest or r.origin == counterparty:
+                    return d
+        return None
+
+    def sign_close(self, dest: str) -> str:
+        """Payer signature over tagged_hash('xbt402/close', chan). Keys stay here."""
+        from xbt402.x402_channel import close_message
+
+        with self._lock:
+            rec = self._records.get(dest)
+            if rec is None:
+                raise ChannelError("unknown_channel", dest)
+            secret = self._secrets.get(rec.chan)
+            if secret is None:
+                raise ChannelError("bad_key", "signer has no key for this channel")
+            return ecc.sign(secret, close_message(rec.chan)).hex()
+
     def new_payer_key(self) -> tuple[int, str]:
         secret = secrets.randbelow(ecc.N - 1) + 1
         return secret, ecc.pubkey(secret).hex()

@@ -15,6 +15,7 @@ from agentwallet.channels import ChannelBook, ChannelCapError
 ensure_b1()
 from xbt402 import ecc  # noqa: E402
 from xbt402.channel import ChannelParams  # noqa: E402
+from xbt402.x402_channel import close_message  # noqa: E402
 
 DEST = "bcrt1qmerchant0000000000000000000000000000qq"
 
@@ -85,6 +86,13 @@ class ChannelBudgetTests(unittest.TestCase):
         self.assertNotIn("secret", joined)
         self.assertNotIn(rec.payer_pub, "")  # pubkeys of the channel are ok on chain later
         self.assertTrue(self.book.has(DEST))
+
+    def test_sign_close_and_find_dest(self):
+        rec = self.book.get(DEST)
+        sig = self.book.sign_close(DEST)
+        self.assertTrue(ecc.verify(bytes.fromhex(rec.payer_pub), close_message(rec.chan), bytes.fromhex(sig)))
+        self.assertEqual(self.book.find_dest(DEST), DEST)
+        self.assertEqual(self.book.find_dest(rec.chan), DEST)
 
 
 class ChannelLockSmoke(unittest.TestCase):
