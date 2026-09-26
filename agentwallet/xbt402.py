@@ -128,7 +128,11 @@ class Xbt402Session:
         min_exp = int(extra.get("minExpiryBlocks") or 1)
         max_exp = int(extra.get("maxExpiryBlocks") or 100_000)
         blocks = min(max(expiry_blocks, min_exp + 6), max_exp - 1)
-        expiry = self.height() + blocks
+        check = getattr(self.hot, "check_channel_funding", None)
+        if check is not None:  # AGP-013: above the hot-balance cap, a human sweeps before new channels
+            check()
+        open_height = self.height()
+        expiry = open_height + blocks
         secret, payer_pub = self.book.new_payer_key()
         # Change at close returns to the signer's hot key, not the per-channel payer key.
         params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex(),
@@ -156,7 +160,8 @@ class Xbt402Session:
         st, _, out = XbtChannelClient.http("POST", open_url, json.dumps(body).encode(), {"Content-Type": "application/json"})
         if st != 200:
             raise RuntimeError(f"open failed: HTTP {st}")
-        rec = self.book.add_funded(dest, secret=secret, params=params, origin=origin, cap_sats=cap)
+        rec = self.book.add_funded(dest, secret=secret, params=params, origin=origin, cap_sats=cap,
+                                   open_height=open_height)
         return rec.public()
 
     def _with_auth(self, payload: dict, method: str, url: str, body: bytes) -> dict:
@@ -213,7 +218,7 @@ class Xbt402Session:
             }
         rec = self.book.get(dest)
         opened = None
-        if rec is None:
+        if rec is None or rec.state != "open":  # a closed or refunded channel is replaced by a new one
             t1 = time.time()
             rec_pub = self.open_from_offer(dest, acc, cap_sats=cap_sats, expiry_blocks=expiry_blocks)
             rec = self.book.get(dest)
@@ -388,6 +393,8 @@ class Xbt402Session:
             payer = self.book._payer_locked(rec)
             cp = ConditionalParams(payer.params, bytes.fromhex(cond["hash"]), m["price"], int(cond.get("csvDelta", 10)))
             sig = ecc.sign(payer.secret, cp.sighash(cp.state_tx(rec.used_sats))) + bytes([SIGHASH_ALL_UNIFIED])
+            self.book.audit.record("conditional_state", sig=sig, chan=rec.chan, dest=dest, cum=rec.used_sats,
+                                   hashlock=cond["hash"], cond_sats=m["price"], sighash="0x21")
             rec.seq += 1
             rec.pending_cond = {"hash": cond["hash"], "cipher": cipher.hex(),
                                 "manifest": {k: m[k] for k in ("id", "n", "root", "lock", "finalCt", "lastProof")}}
@@ -453,6 +460,7 @@ class Xbt402Session:
         # the provider's reply is untrusted data: only a txid-shaped txid becomes the wallet's own field
         txid = reply.get("txid") if isinstance(reply, dict) else None
         doc = {"txid": txid if isinstance(txid, str) and len(txid) == 64 and all(c in "0123456789abcdef" for c in txid) else None}
+        self.book.mark_closed(dest, doc.get("txid") or "")
         if self.mine and doc.get("txid"):
             try:
                 self.mine(1)

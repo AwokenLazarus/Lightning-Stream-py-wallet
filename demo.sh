@@ -16,6 +16,8 @@ export B2_HTTP_PORT="${B2_HTTP_PORT:-30310}"
 export B2_WALLET="${B2_WALLET:-agent}"
 export B2_SIGNER_SOCK="${B2_SIGNER_SOCK:-$ROOT/.run/signer.sock}"
 export B2_HUMAN_DEVICE="${B2_HUMAN_DEVICE:-$HOME/xbt-rnd/b2-human-device}"
+# AGP-013: the hot key's wrapping key, outside the workspace (created 0600 on first start)
+export B2_HOT_KEYFILE="${B2_HOT_KEYFILE:-$B2_RUN/hot.key}"
 export B2_PENDING="${B2_PENDING:-$ROOT/.run/pending_approval.json}"
 export B2_X402_URL="http://127.0.0.1:${B2_HTTP_PORT}/v1/infer"
 BITCOIND="${BITCOIND:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2/bitcoind}"

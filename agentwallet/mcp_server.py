@@ -1,9 +1,11 @@
 """MCP surface. Talks only to the signer socket. No RPC, no keys.
 
 The tool list is fixed: balance, quote_payment, pay, history, channels,
-xbt402_pay, close_channel. approve and recover_vault are intentionally
-absent — a model cannot self-approve. Humans use the out-of-band
-agentwallet-approve CLI.
+xbt402_pay, close_channel, and (AGP-013) xbt402_refund, forward_status,
+forward_recover. approve, recover_vault, sweep_hot and rotate_hot_key are
+intentionally absent — a model cannot self-approve or move the hot key.
+Humans use the out-of-band agentwallet-approve CLI. This process never reads
+the hot key's wrapping key (B2_HOT_KEYFILE / B2_HOT_PASSPHRASE).
 """
 
 from __future__ import annotations
@@ -16,11 +18,12 @@ from .sanitize import assert_no_key_material, sanitize
 from .signer import SignerClient
 
 # Exact MCP surface. Tests assert this set.
-# Wave 3 adds close_channel. approve / recover_vault stay off the model.
+# Wave 3 adds close_channel; AGP-013 the refund and the forward rail. approve / recover_vault stay off the model.
 MCP_TOOL_NAMES = frozenset(
-    {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "close_channel"}
+    {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "close_channel",
+     "xbt402_refund", "forward_status", "forward_recover"}
 )
-FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault", "recover_treasury"})
+FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault", "recover_treasury", "sweep_hot", "rotate_hot_key"})
 
 
 def _client() -> SignerClient:
@@ -91,6 +94,30 @@ def _build_server():
     def close_channel(counterparty: str) -> str:
         """Cooperative close of the Spillman channel with this counterparty. No approval tool."""
         return _pack(_client().call("close_channel", counterparty=counterparty))
+
+    @mcp.tool()
+    def xbt402_refund(counterparty: str) -> str:
+        """Refund a channel the provider never closed, once its CLTV expiry has passed.
+
+        The whole channel output returns to the wallet's own hot key (you cannot choose where).
+        Refused before expiry and for a channel already closed; a second call reports the first refund.
+        A watcher in the wallet also does this on its own at expiry.
+        """
+        return _pack(_client().call("xbt402_refund", counterparty=counterparty))
+
+    @mcp.tool()
+    def forward_status() -> str:
+        """Forward-market rail: policy limits, 24 h forward spend, pending and delivered lots.
+
+        Forward lots are bought with xbt402_pay on a market's /forward/quote URL (atomic: the channel
+        payment only completes together with the signed coinbase transfer)."""
+        return _pack(_client().call("forward_status"))
+
+    @mcp.tool()
+    def forward_recover(txid: str) -> str:
+        """After a market closed a channel with a pending forward purchase, rebuild the transfer from
+        the close transaction's witness (or learn the purchase is void and was not paid)."""
+        return _pack(_client().call("forward_recover", txid=txid))
 
     return mcp
 

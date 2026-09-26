@@ -2,6 +2,11 @@
 
 The signer holds every payer secret. MCP responses list cap / used / expiry only.
 A channel increment is serialized so concurrent pays cannot exceed the cap.
+
+AGP-013: payer keys are sealed at rest when the book has a KeyStore; every signature goes to the
+signature audit log; a channel has a lifecycle (open -> closed | refunded) and the book refuses to
+sign a new state on a channel that is not open or is within `expiry_margin` blocks of its CLTV
+expiry (the provider needs those blocks to close before the payer's refund becomes valid).
 """
 
 from __future__ import annotations
@@ -14,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .b1path import ensure_b1
+from .keystore import KeyStore, write_private
+from .sigaudit import NullAudit
 
 ensure_b1()
 from xbt402 import ecc  # noqa: E402
@@ -46,9 +53,17 @@ class ChannelRecord:
     # a signed hash lock whose paid response has not arrived: {hash, cipher, manifest}. The claim that
     # pays the provider reveals k, which opens this ciphertext (Xbt402Session.recover_conditional)
     pending_cond: dict = field(default_factory=dict)
+    # AGP-013 lifecycle: "open" | "closed" (a close tx spent the funding) | "refunded" (our refund did)
+    state: str = "open"
+    closed_txid: str = ""
+    refund_txid: str = ""
+    open_height: int = 0
 
     def public(self) -> dict:
         return {
+            "state": self.state,
+            "closed_txid": self.closed_txid or None,
+            "refund_txid": self.refund_txid or None,
             "dest": self.dest,
             "chan": self.chan,
             "cap_sats": self.cap_sats,
@@ -61,9 +76,15 @@ class ChannelRecord:
 
 
 class ChannelBook:
-    def __init__(self, records_path: Path, keys_path: Path):
+    KEYS_AAD = "b2/channel-keys"
+
+    def __init__(self, records_path: Path, keys_path: Path, *, keystore: KeyStore | None = None, audit=None):
         self.records_path = Path(records_path)
         self.keys_path = Path(keys_path)
+        self.keystore = keystore
+        self.audit = audit or NullAudit()
+        # (height_fn, margin): refuse new states once height >= expiry - margin. None: no check.
+        self.expiry_guard = None
         self.records_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._records: dict[str, ChannelRecord] = {}
@@ -77,6 +98,13 @@ class ChannelBook:
                 self._records[dest] = ChannelRecord(**rec)
         if self.keys_path.exists():
             raw = json.loads(self.keys_path.read_text(encoding="utf-8"))
+            if "sealed" in raw:
+                if self.keystore is None:
+                    raise RuntimeError("channel keys are encrypted: set B2_HOT_KEYFILE or B2_HOT_PASSPHRASE")
+                raw = json.loads(self.keystore.open(raw["sealed"], self.KEYS_AAD))
+            elif self.keystore is not None and raw.get("secrets"):
+                self._secrets = {k: int(v, 16) for k, v in (raw.get("secrets") or {}).items()}
+                self._persist()  # first start with a wrapping key: re-seal the plaintext file
             self._secrets = {k: int(v, 16) for k, v in (raw.get("secrets") or {}).items()}
 
     def _persist(self) -> None:
@@ -90,13 +118,10 @@ class ChannelBook:
             encoding="utf-8",
         )
         os.replace(tmp, self.records_path)
-        ktmp = self.keys_path.with_suffix(".tmp")
-        ktmp.write_text(
-            json.dumps({"secrets": {k: f"{v:064x}" for k, v in self._secrets.items()}}, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(ktmp, self.keys_path)
-        os.chmod(self.keys_path, 0o600)
+        doc = json.dumps({"secrets": {k: f"{v:064x}" for k, v in self._secrets.items()}}, indent=2)
+        if self.keystore is not None:
+            doc = json.dumps({"sealed": self.keystore.seal(doc.encode(), self.KEYS_AAD)}, indent=2)
+        write_private(self.keys_path, doc)
 
     def list_public(self) -> list[dict]:
         with self._lock:
@@ -143,7 +168,11 @@ class ChannelBook:
             secret = self._secrets.get(rec.chan)
             if secret is None:
                 raise ChannelError("bad_key", "signer has no key for this channel")
-            return ecc.sign(secret, close_message(rec.chan)).hex()
+            if rec.state == "refunded":
+                raise ChannelError("channel_refunded", f"refunded in {rec.refund_txid}")
+            sig = ecc.sign(secret, close_message(rec.chan))
+            self.audit.record("close_auth", sig=sig, chan=rec.chan, dest=rec.dest, cum=rec.used_sats)
+            return sig.hex()
 
     def request_auth(self, chan: str, seq, cum, sig, req: str) -> str:
         """H3 per-request HMAC. The ECDH channel key never leaves the signer."""
@@ -168,6 +197,7 @@ class ChannelBook:
                 raise ChannelCapError(rec.used_sats, amount - rec.used_sats, rec.cap_sats)
             payer = self._payer_locked(rec)
             sig = payer.sign_state_a3(amount)
+            self.audit.record("channel_state_a3", sig=sig, chan=rec.chan, dest=rec.dest, cum=amount, sighash="0xa3")
             rec.used_sats = max(rec.used_sats, amount)
             self._persist()
             return sig
@@ -192,6 +222,7 @@ class ChannelBook:
         params: ChannelParams,
         origin: str = "",
         cap_sats: int | None = None,
+        open_height: int = 0,
     ) -> ChannelRecord:
         rec = ChannelRecord(
             dest=dest,
@@ -209,6 +240,7 @@ class ChannelBook:
             funding_sats=params.capacity,
             seq=0,
             origin=origin,
+            open_height=int(open_height or 0),
         )
         with self._lock:
             self._records[dest] = rec
@@ -216,7 +248,19 @@ class ChannelBook:
             self._persist()
             return ChannelRecord(**asdict(rec))
 
+    def check_usable_locked(self, rec: ChannelRecord) -> None:
+        """Only an open channel outside its expiry margin gets new states."""
+        if rec.state != "open":
+            raise ChannelError(f"channel_{rec.state}", f"channel {rec.chan[:16]} is {rec.state}")
+        if self.expiry_guard is not None:
+            height_fn, margin = self.expiry_guard
+            h = int(height_fn())
+            if h >= rec.expiry - int(margin):
+                raise ChannelError("channel_expiring",
+                                   f"height {h} is within {margin} blocks of expiry {rec.expiry}: close or refund it")
+
     def _payer_locked(self, rec: ChannelRecord) -> Payer:
+        self.check_usable_locked(rec)
         secret = self._secrets.get(rec.chan)
         if secret is None:
             raise ChannelError("bad_key", "signer has no key for this channel")
@@ -257,6 +301,7 @@ class ChannelBook:
                 if sign_cum > payer.params.max_amount:
                     raise ChannelCapError(rec.used_sats, amount_sats, payer.params.max_amount)
                 sig = payer.sign_state(sign_cum)
+                self.audit.record("channel_state", sig=sig, chan=rec.chan, dest=rec.dest, cum=sign_cum, sighash="0x21")
             rec.used_sats = sign_cum
             rec.seq += 1
             self._persist()
@@ -274,7 +319,46 @@ class ChannelBook:
                 raise ChannelError("stale_amount", f"have {rec.used_sats}, got {cum}")
             payer = self._payer_locked(rec)
             sig = payer.sign_state(cum) if cum > payer.signed else b""
+            if sig:
+                self.audit.record("channel_state", sig=sig, chan=rec.chan, dest=rec.dest, cum=cum, sighash="0x21")
             rec.used_sats = max(rec.used_sats, cum)
             rec.seq += 1
             self._persist()
             return sig
+
+    # --- AGP-013 lifecycle: provider close seen on-chain, payer refund after expiry ---------------
+    def open_records(self) -> list[ChannelRecord]:
+        with self._lock:
+            return [ChannelRecord(**asdict(r)) for r in self._records.values() if r.state == "open"]
+
+    def mark_closed(self, key: str, txid: str = "") -> None:
+        with self._lock:
+            rec = self._rec_locked(key)
+            if rec.state == "open":
+                rec.state, rec.closed_txid = "closed", txid or rec.closed_txid
+                self._persist()
+
+    def refund_tx(self, key: str, dest_spk: bytes, fee: int | None = None):
+        """The payer's CLTV refund of the whole funding output to `dest_spk` (B1 `refund_tx`).
+        Only for an open channel: a closed or refunded one has no funding output left to spend."""
+        with self._lock:
+            rec = self._rec_locked(key)
+            if rec.state != "open":
+                raise ChannelError(f"channel_{rec.state}", rec.refund_txid or rec.closed_txid)
+            secret = self._secrets.get(rec.chan)
+            if secret is None:
+                raise ChannelError("bad_key", "signer has no key for this channel")
+            params = ChannelParams(
+                payer_pub=rec.payer_pub, payee_pub=rec.payee_pub, expiry=rec.expiry, payer_spk=rec.payer_spk,
+                payee_spk=rec.payee_spk, close_fee=rec.close_fee, funding_txid=rec.funding_txid,
+                funding_vout=rec.funding_vout, capacity=rec.funding_sats or rec.cap_sats)
+            tx = params.refund_tx(secret, dest_spk=dest_spk, fee=fee)
+            self.audit.record("refund", sig=tx.inputs[0].witness[0], chan=rec.chan, dest=rec.dest, txid=tx.txid(),
+                              amount_sats=tx.outputs[0].value, locktime=rec.expiry, sighash="0x21")
+            return tx, rec.expiry
+
+    def mark_refunded(self, key: str, txid: str) -> None:
+        with self._lock:
+            rec = self._rec_locked(key)
+            rec.state, rec.refund_txid = "refunded", txid
+            self._persist()

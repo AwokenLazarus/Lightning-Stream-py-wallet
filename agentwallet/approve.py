@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from .approval import b2x, load_private_key, sign_approval
+from .approval import b2x, load_private_key, sign, sign_approval, sweep_message
 from .signer import SignerClient
 
 
@@ -38,7 +38,9 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Path to the human private key (32 raw bytes or hex). Must NOT be under B2_ROOT.",
     )
-    p.add_argument("--token", required=True)
+    p.add_argument("--token", default="", help="approval token (payments); not used with --sweep")
+    p.add_argument("--sweep", action="store_true",
+                   help="AGP-013: sign a sweep of --amount-sats out of the hot key to --dest (hot balance cap)")
     p.add_argument("--dest", required=True)
     p.add_argument("--amount-sats", type=int, required=True)
     p.add_argument("--expiry", type=int, required=True, help="Unix timestamp from the needs_human response")
@@ -61,8 +63,17 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("need --sock or B2_SIGNER_SOCK")
 
     priv = load_private_key(key_path)
-    sig = sign_approval(priv, args.token, args.dest, args.amount_sats, args.expiry)
     client = SignerClient(Path(args.sock))
+    if args.sweep:
+        hot = client.call("hot_address")["hot_address"]
+        sig = sign(priv, sweep_message(hot, args.dest, args.amount_sats, args.expiry))
+        result = client.call("sweep_hot", to=args.dest, amount_sats=args.amount_sats, expiry=args.expiry,
+                             signature=b2x(sig))
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("ok") else 1
+    if not args.token:
+        raise SystemExit("need --token (or --sweep)")
+    sig = sign_approval(priv, args.token, args.dest, args.amount_sats, args.expiry)
     result = client.call(
         "approve",
         token=args.token,

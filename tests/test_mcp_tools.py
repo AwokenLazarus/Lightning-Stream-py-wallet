@@ -1,4 +1,5 @@
-"""MCP surface is balance, quote_payment, pay, history, channels, xbt402_pay, close_channel."""
+"""MCP surface is balance, quote_payment, pay, history, channels, xbt402_pay, close_channel,
+xbt402_refund, forward_status, forward_recover (AGP-013)."""
 
 from __future__ import annotations
 
@@ -11,7 +12,8 @@ from agentwallet.mcp_server import (
     registered_tool_names,
 )
 
-EXACT = {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "close_channel"}
+EXACT = {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "close_channel",
+         "xbt402_refund", "forward_status", "forward_recover"}  # AGP-013 adds the last three
 
 
 class McpToolListTests(unittest.TestCase):

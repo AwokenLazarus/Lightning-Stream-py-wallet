@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +71,8 @@ def make_signer(tmp: Path, pub_hex: str, clock: Clock | None = None) -> Signer:
     }
     (tmp / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
     rpc = FakeRpc()
+    # AGP-013: the signer refuses a plaintext hot key; its wrapping key lives outside the run dir
+    os.environ["B2_HOT_KEYFILE"] = str(Path(tempfile.mkdtemp(prefix="b2-hotkey-")) / "hot.key")
     signer = Signer(tmp, rpc=rpc)
     if clock is not None:
         signer.engine.clock = clock

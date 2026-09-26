@@ -3,6 +3,12 @@
 Human approval is cryptographic: the signer holds only an ed25519 public key.
 `approve` and `recover_vault` require a signature by that key. There is no
 `human=` boolean. Those methods are not MCP tools.
+
+AGP-013: the hot key and channel keys are sealed at rest (keystore.py; wrapping key from
+B2_HOT_KEYFILE / B2_HOT_PASSPHRASE in the signer's environment only), every signature is logged to
+`.run/signatures.jsonl` (sigaudit.py), `xbt402_refund` and an expiry watcher refund channels the
+provider never closed, `rotate_hot_key` moves the hot key, `sweep_hot` (human-signed) empties it
+below its balance cap, and xbt402_pay has a forward rail (forward.py).
 """
 
 from __future__ import annotations
@@ -11,13 +17,19 @@ import json
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 
+from . import sigaudit
 from .approval import verify, verify_approval, x2b
 from .channels import ChannelBook, ChannelCapError
-from .hot import HotWallet
+from .forward import ForwardPolicy, ForwardSession
+from .hot import HotCapError, HotWallet
+from .keystore import KeyStore, KeyStoreError
 from .policy import Payment, PolicyConfig, PolicyEngine, PolicyStore, AuditLog, Verdict, normalize_dest
 from .rpc import KnotsRpc, KnotsRpcError
+
+from xbt402.channel import ChannelError  # noqa: E402  (B1 on sys.path through .channels)
 from .sanitize import sanitize
 from .treasury import Treasury, TREASURY_CSV
 from .vault import PresignedVault
@@ -64,15 +76,31 @@ class Signer:
         self.sock_path = Path(os.environ.get("B2_SIGNER_SOCK", run / "signer.sock"))
         pub_hex = (raw.get("human_pubkey") or "").strip()
         self.human_pubkey = x2b(pub_hex) if pub_hex else b""
-        self._spend_lock = threading.Lock()
-        self.hot = HotWallet(run / "hot.json", self.rpc)
+        self._spend_lock = threading.RLock()
+        self.keystore = KeyStore.from_env(run)
+        if self.keystore is None and not KeyStore.plaintext_allowed():
+            raise KeyStoreError("the signer's hot key must be encrypted at rest: set B2_HOT_KEYFILE (a 32-byte key "
+                                "file outside the run dir) or B2_HOT_PASSPHRASE (B2_HOT_ALLOW_PLAINTEXT=1 for tests)")
+        self.sigaudit = sigaudit.SigAudit(run / "signatures.jsonl")
+        self.hot = HotWallet(run / "hot.json", self.rpc, keystore=self.keystore, audit=self.sigaudit,
+                             cap_sats=self.config.hot_balance_cap_sats)
         self.treasury = Treasury(run / "treasury.json", csv=int(getattr(self.config, "treasury_csv", TREASURY_CSV) or TREASURY_CSV))
-        self.channels = ChannelBook(run / "channels.json", run / "channel_keys.json")
-        self._xbt402 = Xbt402Session(self.channels, self.hot, self.rpc, height=self._height, mine=self._mine)
+        self.channels = ChannelBook(run / "channels.json", run / "channel_keys.json", keystore=self.keystore,
+                                    audit=self.sigaudit)
+        self.channels.expiry_guard = (self._height, self.config.refund_margin_blocks)
+        self._xbt402 = ForwardSession(self.channels, self.hot, self.rpc, height=self._height, mine=self._mine,
+                                      forward_path=run / "forward.json",
+                                      policy=ForwardPolicy.from_dict(self.config.forward))
+        self._watch_stop = threading.Event()
+        self.watch_interval = float(os.environ.get("B2_WATCH_INTERVAL", "10"))
 
     def handle(self, req: dict) -> dict:
         method = req.get("method")
-        params = req.get("params") or {}
+        # every signature made while handling this request is logged under its method (sigaudit)
+        with sigaudit.context(method=str(method or ""), rule=f"method:{method}"):
+            return self._handle(method, req.get("params") or {})
+
+    def _handle(self, method, params: dict) -> dict:
         # A boolean "human" in the request is never a capability. Ignore it.
         if method == "balance":
             bals = self.rpc.call("getbalances")
@@ -135,6 +163,7 @@ class Signer:
             d = self.engine.evaluate(pay, human=False)
             if d.verdict is not Verdict.ALLOW:
                 return sanitize(d.as_dict())
+            sigaudit.set_rule(f"policy:{d.rule}")
             sig = self.channels.sign_state(dest, cum)
             self.engine.commit(pay, txid=(self.channels.get(dest) or type("R", (), {"chan": ""})).chan)
             return sanitize({"verdict": "allow", "chan": self.channels.get(dest).chan, "cum": cum, "sig": sig.hex() if sig else ""})
@@ -154,6 +183,43 @@ class Signer:
                 return sanitize(self._fund_treasury_locked(params))
         if method == "recover_treasury":
             return sanitize(self._recover_treasury_locked(params))
+        # --- AGP-013 ---------------------------------------------------------------------------------
+        if method in ("xbt402_refund", "refund_channel"):  # refund_channel: b5 AGP-008's name
+            with self._spend_lock:
+                key = params.get("counterparty") or params.get("dest") or params.get("chan") or ""
+                return sanitize(self._refund_locked(key))
+        if method == "watch_tick":
+            return sanitize({"actions": self.watch_tick()})
+        if method == "forward_recover":
+            with self._spend_lock:
+                res = self._xbt402.forward_recover(params.get("txid") or "")
+                if res.get("recovered"):     # the policy ledger learns the spend it could not see live
+                    self.engine.commit(Payment(dest=res["dest"], amount_sats=res["price"],
+                                               memo=f"forward {res['outpoint']} (recovered)"), txid=res["transfer_txid"])
+                return sanitize(res)
+        if method == "forward_status":
+            return sanitize(self._xbt402.status())
+        if method == "forward_pending":
+            return sanitize({"pending": self._xbt402.status()["pending"]})
+        if method == "forward_transfers":
+            with self._xbt402.fwd.lock:
+                return sanitize({"delivered": json.loads(json.dumps(self._xbt402.fwd.data["delivered"]))})
+        if method == "rotate_hot_key":
+            with self._spend_lock:
+                sigaudit.set_rule("operator:rotate_hot_key")
+                out = self.hot.rotate()
+                self.engine.audit.append({"type": "hot_rotation", "ts": self.engine.clock(),
+                                          "old_address": out["old_address"], "new_address": out["new_address"],
+                                          "sweep_txid": (out.get("sweep") or {}).get("txid")})
+                if out.get("sweep"):
+                    self._mine_safe()
+                return sanitize({**out, **self.hot.status()})
+        if method == "sweep_hot":
+            with self._spend_lock:
+                return sanitize(self._sweep_hot_signed(params))
+        if method == "signatures":
+            return sanitize({"signatures": self.sigaudit.read(int(params.get("limit") or 50)),
+                             "chain_ok": sigaudit.verify_chain(self.sigaudit.path)[0]})
         raise ValueError(f"unknown method {method}")
 
     def _height(self) -> int:
@@ -168,6 +234,133 @@ class Signer:
     def _mine(self, n: int = 1) -> None:
         addr = self.rpc.call("getnewaddress", "mine", "bech32")
         self.rpc.call("generatetoaddress", int(n), addr)
+
+    def _mine_safe(self) -> None:
+        try:
+            self._mine(1)
+        except Exception:
+            pass
+
+    # --- AGP-013: payer refund, expiry watcher, human sweep ------------------------------------------
+    def _refund_locked(self, key: str, *, auto: bool = False) -> dict:
+        """Broadcast the payer's CLTV refund of a channel the provider did not close. The refund always
+        pays the signer's current hot key: nothing the caller passes can redirect it."""
+        if not self.config.refund_enabled:
+            return _deny("refund_disabled", "refunds are off in this policy")
+        dest = self.channels.find_dest(key) if key else None
+        rec = self.channels.get(dest) if dest else None
+        if rec is None:
+            return _deny("unknown_channel", f"no channel for {key}")
+        base = {"dest": dest, "chan": rec.chan, "expiry": rec.expiry}
+        if rec.state == "refunded":  # idempotent: report the refund already made, never a second one
+            return {"verdict": "allow", "rule": "already_refunded", "already": True, **base,
+                    "txid": rec.refund_txid, "sats": rec.funding_sats - rec.close_fee}
+        if rec.state == "closed":
+            return {**_deny("channel_closed", "the channel was closed; there is nothing to refund"), **base,
+                    "closed_txid": rec.closed_txid or None}
+        h = self._height()
+        if h < rec.expiry:
+            return {**_deny("refund_early", f"height {h}: the refund is valid from the block after {rec.expiry}"),
+                    **base, "height": h}
+        try:
+            utxo = self.rpc.call("gettxout", rec.funding_txid, rec.funding_vout, True)
+        except KnotsRpcError as e:
+            return _deny("refund_rpc", str(e)[:200])
+        if not utxo:
+            spender = self._spender(rec.funding_txid, rec.funding_vout)
+            if spender or self._tx_known(rec.funding_txid):
+                self.channels.mark_closed(dest, spender or "")
+                return {**_deny("channel_closed", "the funding output is already spent (the provider closed)"),
+                        **base, "closed_txid": spender}
+            return {**_deny("funding_unknown", "the funding output is not on this node"), **base}
+        sigaudit.set_rule("watcher:auto_refund" if auto else "policy:refund_enabled")
+        tx, _ = self.channels.refund_tx(dest, self.hot.spk, fee=rec.close_fee)
+        try:
+            txid = self.rpc.call("sendrawtransaction", tx.hex())
+        except KnotsRpcError as e:
+            return {**_deny("refund_rejected", str(e)[:200]), **base}
+        self.channels.mark_refunded(dest, txid)
+        sats = tx.outputs[0].value
+        self.hot.notice_utxo(txid, 0, sats)
+        with self._xbt402.fwd.lock:  # a forward pre-signature on this channel can never be completed now
+            pend = self._xbt402.fwd.data["pending"].pop(dest, None)
+            if pend:
+                self._xbt402.fwd.data["void"][pend["offer"]["outpoint"]] = {"refund": txid, "cum": pend["cum"]}
+                self._xbt402.fwd.save()
+        self.engine.audit.append({"type": "refund", "dest": dest, "chan": rec.chan, "txid": txid, "sats": sats,
+                                  "auto": auto, "ts": self.engine.clock()})
+        return {"verdict": "allow", "rule": "refund", **base, "txid": txid, "sats": sats,
+                "to": self.hot.address, "auto": auto}
+
+    def _spender(self, txid: str, vout: int) -> str | None:
+        try:
+            r = self.rpc.call("gettxspendingprevout", [{"txid": txid, "vout": int(vout)}])
+            return (r[0] or {}).get("spendingtxid") if r else None
+        except Exception:
+            return None
+
+    def _tx_known(self, txid: str) -> bool:
+        try:
+            return bool(self.rpc.call("getrawtransaction", txid, True))
+        except Exception:
+            return False
+
+    def watch_tick(self) -> list[dict]:
+        """One watcher pass: refund every open channel at or past its CLTV expiry, and sweep coins that
+        reached a retired hot key. Channels within the margin already get no new states."""
+        actions = []
+        try:
+            h = self._height()
+        except Exception:
+            return actions
+        for rec in self.channels.open_records():
+            if h >= rec.expiry:
+                with self._spend_lock, sigaudit.context(method="watcher"):
+                    r = self._refund_locked(rec.dest, auto=True)
+                actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, **{k: r.get(k) for k in
+                                ("verdict", "rule", "txid", "sats", "reason")}})
+        with self._spend_lock, sigaudit.context(method="watcher", rule="watcher:retired_sweep"):
+            try:
+                sw = self.hot.sweep_retired()
+            except Exception as e:
+                sw = {"error": str(e)[:200]}
+        if sw:
+            actions.append({"retired_sweep": sw})
+        return actions
+
+    def _watch_loop(self) -> None:
+        while not self._watch_stop.wait(self.watch_interval):
+            try:
+                for a in self.watch_tick():
+                    print(f"watcher: {json.dumps(a, sort_keys=True)}", flush=True)
+            except Exception as e:  # the watcher must outlive a bad tick
+                print(f"watcher error: {e}", flush=True)
+
+    def _sweep_hot_signed(self, params: dict) -> dict:
+        from xbt402.tx import address_to_spk
+        from .approval import sweep_message
+
+        to = (params.get("to") or params.get("address") or "").strip()
+        try:
+            amount = int(params.get("amount_sats") or 0)
+            expiry = int(params.get("expiry") or 0)
+            signature = x2b(params.get("signature") or "")
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "bad amount, expiry or signature"}
+        if not self.human_pubkey or not signature or not verify(
+                self.human_pubkey, sweep_message(self.hot.address, to, amount, expiry), signature):
+            return {"ok": False, "reason": "sweep_hot requires a valid human signature"}
+        if expiry < self.engine.clock():
+            return {"ok": False, "reason": "sweep signature expired"}
+        sigaudit.set_rule("human:sweep_signature")
+        try:
+            out = self.hot.sweep_to(address_to_spk(to), amount)
+        except (RuntimeError, ValueError, KnotsRpcError) as e:
+            return {"ok": False, "reason": str(e)[:200]}
+        self.engine.audit.append({"type": "hot_sweep", "to": to, "sats": amount, "txid": out["txid"],
+                                  "ts": self.engine.clock()})
+        self._mine_safe()
+        return {"ok": True, "to": to, **out, **self.hot.status()}
 
     def _uses_channel(self, dest: str) -> bool:
         dest = normalize_dest(dest)
@@ -184,6 +377,7 @@ class Signer:
         d = self.engine.evaluate(pay, human=human)
         if d.verdict is not Verdict.ALLOW:
             return d.as_dict()
+        sigaudit.set_rule("human:approval_signature" if human else f"policy:{d.rule}")
         dest = pay.normalized(self.engine.clock()).dest
         if self._uses_channel(dest):
             return self._channel_pay(pay, dest, d)
@@ -196,7 +390,8 @@ class Signer:
         return {**d.as_dict(), "txid": txid, "rail": "onchain"}
 
     def _channel_pay(self, pay: Payment, dest: str, d) -> dict:
-        if not self.channels.has(dest):
+        rec = self.channels.get(dest)
+        if rec is None or rec.state != "open":
             opened = self._open_channel_locked({"dest": dest})
             if opened.get("verdict") == "deny":
                 return opened
@@ -204,6 +399,8 @@ class Signer:
             rec, _sig = self.channels.increment(dest, pay.amount_sats)
         except ChannelCapError as e:
             return _deny("channel_cap", str(e))
+        except ChannelError as e:
+            return _deny(e.code, str(e))
         self.engine.commit(pay, txid=rec.chan)
         return {
             **d.as_dict(),
@@ -219,8 +416,9 @@ class Signer:
         dest = normalize_dest(params.get("dest") or params.get("to") or "")
         if not dest:
             return _deny("dest", "destination required")
-        if self.channels.has(dest):
-            return {"verdict": "allow", "already": True, **self.channels.get(dest).public()}
+        existing = self.channels.get(dest)
+        if existing is not None and existing.state == "open":
+            return {"verdict": "allow", "already": True, **existing.public()}
         pay_to = (params.get("pay_to") or self.config.pay_to_for(dest) or "").strip()
         if not pay_to:
             return _deny("pay_to", f"no payTo pubkey registered for {dest}")
@@ -229,8 +427,14 @@ class Signer:
         close_fee = int(params.get("close_fee") or 600)
         from xbt402.channel import ChannelParams
 
+        try:
+            self.hot.check_channel_funding()
+        except HotCapError as e:
+            return {**_deny("hot_balance_cap", str(e)), "action": "human_sweep",
+                    "hot_sats": e.balance, "cap_sats": e.cap}
         secret, payer_pub = self.channels.new_payer_key()
-        expiry = self._height() + expiry_blocks
+        open_height = self._height()
+        expiry = open_height + expiry_blocks
         p = ChannelParams.derive(pay_to, payer_pub, expiry, close_fee, self.hot.spk.hex(),
                                  network=self._xbt402.network())
         funded = cap + close_fee
@@ -240,7 +444,7 @@ class Signer:
             self._mine(1)
         except Exception:
             pass
-        rec = self.channels.add_funded(dest, secret=secret, params=p, cap_sats=cap)
+        rec = self.channels.add_funded(dest, secret=secret, params=p, cap_sats=cap, open_height=open_height)
         return {"verdict": "allow", "rail": "channel", **rec.public(), "funding_sighash": "0x21"}
 
     def _xbt402_pay_locked(self, params: dict) -> dict:
@@ -283,6 +487,7 @@ class Signer:
         d = self.engine.evaluate(pay, human=False)
         if d.verdict is not Verdict.ALLOW:
             return d.as_dict()
+        sigaudit.set_rule(f"policy:{d.rule}")
         try:
             result = self._xbt402.pay_once(
                 url,
@@ -294,6 +499,10 @@ class Signer:
             )
         except ChannelCapError as e:
             return _deny("channel_cap", str(e))
+        except HotCapError as e:
+            return {**_deny("hot_balance_cap", str(e)), "action": "human_sweep", "hot_sats": e.balance, "cap_sats": e.cap}
+        except ChannelError as e:
+            return _deny(e.code, str(e))
         except Exception as e:
             return _deny("xbt402", str(e))
         if result.get("verdict") == "deny":
@@ -324,6 +533,9 @@ class Signer:
             d = self.engine.evaluate(pay, human=False)
             if d.verdict is not Verdict.ALLOW:
                 return d.as_dict()
+            sigaudit.set_rule(f"policy:{d.rule}")
+        else:
+            sigaudit.set_rule("policy:no_increase")
         try:
             sig = self.channels.sign_state_a3(dest, amount)
         except Exception as e:
@@ -376,6 +588,8 @@ class Signer:
         if expiry < now:
             return {"ok": False, "reason": "recover signature expired"}
         tx = self.treasury.recovery_tx(address_to_spk(dest))
+        self.sigaudit.record("treasury_recovery", sig=tx.inputs[0].witness[0], dest=dest, txid=tx.txid(),
+                             rule="human:recover_signature", sighash="0x21")
         try:
             txid = self.rpc.call("sendrawtransaction", tx.hex())
         except KnotsRpcError as e:
@@ -494,6 +708,8 @@ class Signer:
         sock.listen(8)
         os.chmod(self.sock_path, 0o600)
         print(f"signer listening on {self.sock_path}", flush=True)
+        if self.watch_interval > 0:
+            threading.Thread(target=self._watch_loop, name="expiry-watcher", daemon=True).start()
 
         def client(conn: socket.socket):
             buf = b""

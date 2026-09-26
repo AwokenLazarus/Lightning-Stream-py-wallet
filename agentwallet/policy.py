@@ -90,6 +90,11 @@ class PolicyConfig:
     channel_expiry_blocks: int = 1008
     treasury_csv: int = 4320
     counterparties: dict = field(default_factory=dict)
+    # AGP-013
+    refund_enabled: bool = True          # xbt402_refund / the expiry watcher may refund our own channels
+    refund_margin_blocks: int = 6        # no new states this close to a channel's expiry
+    hot_balance_cap_sats: int = 0        # 0 = no cap; above it no new channel is funded (human sweep)
+    forward: dict = field(default_factory=dict)  # forward rail limits (agentwallet/forward.py)
 
     def normalized_allowlist(self) -> frozenset[str]:
         out = set()
@@ -119,8 +124,14 @@ class PolicyConfig:
             "approval_ttl_s",
             "channel_expiry_blocks",
             "treasury_csv",
+            "refund_margin_blocks",
+            "hot_balance_cap_sats",
         }
-        kwargs = {k: raw[k] for k in fields if k in raw}
+        kwargs = {k: int(raw[k]) for k in fields if k in raw}
+        if "refund_enabled" in raw:
+            kwargs["refund_enabled"] = bool(raw["refund_enabled"])
+        if isinstance(raw.get("forward"), dict):
+            kwargs["forward"] = dict(raw["forward"])
         cps = raw.get("counterparties") or {}
         kwargs["counterparties"] = {normalize_dest(k): v for k, v in cps.items()}
         return cls(allowlist=frozenset(allow), **kwargs)

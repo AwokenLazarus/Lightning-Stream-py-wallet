@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.serialization import (
 
 DOMAIN = b"xbt-agentwallet-approve-v1"
 RECOVER_DOMAIN = b"xbt-agentwallet-recover-v1"
+SWEEP_DOMAIN = b"xbt-agentwallet-hot-sweep-v1"
 
 
 def canonical_message(token: str, dest: str, amount_sats: int, expiry: int) -> bytes:
@@ -43,6 +44,19 @@ def recover_message(recovery_address: str, expiry: int) -> bytes:
         [
             RECOVER_DOMAIN,
             (recovery_address or "").encode("utf-8"),
+            str(int(expiry)).encode("ascii"),
+        ]
+    )
+
+
+def sweep_message(hot_address: str, dest: str, amount_sats: int, expiry: int) -> bytes:
+    """AGP-013: a human moves `amount_sats` out of the hot key (above its balance cap) to `dest`."""
+    return b"\n".join(
+        [
+            SWEEP_DOMAIN,
+            (hot_address or "").encode("utf-8"),
+            (dest or "").encode("utf-8"),
+            str(int(amount_sats)).encode("ascii"),
             str(int(expiry)).encode("ascii"),
         ]
     )
