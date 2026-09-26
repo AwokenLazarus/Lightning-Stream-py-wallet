@@ -43,6 +43,7 @@ class Market:
         self.bad_transfer_to = None
         self.lots = {}
         self.height = height
+        self.calls = []
 
     def quote(self, n: int) -> dict:
         esc = Escrow(fecc.pubkey(MINER), fecc.pubkey(MKT), MATURITY_419 + 300)
@@ -73,6 +74,7 @@ class Market:
         path = "/" + url.split("/", 3)[3]
         offer, esc, tx, sig = self.lots[path]
         acc = self.acc(offer)
+        self.calls.append("paid" if "PAYMENT-SIGNATURE" in (headers or {}) else "unpaid")
         if "PAYMENT-SIGNATURE" not in (headers or {}):
             return 402, {"PAYMENT-REQUIRED": b64json({"x402Version": 2, "accepts": [acc]})}, b"{}"
         payload = unb64json(headers["PAYMENT-SIGNATURE"])["payload"]
@@ -130,6 +132,7 @@ class ForwardRail(unittest.TestCase):
         r = self.buy()
         self.assertEqual((r["verdict"], r["rail"], r["delivered"], r["charged_sats"]), ("allow", "xbt402", True, PRICE), r)
         self.assertTrue(r["forward_receipt_ok"])
+        self.assertEqual(self.m.calls, ["unpaid", "paid"], "one 402 request, one paid request")
         tx = BTx.parse(bytes.fromhex(r["transfer_hex"]))
         offer = self.m.lots["/forward/quote?lot=0"][0]
         esc = self.m.lots["/forward/quote?lot=0"][1]

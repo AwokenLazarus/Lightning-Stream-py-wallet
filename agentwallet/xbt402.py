@@ -202,6 +202,9 @@ class Xbt402Session:
             }
         pr = unb64json(hdrs["PAYMENT-REQUIRED"])
         acc = pick_accept(pr, self.network())
+        routed = self._route_offer(url, method, body, max_sats, expiry_blocks, cap_sats, acc)
+        if routed is not None:  # another rail (forward) took the offer; the 402 above is its only unpaid call
+            return routed
         price = int(acc["amount"])
         if price > max_sats:
             return {"verdict": "deny", "rule": "max_sats", "reason": f"quoted {price} > max_sats {max_sats}"}
@@ -254,6 +257,10 @@ class Xbt402Session:
             res.update(self.stream(dest, acc, doc, max_sats - charged))
             res["charged_sats"] = charged + res.pop("stream_charged")
         return res
+
+    def _route_offer(self, url, method, body, max_sats, expiry_blocks, cap_sats, acc):
+        """Hook for rails that buy something other than an HTTP response (forward.py). None = plain call."""
+        return None
 
     def stream(self, dest, acc, doc, budget):
         m, t0 = doc["manifest"], time.time()

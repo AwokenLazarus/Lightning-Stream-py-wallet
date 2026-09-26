@@ -218,7 +218,7 @@ class HotWallet:
             sigs.append((k, sig))
         txid = self.rpc.call("sendrawtransaction", tx.hex())
         for k, sig in sigs:
-            self.audit.record(kind, sig=sig, txid=txid, key=k.spk.hex(), sighash="0x21",
+            self.audit.record(kind, sig=sig, txid=txid, key_spk=k.spk.hex(), sighash="0x21",
                               amount_sats=sum(o.value for o in outs), **audit)
         spent = {(u["txid"], int(u["vout"])) for u in utxos}
         self._utxos = [u for u in self._utxos if (u["txid"], int(u["vout"])) not in spent]

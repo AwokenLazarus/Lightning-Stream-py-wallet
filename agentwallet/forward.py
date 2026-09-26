@@ -40,11 +40,10 @@ from .fwd import adaptor
 from .fwd.buyer import check_transfer, lot_from_offer, receipt_digest, transfer_with, verify_offer
 from .fwd.escrow import ForwardError
 from .policy import normalize_dest
-from .xbt402 import Xbt402Session, _log, origin_of, pick_accept
+from .xbt402 import Xbt402Session, _log, origin_of
 
 from xbt402 import ecc as becc  # noqa: E402  (B1 on sys.path through .xbt402)
 from xbt402.channel import DUST, ChannelError  # noqa: E402
-from xbt402.x402_channel import XbtChannelClient, unb64json  # noqa: E402
 from .fwd.tx import Tx as FTx
 
 DAY_S = 24 * 3600
@@ -102,19 +101,11 @@ class ForwardSession(Xbt402Session):
         self.fwd = ForwardBook(forward_path)
         self.fpolicy = policy or ForwardPolicy()
 
-    def _pay_once(self, url, method, body, max_sats, expiry_blocks, cap_sats):
-        st, hdrs, _ = XbtChannelClient.http(method, url, body or b"")
-        if st == 402:
-            h = {k.upper(): v for k, v in hdrs.items()}
-            acc = None
-            if "PAYMENT-REQUIRED" in h:
-                try:
-                    acc = pick_accept(unb64json(h["PAYMENT-REQUIRED"]), self.network())
-                except (RuntimeError, ValueError, KeyError, TypeError):
-                    acc = None
-            if acc and isinstance((acc.get("extra") or {}).get("forward"), dict):
-                return self._forward(url, method, body, max_sats, expiry_blocks, cap_sats, acc)
-        return super()._pay_once(url, method, body, max_sats, expiry_blocks, cap_sats)
+    def _route_offer(self, url, method, body, max_sats, expiry_blocks, cap_sats, acc):
+        """xbt402's one unpaid request found an offer; a forward lot comes here, anything else stays plain."""
+        if isinstance((acc.get("extra") or {}).get("forward"), dict):
+            return self._forward(url, method, body, max_sats, expiry_blocks, cap_sats, acc)
+        return None
 
     def _gettxout(self, txid, vout):
         return self.rpc.call("gettxout", txid, vout, False)
