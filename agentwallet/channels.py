@@ -76,6 +76,10 @@ class ChannelRecord:
     funding_hex: str = ""       # the signed funding (public once broadcast), re-sent if it went missing
     funding_height: int = 0     # block of the funding once seen confirmed (lookups on a pruned node)
     open_error: str = ""
+    # AGP-020: last signed-but-unacknowledged state. sign_state / pay_once re-hand this
+    # (same cum, same sig) instead of signing a higher one (M3: one call of slack).
+    last_sig: str = ""
+    acked_sats: int = 0
 
     def spent(self) -> int:
         return self.used_sats if self.spent_sats < 0 else self.spent_sats
@@ -369,6 +373,7 @@ class ChannelBook:
                 if sign_cum > payer.params.max_amount:
                     raise ChannelCapError(rec.used_sats, amount_sats, payer.params.max_amount)
                 sig = payer.sign_state(sign_cum)
+                rec.last_sig = sig.hex()
                 self.audit.record("channel_state", sig=sig, chan=rec.chan, dest=rec.dest, cum=sign_cum, sighash="0x21")
             rec.used_sats = sign_cum
             rec.spent_sats = new_spent
@@ -377,7 +382,9 @@ class ChannelBook:
             return ChannelRecord(**asdict(rec)), sig
 
     def sign_state(self, dest: str, cum: int) -> bytes:
-        """Policy-checked caller already decided `cum`. Still refuses a cap breach."""
+        """Policy-checked caller already decided `cum`. Still refuses a cap breach.
+        An already-signed cum hands back the cached signature (AGP-020); a higher
+        one is signed only when the last state has been acknowledged."""
         with self._lock:
             rec = self._records.get(dest)
             if rec is None:
@@ -387,14 +394,39 @@ class ChannelBook:
             if cum < rec.used_sats:
                 raise ChannelError("stale_amount", f"have {rec.used_sats}, got {cum}")
             payer = self._payer_locked(rec)
-            sig = payer.sign_state(cum) if cum > payer.signed else b""
-            if sig:
+            sig = b""
+            if cum > payer.signed:
+                sig = payer.sign_state(cum)
+                rec.last_sig = sig.hex()
                 self.audit.record("channel_state", sig=sig, chan=rec.chan, dest=rec.dest, cum=cum, sighash="0x21")
+            elif rec.last_sig:
+                sig = bytes.fromhex(rec.last_sig)
             rec.used_sats = max(rec.used_sats, cum)
             rec.spent_sats = max(rec.spent(), cum)
             rec.seq += 1
             self._persist()
             return sig
+
+    def resend_state(self, dest: str) -> tuple[ChannelRecord, bytes]:
+        """Re-hand the last signed-but-unacknowledged state (same cum, same sig, fresh seq)."""
+        with self._lock:
+            rec = self._records.get(dest)
+            if rec is None:
+                raise ChannelError("unknown_channel", dest)
+            if not rec.last_sig or rec.used_sats <= rec.acked_sats:
+                raise ChannelError("no_unacked_state", dest)
+            rec.seq += 1
+            self._persist()
+            return ChannelRecord(**asdict(rec)), bytes.fromhex(rec.last_sig)
+
+    def ack_state(self, dest: str, cum: int | None = None) -> None:
+        """The provider recorded this signed cum (a receipt or a PAYMENT-RESPONSE)."""
+        with self._lock:
+            rec = self._records.get(dest)
+            if rec is None:
+                return
+            rec.acked_sats = rec.used_sats if cum is None else min(int(cum), rec.used_sats)
+            self._persist()
 
     # --- AGP-013 lifecycle: provider close seen on-chain, payer refund after expiry ---------------
     def open_records(self) -> list[ChannelRecord]:

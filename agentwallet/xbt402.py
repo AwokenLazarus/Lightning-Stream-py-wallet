@@ -330,11 +330,17 @@ class Xbt402Session:
             opened = {**rec_pub, "funding_txid": rec.funding_txid, "funding_sats": rec.funding_sats}
             _log("open", url=url, chan=rec.chan, txid=rec.funding_txid, capacity=rec.funding_sats,
                  cap=rec.cap_sats, ms=round(1000 * (time.time() - t1), 1))
-        rec, sig = self.book.increment(dest, price)
+        rec = self.book.get(dest)
+        if rec is not None and rec.last_sig and rec.used_sats > rec.acked_sats:
+            rec, sig = self.book.resend_state(dest)   # same (cum, sig); do not sign a higher one (M3)
+        else:
+            rec, sig = self.book.increment(dest, price)
         payload = {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats)}
         if sig:
-            payload["sig"] = sig.hex()
+            payload["sig"] = sig.hex() if isinstance(sig, bytes) else sig
         st2, _, out2, receipt = self._paid(method, url, body, acc, payload)
+        if receipt:
+            self.book.ack_state(dest, rec.used_sats)
         charged = charged_of(receipt, price) if st2 < 400 else 0
         _log("call", url=url, status=st2, ms=round(1000 * (time.time() - t0), 1), chargedSat=charged,
              chan=rec.chan, cum=rec.used_sats, opened=bool(opened))

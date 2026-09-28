@@ -12,7 +12,7 @@ This is the wallet hook XBT-060 / the B1 SDK should use (`fund(address, sats)` â
 | `sign_state` | `dest`, `cum` | policy-checked `{sig, chan, cum}` |
 | `open_channel` | `dest`, `pay_to?`, `cap_sats?`, `expiry_blocks?` | opens a Spillman channel; cap defaults to `per_counterparty_cap_sats` |
 | `channels` | â€” | `{channels:[{dest,chan,cap_sats,used_sats,expiry,residual_sats}]}` |
-| `xbt402_pay` | `url`, `method`, `body`, `max_sats` | policy-checked 402 payment; streamed results: digest + stored path; provider body + receipt verbatim under `untrusted_provider_response` (untrusted data, not key-filtered). AGP-017: `verdict: pending, rule: funding_unconfirmed` while a new channel's funding waits for the offer's `minConf` (call again; the watcher also opens it) |
+| `xbt402_pay` | `url`, `method`, `body`, `max_sats` | policy-checked 402 payment; streamed results: digest + stored path; provider body + receipt verbatim under `untrusted_provider_response` (untrusted data, not key-filtered). AGP-017: `verdict: pending, rule: funding_unconfirmed` while a new channel's funding waits for the offer's `minConf` (call again; the watcher also opens it). AGP-020: a signed state refused before the provider records it is re-sent on the next call (same cum and sig; at most one call of slack) |
 | `notice_hot_txid` | `txid` | register a send-to-hot UTXO |
 | `fund_treasury` | `sats` | 0x21 fund of the CSV-4320 treasury |
 | `recover_treasury` | `signature`, `expiry`, `to` | human-signed CSV recovery (not an MCP tool) |
