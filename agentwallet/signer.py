@@ -318,6 +318,11 @@ class Signer:
             spender = self._spender(rec.funding_txid, rec.funding_vout)
             if spender or self._tx_known(rec.funding_txid):
                 self.channels.mark_closed(dest, spender or "")
+                if spender:  # AGP-016: a provider-built close pays our change to the hot key; learn it now
+                    try:
+                        self.hot.scan_from_txid(spender)
+                    except Exception:
+                        pass
                 return {**_deny("channel_closed", "the funding output is already spent (the provider closed)"),
                         **base, "closed_txid": spender}
             return {**_deny("funding_unknown", "the funding output is not on this node"), **base}

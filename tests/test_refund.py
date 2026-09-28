@@ -78,6 +78,19 @@ class Refund(unittest.TestCase):
         self.assertEqual(self.refund()["rule"], "channel_closed")
         self.assertEqual([x["kind"] for x in self.s.sigaudit.read()], [], "nothing signed")
 
+    def test_provider_close_change_is_noticed(self):
+        """AGP-016: the provider built and broadcast the close; its change output pays our hot key."""
+        close = "ee" * 32
+        self.rpc.utxos.pop((self.p.funding_txid, 0))
+        self.rpc.spenders[(self.p.funding_txid, 0)] = close
+        self.rpc.txs[close] = {"txid": close, "vout": [
+            {"n": 0, "value": 0.00002400, "scriptPubKey": {"hex": "0014" + "22" * 20}},
+            {"n": 1, "value": 0.00097600, "scriptPubKey": {"hex": self.s.hot.spk.hex()}}]}
+        self.rpc.height = 1200
+        self.assertEqual(self.refund()["rule"], "channel_closed")
+        self.assertEqual(self.s.hot.balance_sats(), 97_600)
+        self.assertEqual(self.rpc.sent, [])
+
     def test_cooperative_close_marks_the_channel_closed(self):
         self.s.channels.mark_closed(API, "dd" * 32)
         self.rpc.height = 1200
