@@ -259,13 +259,17 @@ class HotWallet:
             self._stale = [u for u in self._stale if (u["txid"], int(u["vout"])) != (txid, int(vout))]
             self._persist_utxos()
 
-    def scan_from_txid(self, txid: str) -> int:
+    def scan_from_txid(self, txid: str, *, unspent_only: bool = False) -> int:
+        """Notice this tx's outputs to any hot key. `unspent_only` (AGP-016, for closes found after the
+        fact) skips outputs the node says are already spent, so a swept coin is never counted twice."""
         raw = self.rpc.call("getrawtransaction", txid, True)
         added = 0
         for o in raw.get("vout") or []:
             spk = (o.get("scriptPubKey") or {})
             k = self._key_for_spk(spk.get("hex", "")) or next(
                 (k for k in self._keys() if spk.get("address") == k.address), None)
+            if k is not None and unspent_only and not self.rpc.call("gettxout", txid, int(o["n"]), True):
+                continue
             if k is not None:
                 self.notice_utxo(txid, int(o["n"]), int(round(float(o["value"]) * XBT_SATS)), k.spk.hex())
                 added += 1

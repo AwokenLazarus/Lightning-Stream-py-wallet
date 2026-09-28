@@ -304,6 +304,7 @@ class Signer:
             return {"verdict": "allow", "rule": "already_refunded", "already": True, **base,
                     "txid": rec.refund_txid, "sats": rec.funding_sats - rec.close_fee}
         if rec.state == "closed":
+            self._notice_close_change(rec.closed_txid)
             return {**_deny("channel_closed", "the channel was closed; there is nothing to refund"), **base,
                     "closed_txid": rec.closed_txid or None}
         h = self._height()
@@ -318,11 +319,7 @@ class Signer:
             spender = self._spender(rec.funding_txid, rec.funding_vout)
             if spender or self._tx_known(rec.funding_txid):
                 self.channels.mark_closed(dest, spender or "")
-                if spender:  # AGP-016: a provider-built close pays our change to the hot key; learn it now
-                    try:
-                        self.hot.scan_from_txid(spender)
-                    except Exception:
-                        pass
+                self._notice_close_change(spender)
                 return {**_deny("channel_closed", "the funding output is already spent (the provider closed)"),
                         **base, "closed_txid": spender}
             return {**_deny("funding_unknown", "the funding output is not on this node"), **base}
@@ -345,6 +342,16 @@ class Signer:
         self._anchor("refund")
         return {"verdict": "allow", "rule": "refund", **base, "txid": txid, "sats": sats,
                 "to": self.hot.address, "auto": auto}
+
+    def _notice_close_change(self, close_txid: str | None) -> None:
+        """AGP-016: a close pays our change to the hot key. If the provider built it (or its tx had not
+        reached our node when we closed), learn the still-unspent change now."""
+        if not close_txid:
+            return
+        try:
+            self.hot.scan_from_txid(close_txid, unspent_only=True)
+        except Exception:
+            pass
 
     def _spender(self, txid: str, vout: int) -> str | None:
         try:
