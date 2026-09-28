@@ -1,0 +1,85 @@
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 40df169..44b4797 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -10,6 +10,7 @@ use serde::Serialize;
+ use serde_json::{json, value::RawValue, Value};
+ 
+ use std::fs::File;
++use std::str::FromStr;
+ use std::io::Read;
+ use std::path::Path;
+ 
+@@ -22,14 +23,35 @@ use crate::{
+     types::SerBlock,
+ };
+ 
++struct RawChainInfo {
++    headers: u64,
++    blocks: u64,
++    initial_block_download: bool,
++    pruned: bool,
++}
++
++impl From<&serde_json::Value> for RawChainInfo {
++    fn from(v: &serde_json::Value) -> Self {
++        Self {
++            headers: v["headers"].as_u64().unwrap_or(0),
++            blocks: v["blocks"].as_u64().unwrap_or(0),
++            initial_block_download: v["initialblockdownload"].as_bool().unwrap_or(false),
++            pruned: v["pruned"].as_bool().unwrap_or(false),
++        }
++    }
++}
++
+ enum PollResult {
+     Done(Result<()>),
+     Retry,
+ }
+ 
+ fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
+-    match client.get_blockchain_info() {
+-        Ok(info) => {
++    // Knots 29.4.2 renamed `difficulty` to `difficulty_blake2b`, which the typed
++    // bitcoincore-rpc-json struct cannot deserialize: read the fields we need raw.
++    match client.call::<serde_json::Value>("getblockchaininfo", &[]) {
++        Ok(v) => {
++            let info = RawChainInfo::from(&v);
+             if skip_block_download_wait {
+                 // bitcoind RPC is available, don't wait for block download to finish
+                 return PollResult::Done(Ok(()));
+@@ -134,7 +156,7 @@ impl Daemon {
+         if !network_info.network_active {
+             bail!("electrs requires active bitcoind p2p network");
+         }
+-        let info = rpc.get_blockchain_info()?;
++        let info = RawChainInfo::from(&rpc.call::<serde_json::Value>("getblockchaininfo", &[])?);
+         if info.pruned {
+             bail!("electrs requires non-pruned bitcoind node");
+         }
+@@ -219,11 +241,21 @@ impl Daemon {
+     }
+ 
+     pub(crate) fn get_block_txids(&self, blockhash: BlockHash) -> Result<Vec<Txid>> {
+-        Ok(self
++        // raw `getblock <hash> 1`: the typed result needs `difficulty`, renamed in Knots 29.4.2
++        let v: Value = self
+             .rpc
+-            .get_block_info(&blockhash)
+-            .context("failed to get block txids")?
+-            .tx)
++            .call("getblock", &[json!(blockhash), json!(1)])
++            .context("failed to get block txids")?;
++        v["tx"]
++            .as_array()
++            .context("getblock: no tx array")?
++            .iter()
++            .map(|t| {
++                t.as_str()
++                    .context("getblock: txid is not a string")
++                    .and_then(|s| Txid::from_str(s).context("getblock: bad txid"))
++            })
++            .collect()
+     }
+ 
+     pub(crate) fn get_mempool_info(&self) -> Result<json::GetMempoolInfoResult> {

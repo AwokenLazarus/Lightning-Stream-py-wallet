@@ -50,3 +50,9 @@ MCP tools are exactly: `balance`, `quote_payment`, `pay`, `history`, `channels`,
 - `channels` lists a `pending` state (funded, open not yet accepted) with `funding_txid` and `open_error`.
 - `forward_recover` takes an optional `blockhash` (a pruned node finds a confirmed close only with it).
 - `sweep_hot` refuses a destination of another network's hrp and reports `fee_sats` (dust change included), `change_sats`, `outputs`.
+
+## AGP-024 (light client)
+- With `B2_CHAIN_BACKEND=electrum` the signer runs on Electrum servers (`docs/B2_CHAIN_BACKEND.md`); every method above behaves the same except: `balance` has `node_wallet: null` and `chain_backend: "electrum"` (no node wallet), an on-chain `pay` is `deny/light_backend`, `recover_vault` is unavailable, and the signer never mines.
+- `health` adds `chain_backend` (light only): checkpoint, tip, `tip_age_s`, `tip_stale`, servers (`on_best_chain`, errors), `watched_scripts`, `verification_failures`.
+- `chain_backend`: the same, after a header sync; `{"backend": "rpc"}` on the RPC path.
+- A light signer whose servers answer but cannot serve the pinned checkpoint refuses to start (`ChainError` naming `B2_CHAIN`).

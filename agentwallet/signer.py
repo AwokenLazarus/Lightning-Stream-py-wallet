@@ -32,7 +32,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import anchor as anchoring, netparams, sigaudit
+from . import anchor as anchoring, chain as chainbackend, netparams, sigaudit
 from .approval import verify, verify_approval, x2b
 from .channels import ChannelBook, ChannelCapError
 from .forward import ForwardPolicy, ForwardSession
@@ -82,13 +82,19 @@ class Signer:
         datadir = Path(os.environ.get("B2_DATADIR", self.root / ".regtest"))
         conf = Path(os.environ.get("B2_CONF", self.root / "bitcoin-b2.conf"))
         wallet = os.environ.get("B2_WALLET", "agent")
-        self.rpc = rpc if rpc is not None else KnotsRpc(datadir, conf, wallet=wallet)
+        # AGP-024: the RPC backend is KnotsRpc as before; B2_CHAIN_BACKEND=electrum (or auto without a node)
+        # reads the chain from Electrum servers, verified against our own BLAKE2b header chain
+        self.rpc = rpc if rpc is not None else chainbackend.backend_from_env(datadir, conf, wallet, run)
+        self.light = chainbackend.is_light(self.rpc)
         # AGP-017 P3/P5: the chain decides the hrp and whether this process may ever mine
         self.chain = netparams.detect_chain(self.rpc)
+        if self.light:
+            self._check_light_chain()
         if self.config.regtest_mine and not netparams.mining_allowed(self.chain):
             raise netparams.ChainError(f"policy regtest_mine is set but the node is on {self.chain!r}: "
                                        "refusing to start (only regtest may mine)")
-        self.mining = netparams.mining_allowed(self.chain) and self.config.regtest_mine is not False
+        # a light client has no node to mine with (AGP-024): its regtest blocks come from the rig
+        self.mining = netparams.mining_allowed(self.chain) and self.config.regtest_mine is not False and not self.light
         if hasattr(self.rpc, "allow_generate"):
             self.rpc.allow_generate = self.mining
         self.hrp = netparams.hrp(self.chain)
@@ -126,6 +132,17 @@ class Signer:
         self._watch_stop = threading.Event()
         self.watch_interval = float(os.environ.get("B2_WATCH_INTERVAL", "10"))
 
+    def _check_light_chain(self) -> None:
+        """AGP-024: servers that answer but are not on this chain's checkpoint are the wrong chain: refuse
+        to start, as the RPC path refuses a node on another chain. Servers that are down only delay us."""
+        from .electrum import CheckpointMismatch
+        try:
+            self.rpc.sync()
+        except CheckpointMismatch as e:
+            raise netparams.ChainError(f"{netparams.ENV_CHAIN}={self.chain!r}: {e}") from e
+        except Exception:
+            pass
+
     def _check_anchor_at_start(self) -> None:
         """Fail closed if the signature log no longer holds the witness's latest anchor."""
         if not self.anchor.enabled:
@@ -158,13 +175,15 @@ class Signer:
     def _handle(self, method, params: dict) -> dict:
         # A boolean "human" in the request is never a capability. Ignore it.
         if method == "balance":
-            bals = self.rpc.call("getbalances")
+            # AGP-024: a light client has no node wallet; its coins are the hot key's (and channels')
+            bals = {} if self.light else self.rpc.call("getbalances")
             mine = bals.get("mine") or {}
             return sanitize(
                 {
                     "trusted_sats": int(round(float(mine.get("trusted", 0)) * XBT_SATS)),
                     "untrusted_pending_sats": int(round(float(mine.get("untrusted_pending", 0)) * XBT_SATS)),
                     "immature_sats": int(round(float(mine.get("immature", 0)) * XBT_SATS)),
+                    **({"node_wallet": None, "chain_backend": "electrum"} if self.light else {}),
                     "vault": self.vault.status(),
                     "hot": self._hot_status(),
                     "treasury": self.treasury.status(),
@@ -192,7 +211,18 @@ class Signer:
         if method == "recover_vault":
             return sanitize(self._recover_signed(params))
         if method == "health":
-            return {"ok": True, "wallet": self.rpc.wallet, "chain": self.chain, "hrp": self.hrp, "mining": self.mining}
+            out = {"ok": True, "wallet": self.rpc.wallet, "chain": self.chain, "hrp": self.hrp, "mining": self.mining}
+            if self.light:
+                out["chain_backend"] = self.rpc.status()
+            return out
+        if method == "chain_backend":
+            if not self.light:
+                return {"backend": "rpc"}
+            try:
+                self.rpc.sync()
+            except Exception as e:
+                return sanitize({**self.rpc.status(), "sync_error": str(e)[:200]})
+            return sanitize(self.rpc.status())
         if method == "channels":
             return sanitize({"channels": self.channels.list_public(), "height": self._height_safe()})
         if method == "hot_address":
@@ -488,8 +518,37 @@ class Signer:
                 actions.append({"anchor": {k: r.get(k) for k in ("ok", "n", "seq", "alert", "reason")}})
         return actions
 
+    def _watch_scripts(self) -> list[bytes]:
+        """AGP-024: what a light backend subscribes to: every hot key (a close's change, a refund) and the
+        funding script of every channel not yet settled (its spend is the close or the refund)."""
+        from xbt402.channel import funding_script
+        from xbt402.tx import p2wsh_spk
+        spks = [k.spk for k in self.hot._keys()]
+        for rec in self.channels.pending_records() + self.channels.unsettled_records() \
+                + self.channels.pending_close_records():
+            try:
+                spks.append(p2wsh_spk(funding_script(bytes.fromhex(rec.payer_pub), bytes.fromhex(rec.payee_pub),
+                                                     rec.expiry)))
+            except (TypeError, ValueError):
+                pass
+        return spks
+
+    def _watch_wait(self) -> bool:
+        """Sleep until the next watcher tick; True when the signer is stopping. On a light backend the
+        tick comes early when a subscribed script or the tip changes (AGP-022's pending change is
+        retried as soon as the close reaches any server)."""
+        if not self.light:
+            return self._watch_stop.wait(self.watch_interval)
+        try:
+            self.rpc.watch(self._watch_scripts())
+            self.rpc.wait_for_change(self.watch_interval)
+        except Exception as e:
+            print(f"watcher: subscriptions unavailable ({str(e)[:120]})", flush=True)
+            return self._watch_stop.wait(self.watch_interval)
+        return self._watch_stop.is_set()
+
     def _watch_loop(self) -> None:
-        while not self._watch_stop.wait(self.watch_interval):
+        while not self._watch_wait():
             try:
                 for a in self.watch_tick():
                     print(f"watcher: {json.dumps(a, sort_keys=True)}", flush=True)
@@ -543,6 +602,9 @@ class Signer:
         dest = pay.normalized(self.engine.clock()).dest
         if self._uses_channel(dest):
             return self._channel_pay(pay, dest, d)
+        if self.light:
+            return _deny("light_backend", "on-chain pay spends the node wallet, and a light client has none: "
+                                          "pay through a channel")
         txid = self._send(pay)
         self.engine.commit(pay, txid=txid)
         try:
