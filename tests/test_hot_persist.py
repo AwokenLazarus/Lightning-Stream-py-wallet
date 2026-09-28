@@ -170,6 +170,8 @@ class SignerRestart(unittest.TestCase):
         s2 = Signer(tmp, rpc=rpc)                          # restart
         self.assertEqual(s2.hot.status()["hot_sats"], 500_000)
         self.assertTrue(s2.hot.last_reconcile["ok"])
+        at_start = s2.handle({"method": "hot_reconcile", "params": {"last": True}})
+        self.assertEqual((at_start["kept"], at_start["found"], at_start["hot_sats"]), (1, 0, 500_000))
         r = s2.handle({"method": "pay", "params": {"to": "http://api.test", "amount_sats": 1500}})
         self.assertEqual(r["verdict"], "allow", r)
         r = s2.handle({"method": "hot_reconcile", "params": {"scan": True}})

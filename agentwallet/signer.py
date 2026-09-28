@@ -264,6 +264,8 @@ class Signer:
         if method == "anchor_status":
             return sanitize(self.anchor.status())
         if method == "hot_reconcile":
+            if params.get("last"):  # the reconcile the signer ran at start (or the latest one)
+                return sanitize({**self.hot.last_reconcile, **self.hot.status()})
             with self._spend_lock:
                 return sanitize({**self.hot.reconcile(scan=bool(params.get("scan", True))), **self.hot.status()})
         raise ValueError(f"unknown method {method}")

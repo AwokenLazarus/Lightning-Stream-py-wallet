@@ -27,7 +27,7 @@ This is the wallet hook XBT-060 / the B1 SDK should use (`fund(address, sats)` â
 | `signatures` | `limit?` | AGP-013. Tail of the signature audit log + `chain_ok`. AGP-016: `chain_ok` is checked against the witness's latest anchor; `chain` has the details, `anchor` the anchoring status |
 | `anchor_now` | `reason?` | AGP-016. Anchor the log head with the witness now (the signer also does it at start, every `anchor_interval_s` in the watcher, and after every close, refund, sweep, rotation and treasury recovery). Not an MCP tool |
 | `anchor_status` | â€” | AGP-016. Anchored line count and head, lines not yet anchored, the last error. Not an MCP tool |
-| `hot_reconcile` | `scan?` (default true) | AGP-016. Re-check the hot UTXO set against the node (gettxout; with `scan`, scantxoutset over every hot key). Not an MCP tool |
+| `hot_reconcile` | `scan?` (default true), `last?` | AGP-016. With `last`, report the last reconcile (the one at start) without running one. Otherwise re-check the hot UTXO set against the node (gettxout; with `scan`, scantxoutset over every hot key). Not an MCP tool |
 
 Existing methods (`balance`, `quote_payment`, `pay`, `history`, `approve`, `recover_vault`) are unchanged. `pay` to a dest with a channel (or a registered `pay_to`) is an off-chain increment.
 
