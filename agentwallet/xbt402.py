@@ -627,6 +627,7 @@ class Xbt402Session:
         # the provider's reply is untrusted data: only a txid-shaped txid becomes the wallet's own field
         txid = reply.get("txid") if isinstance(reply, dict) else None
         doc = {"txid": txid if isinstance(txid, str) and len(txid) == 64 and all(c in "0123456789abcdef" for c in txid) else None}
+        report = self.close_report(reply, rec)
         close_hex = self._close_hex(reply, doc.get("txid"), rec)
         if self.mine and doc.get("txid"):     # regtest only (P3)
             try:
@@ -639,7 +640,8 @@ class Xbt402Session:
         change = self.learn_close_change(rec, doc.get("txid") or "", scan_from=h0, close_hex=close_hex)
         self.book.mark_closed(dest, doc.get("txid") or "", change=change, close_hex=close_hex)
         _log("close", dest=dest, chan=rec.chan, txid=doc.get("txid"), cum=rec.used_sats,
-             change_spk=rec.payer_spk, hot_spk=self.hot.spk.hex(), close_change=change["status"])
+             change_spk=rec.payer_spk, hot_spk=self.hot.spk.hex(), close_change=change["status"],
+             close_report=report["status"], unpaid_msat=report["unpaid_msat"])
         return {
             "verdict": "allow",
             "rail": "xbt402",
@@ -651,5 +653,37 @@ class Xbt402Session:
             "hot_spk": self.hot.spk.hex(),
             "change_to_hot": rec.payer_spk == self.hot.spk.hex(),
             "close_change": change["status"],
+            "close_report": report,
             UNTRUSTED_KEY: untrusted(out.decode("utf-8", "replace")[:BODY_CAP]),
         }
+
+    @staticmethod
+    def close_report(reply, rec) -> dict:
+        """The provider's (untrusted) close amounts, as integers only, checked against our own state.
+        xbt402 v1.2 (AGP-029): `cum` is the gross state we paid, `unpaidMsat` = spent - cum, and a
+        payee-pays channel adds `payeeFee` (the provider's own close fee) and `payeeNet`. status:
+        "ok" when the report matches what we signed and owes nothing; "debt" when the provider says
+        we still owe (`unpaid_msat` > 0); "mismatch" when its numbers disagree with our channel. The
+        close fee of a payee-pays channel is the provider's and is never a debt of ours."""
+        def num(k):
+            v = reply.get(k) if isinstance(reply, dict) else None
+            if isinstance(v, bool) or not isinstance(v, (str, int)):
+                return None
+            try:
+                n = int(v)
+            except ValueError:
+                return None
+            return n if 0 <= n < 1 << 63 else None
+        cum, unpaid, fee, net = num("cum"), num("unpaidMsat"), num("payeeFee"), num("payeeNet")
+        payee_pays = rec.close_fee_payer == "payee"
+        fee_ok = (fee == rec.close_fee and net == (cum or 0) - rec.close_fee) if payee_pays else (fee is None and net is None)
+        if unpaid:
+            status = "debt"
+        elif cum != rec.used_sats or unpaid is None or not fee_ok:
+            status = "mismatch"
+        else:
+            status = "ok"
+        out = {"status": status, "cum": cum, "unpaid_msat": unpaid}
+        if payee_pays:
+            out.update(payee_fee=fee, payee_net=net)
+        return out
