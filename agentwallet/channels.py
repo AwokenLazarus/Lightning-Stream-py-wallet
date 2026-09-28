@@ -84,6 +84,12 @@ class ChannelRecord:
     # {cum, pre, r, T, T1, route, at, prev_used}. Written before the pre-signature leaves (write-ahead).
     pending_lock: dict = field(default_factory=dict)
     given_up: list = field(default_factory=list)     # recent voided locks {cum, at}: adopt_lock only takes these
+    # AGP-022: the close's change to the hot key. "pending" until it is counted ("counted"), proven
+    # spent ("spent") or absent ("none"); "" on records from before AGP-022. close_scan_from is the next
+    # block the watcher reads for the close (no txindex); close_hex is the close, if the provider sent it
+    close_change: str = ""
+    close_scan_from: int = 0
+    close_hex: str = ""
 
     def spent(self) -> int:
         return self.used_sats if self.spent_sats < 0 else self.spent_sats
@@ -95,6 +101,7 @@ class ChannelRecord:
             "spent_sats": self.spent(),
             **({"open_error": self.open_error} if self.open_error and self.state == "pending" else {}),
             "closed_txid": self.closed_txid or None,
+            **({"close_change": self.close_change} if self.state == "closed" and self.close_change else {}),
             "refund_txid": self.refund_txid or None,
             "dest": self.dest,
             "chan": self.chan,
@@ -559,15 +566,44 @@ class ChannelBook:
         with self._lock:
             return [ChannelRecord(**asdict(r)) for r in self._records.values() if r.state == "pending"]
 
-    def mark_closed(self, key: str, txid: str = "") -> None:
+    def mark_closed(self, key: str, txid: str = "", *, change: dict | None = None, close_hex: str = "") -> None:
+        """`change` is HotWallet.learn_close_change's answer, taken before this call: a reader that sees
+        the channel closed also sees its change counted, or close_change "pending" (AGP-022)."""
         with self._lock:
             rec = self._rec_locked(key)
             if rec.state in ("open", "pending"):
                 rec.state, rec.closed_txid = "closed", txid or rec.closed_txid
-                self._persist()
             elif rec.state == "closed" and txid and not rec.closed_txid:
                 rec.closed_txid = txid
+            elif change is None:
+                return
+            if close_hex and not rec.close_hex:
+                rec.close_hex = close_hex
+            if change is not None and rec.state == "closed":
+                self._note_change_locked(rec, change)
+            self._persist()
+
+    def note_close_change(self, key: str, change: dict) -> None:
+        with self._lock:
+            rec = self._rec_locked(key)
+            if rec.state == "closed" and rec.close_change in ("", "pending"):
+                self._note_change_locked(rec, change)
                 self._persist()
+
+    @staticmethod
+    def _note_change_locked(rec: ChannelRecord, change: dict) -> None:
+        if rec.close_change not in ("", "pending"):      # final: counted, spent or none never change again
+            return
+        rec.close_change = change.get("status") or "pending"
+        rec.close_scan_from = int(change.get("scan_from") or rec.close_scan_from)
+        if change.get("txid") and (not rec.closed_txid or change["txid"] != rec.closed_txid):
+            rec.closed_txid = change["txid"]             # the close that actually spent the funding
+
+    def pending_close_records(self) -> list[ChannelRecord]:
+        """Closed channels whose change is not yet counted (AGP-022)."""
+        with self._lock:
+            return [ChannelRecord(**asdict(r)) for r in self._records.values()
+                    if r.state == "closed" and r.close_change == "pending"]
 
     def refund_tx(self, key: str, dest_spk: bytes, fee: int | None = None):
         """The payer's CLTV refund of the whole funding output to `dest_spk` (B1 `refund_tx`).

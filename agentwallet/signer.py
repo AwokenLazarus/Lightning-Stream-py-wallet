@@ -166,7 +166,7 @@ class Signer:
                     "untrusted_pending_sats": int(round(float(mine.get("untrusted_pending", 0)) * XBT_SATS)),
                     "immature_sats": int(round(float(mine.get("immature", 0)) * XBT_SATS)),
                     "vault": self.vault.status(),
-                    "hot": self.hot.status(),
+                    "hot": self._hot_status(),
                     "treasury": self.treasury.status(),
                     "channels": self.channels.list_public(),
                 }
@@ -196,7 +196,7 @@ class Signer:
         if method == "channels":
             return sanitize({"channels": self.channels.list_public(), "height": self._height_safe()})
         if method == "hot_address":
-            return sanitize(self.hot.status())
+            return sanitize(self._hot_status())
         if method == "notice_hot_txid":
             n = self.hot.scan_from_txid(params.get("txid") or "")
             return sanitize({**self.hot.status(), "noticed": n})
@@ -318,7 +318,8 @@ class Signer:
             if params.get("last"):  # the reconcile the signer ran at start (or the latest one)
                 return sanitize({**self.hot.last_reconcile, **self.hot.status()})
             with self._spend_lock:
-                return sanitize({**self.hot.reconcile(scan=bool(params.get("scan", True))), **self.hot.status()})
+                rec = self.hot.reconcile(scan=bool(params.get("scan", True)))
+                return sanitize({**rec, **self._hot_status()})
         raise ValueError(f"unknown method {method}")
 
     def _height(self) -> int:
@@ -362,7 +363,7 @@ class Signer:
             return {"verdict": "allow", "rule": "already_refunded", "already": True, **base,
                     "txid": rec.refund_txid, "sats": rec.funding_sats - rec.close_fee}
         if rec.state == "closed":
-            self._notice_close_change(rec.closed_txid)
+            self._notice_close_change(dest)
             return {**_deny("channel_closed", "the channel was closed; there is nothing to refund"), **base,
                     "closed_txid": rec.closed_txid or None}
         h = self._height()
@@ -380,8 +381,10 @@ class Signer:
             spender = netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, start)
             known = bool(spender or rec.funding_height or netparams.get_tx(self.rpc, rec.funding_txid))
             if known:
-                self.channels.mark_closed(dest, spender or "")
-                self._notice_close_change(spender)
+                # AGP-022: the change first, then the state: a reader that sees "closed" sees the change
+                change = self._xbt402.learn_close_change(rec, spender or "", scan_from=start)
+                self.channels.mark_closed(dest, spender or "", change=change)
+                spender = spender or change.get("txid") or None
                 return {**_deny("channel_closed", "the funding output is already spent (the provider closed)"),
                         **base, "closed_txid": spender}
             return {**_deny("funding_unknown", "the funding output is not on this node"), **base}
@@ -405,15 +408,37 @@ class Signer:
         return {"verdict": "allow", "rule": "refund", **base, "txid": txid, "sats": sats,
                 "to": self.hot.address, "auto": auto}
 
-    def _notice_close_change(self, close_txid: str | None) -> None:
-        """AGP-016: a close pays our change to the hot key. If the provider built it (or its tx had not
-        reached our node when we closed), learn the still-unspent change now."""
-        if not close_txid:
-            return
-        try:
-            self.hot.scan_from_txid(close_txid, unspent_only=True)
-        except Exception:
-            pass
+    def _notice_close_change(self, dest: str) -> str:
+        """AGP-016/022: a close pays our change to the hot key. If the provider built it (or its tx had not
+        reached our node when we closed), learn the still-unspent change now. Once the answer is final
+        (counted, spent, none) nothing is looked up again, so a coin is never counted twice."""
+        rec = self.channels.get(dest)
+        if rec is None or rec.state != "closed":
+            return ""
+        if rec.close_change not in ("", "pending"):
+            return rec.close_change
+        change = self._xbt402.learn_close_change(rec, rec.closed_txid, close_hex=rec.close_hex)
+        self.channels.note_close_change(dest, change)
+        return change["status"]
+
+    def _settle_close_changes(self) -> list[dict]:
+        """Retry every closed channel whose change is still pending (AGP-022). The caller holds _spend_lock."""
+        out = []
+        for rec in self.channels.pending_close_records():
+            st = self._notice_close_change(rec.dest)
+            if st != "pending":
+                out.append({"dest": rec.dest, "chan": rec.chan, "close_change": st,
+                            "closed_txid": (self.channels.get(rec.dest) or rec).closed_txid})
+        return out
+
+    def _hot_status(self) -> dict:
+        """hot.status() once pending close changes had their chance (AGP-022: a read after a close sees
+        its change, or is told which closes are still pending)."""
+        if self.channels.pending_close_records():
+            with self._spend_lock:
+                self._settle_close_changes()
+        pend = [r.closed_txid or r.chan for r in self.channels.pending_close_records()]
+        return {**self.hot.status(), "hot_pending_close_change": pend}
 
 
     def watch_tick(self) -> list[dict]:
@@ -444,6 +469,10 @@ class Signer:
                     r = self._refund_locked(rec.dest, auto=True)
                 actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, **{k: r.get(k) for k in
                                 ("verdict", "rule", "txid", "sats", "reason")}})
+        if self.channels.pending_close_records():          # AGP-022: a close's change not yet counted
+            with self._spend_lock, sigaudit.context(method="watcher"):
+                for a in self._settle_close_changes():
+                    actions.append({**a, "height": h})
         with self._spend_lock, sigaudit.context(method="watcher", rule="watcher:retired_sweep"):
             try:
                 sw = self.hot.sweep_retired()
@@ -484,6 +513,7 @@ class Signer:
         if expiry < self.engine.clock():
             return {"ok": False, "reason": "sweep signature expired"}
         sigaudit.set_rule("human:sweep_signature")
+        self._settle_close_changes()      # AGP-022: a pending close change is counted before the sweep
         try:
             out = self.hot.sweep_to(address_to_spk(to, self.hrp), amount)   # P5: this chain's hrp only
         except (RuntimeError, ValueError, KnotsRpcError) as e:

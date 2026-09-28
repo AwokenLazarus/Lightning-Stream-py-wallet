@@ -550,6 +550,42 @@ class Xbt402Session:
             self.book._persist()
         return pt
 
+    def _height_or(self, default: int) -> int:
+        try:
+            return int(self.height())
+        except Exception:
+            return default
+
+    @staticmethod
+    def _close_hex(reply, txid: str | None, rec) -> str:
+        """The close's raw hex, if the provider's (untrusted) reply has it: kept only when it is the
+        reported txid and spends this channel's funding output."""
+        h = (reply.get("hex") or reply.get("closeHex")) if isinstance(reply, dict) else None
+        if not (txid and isinstance(h, str) and len(h) < 20_000):
+            return ""
+        try:
+            from xbt402.tx import Tx
+            tx = Tx.parse(bytes.fromhex(h))
+        except Exception:
+            return ""
+        spends = any((i.txid[::-1].hex(), i.vout) == (rec.funding_txid, rec.funding_vout) for i in tx.inputs)
+        return h if tx.txid() == txid and spends else ""
+
+    def learn_close_change(self, rec, txid: str, *, scan_from: int = 0, close_hex: str = "") -> dict:
+        """AGP-022: one attempt at counting a close's change (HotWallet.learn_close_change). With the
+        close's hex, our own node is handed the tx first (it checks it; a copy it has is a no-op)."""
+        if close_hex:
+            try:
+                self.rpc.call("sendrawtransaction", close_hex)
+            except Exception:
+                pass
+        start = scan_from or rec.close_scan_from or rec.funding_height or rec.open_height
+        try:
+            return self.hot.learn_close_change(txid or rec.closed_txid, (rec.funding_txid, rec.funding_vout), start)
+        except Exception as e:
+            return {"status": "pending", "txid": txid or rec.closed_txid, "scan_from": start, "added": 0,
+                    "error": str(e)[:160]}
+
     def close_channel(self, dest: str) -> dict:
         """Cooperative close through the signer: payer signs tagged_hash(xbt402/close, chan)."""
         rec = self.book.get(dest)
@@ -563,6 +599,7 @@ class Xbt402Session:
         close_url = origin.rstrip("/") + "/x402/xbt-channel/close"
         payload = {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats)}
         body = {"chan": rec.chan, "sig": sig, "payload": payload}
+        h0 = self._height_or(0)               # AGP-022: no block before this one can hold the close
         st, _, out = XbtChannelClient.http(
             "POST", close_url, json.dumps(body).encode(), {"Content-Type": "application/json"}
         )
@@ -575,19 +612,19 @@ class Xbt402Session:
         # the provider's reply is untrusted data: only a txid-shaped txid becomes the wallet's own field
         txid = reply.get("txid") if isinstance(reply, dict) else None
         doc = {"txid": txid if isinstance(txid, str) and len(txid) == 64 and all(c in "0123456789abcdef" for c in txid) else None}
-        self.book.mark_closed(dest, doc.get("txid") or "")
+        close_hex = self._close_hex(reply, doc.get("txid"), rec)
         if self.mine and doc.get("txid"):     # regtest only (P3)
             try:
                 self.mine(1)
             except Exception:
                 pass
-        if doc.get("txid"):
-            try:
-                self.hot.scan_from_txid(doc["txid"])
-            except Exception:
-                pass
+        # AGP-022: the provider broadcast the close on its node; ours may get it seconds later (P2P), or
+        # only in a block. Learn the change now if we can, then mark the channel closed with the answer:
+        # a "pending" change is retried by the watcher (and before a balance read) until it is final.
+        change = self.learn_close_change(rec, doc.get("txid") or "", scan_from=h0, close_hex=close_hex)
+        self.book.mark_closed(dest, doc.get("txid") or "", change=change, close_hex=close_hex)
         _log("close", dest=dest, chan=rec.chan, txid=doc.get("txid"), cum=rec.used_sats,
-             change_spk=rec.payer_spk, hot_spk=self.hot.spk.hex())
+             change_spk=rec.payer_spk, hot_spk=self.hot.spk.hex(), close_change=change["status"])
         return {
             "verdict": "allow",
             "rail": "xbt402",
@@ -598,5 +635,6 @@ class Xbt402Session:
             "change_spk": rec.payer_spk,
             "hot_spk": self.hot.spk.hex(),
             "change_to_hot": rec.payer_spk == self.hot.spk.hex(),
+            "close_change": change["status"],
             UNTRUSTED_KEY: untrusted(out.decode("utf-8", "replace")[:BODY_CAP]),
         }

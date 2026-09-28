@@ -54,6 +54,8 @@ DUST = 546
 AAD = "b2/hot-key"
 UTXO_AAD = "b2/hot-utxos"
 MAX_STALE = 500
+CLOSE_MAX_OUTPUTS = 4        # a close has 1-3 outputs (payee, our change, a hash lock)
+CLOSE_SCAN_MAX = 144         # blocks one learn_close_change call reads; the next call goes on from there
 
 
 class HotCapError(RuntimeError):
@@ -280,6 +282,83 @@ class HotWallet:
                 self.notice_utxo(txid, int(o["n"]), int(round(float(o["value"]) * XBT_SATS)), k.spk.hex())
                 added += 1
         return added
+
+    def learn_close_change(self, txid: str, funding: tuple[str, int], scan_from: int = 0,
+                           *, limit: int = CLOSE_SCAN_MAX) -> dict:
+        """AGP-022: count a channel close's change to a hot key, once. Called at the close and again on
+        every watcher tick (and before a balance read) until the answer is final.
+
+        The close may be built and broadcast by the provider on its own node, so it can be missing from
+        ours for a while, and it may confirm before our mempool ever sees it. Without txindex it is looked
+        up in the mempool, then by its outputs (gettxout, which also sees confirmed coins), then in the
+        blocks from `scan_from` on (by the funding outpoint it spends, so a different close is found too).
+
+        Returns {"status", "txid", "scan_from", "added"}. status: "counted" (our change is in the set),
+        "none" (the close pays no hot key), "spent" (it did, but that output is already spent: never
+        counted), or "pending" (the close is not on this node yet: ask again later)."""
+        from .netparams import get_tx
+        out = {"status": "pending", "txid": txid or "", "scan_from": int(scan_from or 0), "added": 0}
+        if not txid:                                      # the provider's reply had no txid: find the spend
+            try:
+                r = self.rpc.call("gettxspendingprevout", [{"txid": funding[0], "vout": int(funding[1])}])
+                out["txid"] = txid = ((r[0] or {}).get("spendingtxid") if r else None) or ""
+            except Exception:
+                pass
+        raw = get_tx(self.rpc, txid) if txid else None    # the mempool (or a txindex)
+        if raw is None and txid:                          # confirmed: its unspent outputs answer gettxout
+            for n in range(CLOSE_MAX_OUTPUTS):
+                c = self.rpc.call("gettxout", txid, n, True)
+                if c and self._key_for_spk((c.get("scriptPubKey") or {}).get("hex", "")) is not None:
+                    return {**out, "status": "counted", "added": self._count_close(txid, [(n, c)])}
+        if raw is None:                                   # no unspent output of ours: find it in a block
+            raw = self._close_in_blocks(out, funding, limit)
+            txid = out["txid"]
+        if raw is None:
+            return out
+        mine = []
+        for o in raw.get("vout") or []:
+            spk = (o.get("scriptPubKey") or {})
+            if self._key_for_spk(spk.get("hex", "")) is not None or any(spk.get("address") == k.address for k in self._keys()):
+                mine.append(int(o["n"]))
+        if not mine:
+            return {**out, "status": "none"}
+        live = [(n, c) for n in mine if (c := self.rpc.call("gettxout", txid, n, True))]
+        if not live:
+            return {**out, "status": "spent"}
+        return {**out, "status": "counted", "added": self._count_close(txid, live)}
+
+    def _count_close(self, txid: str, coins: list[tuple[int, dict]]) -> int:
+        """Add unspent close outputs (gettxout results) that pay a hot key; notice_utxo never adds twice."""
+        before = len(self._utxos)
+        for n, c in coins:
+            k = self._key_for_spk((c.get("scriptPubKey") or {}).get("hex", ""))
+            if k is not None:
+                self.notice_utxo(txid, n, int(round(float(c["value"]) * XBT_SATS)), k.spk.hex())
+        return len(self._utxos) - before
+
+    def _close_in_blocks(self, out: dict, funding: tuple[str, int], limit: int) -> dict | None:
+        """The block tx spending `funding`, from out["scan_from"] to the tip. Blocks already read are not
+        read again: out["scan_from"] moves past them. Sets out["txid"] if the spend is a different tx."""
+        try:
+            tip = int(self.rpc.call("getblockcount"))
+        except Exception:
+            return None
+        start = out["scan_from"] or tip
+        if start > tip:
+            return None
+        end = min(tip, start + limit - 1)
+        for h in range(start, end + 1):
+            try:
+                blk = self.rpc.call("getblock", self.rpc.call("getblockhash", h), 2)
+            except Exception:
+                return None                               # keep scan_from here: retry this block next time
+            for tx in blk.get("tx") or []:
+                if any(v.get("txid") == funding[0] and int(v.get("vout", -1)) == int(funding[1])
+                       for v in tx.get("vin") or []):
+                    out["txid"], out["scan_from"] = tx.get("txid") or out["txid"], h
+                    return tx
+            out["scan_from"] = h + 1
+        return None
 
     def _scan_utxoset_for(self, txid: str) -> int:
         """Unspent outputs of `txid` to any hot key, from scantxoutset (confirmed coins only)."""
