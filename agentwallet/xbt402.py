@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from . import netparams
 from .b1path import ensure_b1
-from .channels import ChannelBook
+from .channels import ChannelBook, fee_payer_kw
 from .hot import HotWallet
 from .sanitize import UNTRUSTED_KEY, untrusted
 from .stream import H, StreamError, check_chunk, check_manifest, open_final
@@ -141,16 +141,22 @@ class Xbt402Session:
             # no provider text in the wallet's own errors: the model reads them unlabelled (AGP-005 L12)
             raise RuntimeError(f"provider payee-key derivation is not {DERIVATION!r}; refused before funding")
         close_fee = int(extra.get("closeFeeSat") or 600)
+        # the cap holds under payee-pays too: the least state is dust + closeFeeSat (xbt402 v1.2)
         if self.close_fee_max and close_fee > self.close_fee_max:
             raise RuntimeError(f"offer closeFeeSat {close_fee} is above this wallet's cap {self.close_fee_max}; "
                                "refused before funding")
-        # min/maxCapacity bound the funding output (B1 check_funding), which is cap + closeFeeSat.
+        fee_payer = extra.get("closeFeePayer", "payer")
+        if fee_payer not in ("payer", "payee"):
+            raise RuntimeError("offer closeFeePayer is neither payer nor payee; refused before funding")
+        # payer-pays: we fund our close fee on top of the cap; payee-pays: the payee's output carries it
+        payer_fee = close_fee if fee_payer == "payer" else 0
+        # min/maxCapacity bound the funding output (B1 check_funding), which is cap + our close fee.
         # AGP-017: comparing the cap alone funded 10,600 for a 10,000-only offer, which the provider refuses.
         min_cap = int(extra.get("minCapacity") or 0)
-        max_cap = int(extra.get("maxCapacity") or (cap_sats + close_fee))
-        cap = max(cap_sats, min_cap - close_fee)
-        if cap + close_fee > max_cap:
-            raise RuntimeError(f"channel capacity {cap + close_fee} above provider max {max_cap}")
+        max_cap = int(extra.get("maxCapacity") or (cap_sats + payer_fee))
+        cap = max(cap_sats, min_cap - payer_fee)
+        if cap + payer_fee > max_cap:
+            raise RuntimeError(f"channel capacity {cap + payer_fee} above provider max {max_cap}")
         min_exp = int(extra.get("minExpiryBlocks") or 1)
         max_exp = int(extra.get("maxExpiryBlocks") or 100_000)
         blocks = min(max(expiry_blocks, min_exp + 6), max_exp - 1)
@@ -162,8 +168,8 @@ class Xbt402Session:
         secret, payer_pub = self.book.new_payer_key()
         # Change at close returns to the signer's hot key, not the per-channel payer key.
         params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex(),
-                                      network=acc["network"])
-        funded = cap + close_fee
+                                      network=acc["network"], **fee_payer_kw(fee_payer))
+        funded = cap + payer_fee
         try:
             min_conf = max(0, int(extra.get("minConf", 1)))
         except (TypeError, ValueError):
@@ -230,9 +236,8 @@ class Xbt402Session:
                 "expiry": rec.expiry,
                 "payerPub": rec.payer_pub,
                 "payerSpk": rec.payer_spk,
-                "redeemScript": ChannelParams(payer_pub=rec.payer_pub, payee_pub=rec.payee_pub, expiry=rec.expiry,
-                                              payer_spk=rec.payer_spk, payee_spk=rec.payee_spk,
-                                              close_fee=rec.close_fee).script.hex(),
+                "redeemScript": rec.params().script.hex(),
+                **({"closeFeePayer": rec.close_fee_payer} if rec.close_fee_payer != "payer" else {}),
             },
         }
         try:
@@ -249,6 +254,16 @@ class Xbt402Session:
             except (ValueError, AttributeError):
                 code = ""
             code = code if safe_code(code) else ""     # no provider text in the wallet's errors (L12)
+        if st == 200:
+            try:
+                echoed = json.loads(out).get("closeFeePayer", "payer")
+            except (ValueError, AttributeError):
+                echoed = None
+            if echoed != rec.close_fee_payer:
+                # the provider would refuse every state we sign: never mark it open (refunded at expiry)
+                self.book.note_pending(dest, open_error="open refused: provider opened another closeFeePayer")
+                raise RuntimeError("open failed: the provider did not take the offer's closeFeePayer; the channel "
+                                   "stays pending and is refunded at expiry")
         if st == 200 or code == "duplicate_channel":
             opened = self.book.mark_open(dest)
             _log("opened", dest=dest, chan=opened.chan, confirmations=confs, duplicate=st != 200)

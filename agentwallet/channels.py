@@ -34,7 +34,13 @@ from .sigaudit import NullAudit
 
 ensure_b1()
 from xbt402 import ecc  # noqa: E402
-from xbt402.channel import DUST, ChannelError, ChannelParams, Payer  # noqa: E402
+from xbt402.channel import ChannelError, ChannelParams, Payer  # noqa: E402
+
+
+def fee_payer_kw(fee_payer: str) -> dict:
+    """ChannelParams keyword for a v1.2 payee-pays channel; nothing for payer-pays, so a B1 pin from
+    before AGP-023 (no close_fee_payer) still builds every v1.1 channel."""
+    return {} if fee_payer == "payer" else {"close_fee_payer": fee_payer}
 
 
 class ChannelCapError(RuntimeError):
@@ -90,6 +96,18 @@ class ChannelRecord:
     close_change: str = ""
     close_scan_from: int = 0
     close_hex: str = ""
+    # AGP-023 (xbt402 v1.2): who pays close_fee, fixed at open. "payer" (v1.1, and every record from
+    # before AGP-023); "payee" when the offer said closeFeePayer "payee": the payee's output carries
+    # the fee and ours is capacity - cum, so the least state is dust + close_fee
+    close_fee_payer: str = "payer"
+
+    def params(self) -> ChannelParams:
+        """The channel's ChannelParams, rebuilt byte for byte from this record."""
+        return ChannelParams(
+            payer_pub=self.payer_pub, payee_pub=self.payee_pub, expiry=self.expiry, payer_spk=self.payer_spk,
+            payee_spk=self.payee_spk, close_fee=self.close_fee, funding_txid=self.funding_txid,
+            funding_vout=self.funding_vout, capacity=self.funding_sats or self.cap_sats,
+            **fee_payer_kw(self.close_fee_payer))
 
     def spent(self) -> int:
         return self.used_sats if self.spent_sats < 0 else self.spent_sats
@@ -111,6 +129,7 @@ class ChannelRecord:
             "residual_sats": max(0, self.cap_sats - self.used_sats),
             "seq": self.seq,
             "origin": self.origin,
+            **({"close_fee_payer": self.close_fee_payer} if self.close_fee_payer != "payer" else {}),
             **({"pending_lock_cum": self.pending_lock.get("cum")} if self.pending_lock else {}),
         }
 
@@ -307,7 +326,8 @@ class ChannelBook:
             expiry=params.expiry, payer_pub=params.payer_pub, payee_pub=params.payee_pub,
             close_fee=params.close_fee, payer_spk=params.payer_spk, payee_spk=params.payee_spk,
             funding_txid=params.funding_txid, funding_vout=params.funding_vout, funding_sats=params.capacity,
-            seq=0, origin=origin, open_height=int(open_height or 0), spent_sats=0)
+            seq=0, origin=origin, open_height=int(open_height or 0), spent_sats=0,
+            close_fee_payer=getattr(params, "close_fee_payer", "payer"))
 
     def add_funded(
         self,
@@ -347,18 +367,7 @@ class ChannelBook:
         secret = self._secrets.get(rec.chan)
         if secret is None:
             raise ChannelError("bad_key", "signer has no key for this channel")
-        params = ChannelParams(
-            payer_pub=rec.payer_pub,
-            payee_pub=rec.payee_pub,
-            expiry=rec.expiry,
-            payer_spk=rec.payer_spk,
-            payee_spk=rec.payee_spk,
-            close_fee=rec.close_fee,
-            funding_txid=rec.funding_txid,
-            funding_vout=rec.funding_vout,
-            capacity=rec.funding_sats or rec.cap_sats,
-        )
-        payer = Payer(params, secret)
+        payer = Payer(rec.params(), secret)
         payer.signed = rec.used_sats
         return payer
 
@@ -375,10 +384,11 @@ class ChannelBook:
                 raise ChannelCapError(spent, amount_sats, rec.cap_sats)
             new_spent = spent + amount_sats
             sign_cum = max(new_spent, rec.used_sats)
-            if 0 < sign_cum < DUST:
-                if DUST > rec.cap_sats:
-                    raise ChannelCapError(spent, DUST - spent, rec.cap_sats)
-                sign_cum = DUST
+            floor = getattr(rec.params(), "min_amount", 546)   # dust, + close_fee on a payee-pays channel (v1.2)
+            if 0 < sign_cum < floor:
+                if floor > rec.cap_sats:
+                    raise ChannelCapError(spent, floor - spent, rec.cap_sats)
+                sign_cum = floor
             self._plain_over_lock_locked(rec, sign_cum)
             payer = self._payer_locked(rec)
             sig = b""
@@ -615,11 +625,7 @@ class ChannelBook:
             secret = self._secrets.get(rec.chan)
             if secret is None:
                 raise ChannelError("bad_key", "signer has no key for this channel")
-            params = ChannelParams(
-                payer_pub=rec.payer_pub, payee_pub=rec.payee_pub, expiry=rec.expiry, payer_spk=rec.payer_spk,
-                payee_spk=rec.payee_spk, close_fee=rec.close_fee, funding_txid=rec.funding_txid,
-                funding_vout=rec.funding_vout, capacity=rec.funding_sats or rec.cap_sats)
-            tx = params.refund_tx(secret, dest_spk=dest_spk, fee=fee)
+            tx = rec.params().refund_tx(secret, dest_spk=dest_spk, fee=fee)
             self.audit.record("refund", sig=tx.inputs[0].witness[0], chan=rec.chan, dest=rec.dest, txid=tx.txid(),
                               amount_sats=tx.outputs[0].value, locktime=rec.expiry, sighash="0x21")
             return tx, rec.expiry

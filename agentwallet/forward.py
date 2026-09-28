@@ -43,7 +43,7 @@ from .policy import normalize_dest
 from .xbt402 import Xbt402Session, _log, origin_of
 
 from xbt402 import ecc as becc  # noqa: E402  (B1 on sys.path through .xbt402)
-from xbt402.channel import DUST, ChannelError  # noqa: E402
+from xbt402.channel import ChannelError  # noqa: E402
 from .fwd.tx import Tx as FTx
 
 DAY_S = 24 * 3600
@@ -158,8 +158,8 @@ class ForwardSession(Xbt402Session):
             cum = rec.used_sats + price
             if cum > rec.cap_sats or cum > payer.params.max_amount:
                 raise ChannelCapError(rec.used_sats, price, min(rec.cap_sats, payer.params.max_amount))
-            if cum < DUST:
-                raise ChannelError("bad_amount", "state below dust")
+            if cum < getattr(payer.params, "min_amount", 546):
+                raise ChannelError("bad_amount", "state below the channel's least state")
             z = payer.params.sighash(payer.params.state_tx(cum))
             pre = adaptor.presign(payer.secret, z, lot.S)
             self.book.audit.record("adaptor_presig", sig=pre.R + pre.s1.to_bytes(32, "big"), chan=rec.chan, dest=dest,
