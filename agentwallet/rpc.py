@@ -20,6 +20,8 @@ class KnotsRpc:
         self.wallet = wallet
         self._url = None
         self._auth = None
+        # AGP-017 P3: block-generating RPCs only when the signer has confirmed the node is regtest
+        self.allow_generate = False
 
     def _cookie(self) -> tuple[str, str]:
         # Knots writes the cookie under <datadir>/regtest/.cookie
@@ -51,6 +53,9 @@ class KnotsRpc:
         }
         if method.lower() in forbidden:
             raise KnotsRpcError(f"signer refuses RPC method {method}")
+        if method.lower() in {"generatetoaddress", "generatetodescriptor", "generateblock", "generate"} \
+                and not self.allow_generate:
+            raise KnotsRpcError(f"signer refuses {method}: mining is for regtest only")
         user, pw = self._cookie()
         payload = json.dumps({"jsonrpc": "1.0", "id": "b2", "method": method, "params": list(params)}).encode()
         req = urllib.request.Request(

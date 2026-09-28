@@ -205,6 +205,7 @@ class ForwardSession(Xbt402Session):
             p = self.fwd.data["pending"].pop(dest)
             rec = self.book._records[dest]
             rec.used_sats = max(rec.used_sats, p["cum"])
+            rec.spent_sats = max(rec.spent(), p["cum"])
             self.book._persist()
             self.fwd.data["delivered"][p["offer"]["outpoint"]] = {
                 "txid": tx.txid(), "hex": tx.hex(), "deliverHeight": p["offer"]["deliverHeight"], "price": p["price"],
@@ -212,10 +213,13 @@ class ForwardSession(Xbt402Session):
             self.fwd.save()
         return p
 
-    def forward_recover(self, close_txid: str) -> dict:
+    def forward_recover(self, close_txid: str, blockhash: str = "") -> dict:
         """Read a channel close; if it carries our completed adaptor state, extract s and finish the
         transfer. If it closes with a lower state, the pending purchase is void: nothing was paid."""
-        raw = self.rpc.call("getrawtransaction", close_txid)
+        from .netparams import get_tx
+        raw = (get_tx(self.rpc, close_txid, blockhash) or {}).get("hex")   # AGP-017 P6: no txindex needed
+        if not raw:
+            raise RuntimeError("close transaction not found in the mempool (pass its block hash on a pruned node)")
         close = FTx.parse(bytes.fromhex(raw))
         spent = {(i.txid[::-1].hex(), i.vout): i for i in close.inputs}
         with self.fwd.lock:

@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import netparams
 from .b1path import ensure_b1
 from .channels import ChannelBook
 from .hot import HotWallet
@@ -38,6 +39,7 @@ from xbt402.x402_channel import (  # noqa: E402
     network_id,
     receipt_of,
     request_digest,
+    safe_code,
     unb64json,
 )
 
@@ -97,34 +99,58 @@ def _store_body(raw: bytes, name: str) -> dict:
 
 
 class Xbt402Session:
-    """One signer-owned client session: channels keyed by HTTP origin."""
+    """One signer-owned client session: channels keyed by HTTP origin.
 
-    def __init__(self, book: ChannelBook, hot: HotWallet, rpc, height, mine=None):
+    AGP-017: `chain` is the node's chain (netparams). The network id comes from the spec's anchor
+    (block 961640 on mainnet, P4); a mining hook is refused on any chain but regtest (P3); a channel
+    is recorded before its funding is broadcast and opened only once the funding has the offer's
+    minConf (P1, P2)."""
+
+    OPEN_POLL_S = 2.0
+
+    def __init__(self, book: ChannelBook, hot: HotWallet, rpc, height, mine=None, *, chain: str = "regtest",
+                 open_wait_s: float = 45, close_fee_max: int = 0, refund_margin: int = 6):
+        if mine is not None and not netparams.mining_allowed(chain):
+            raise netparams.ChainError(f"a mining hook on {chain!r}: only regtest may mine")
         self.book = book
         self.hot = hot
         self.rpc = rpc
         self.height = height
         self.mine = mine
+        self.chain = chain
+        self.open_wait_s = float(open_wait_s)
+        self.close_fee_max = int(close_fee_max or 0)
+        self.refund_margin = int(refund_margin)
+        self._net = None
 
     def network(self) -> str:
-        h = self.height()
-        tip = h if h >= 101 else 101
+        if self.chain != "regtest":
+            if self._net is None:            # a wrong anchor block raises: never pay on a network we can't name
+                self._net = netparams.network(self.rpc, self.chain)
+            return self._net
         try:
-            return network_id(self.rpc.call("getblockhash", min(tip, 101)))
+            return netparams.network(self.rpc, self.chain, tip=self.height())
         except Exception:
             return network_id("0" * 64)
 
     def open_from_offer(self, dest: str, acc: dict, cap_sats: int, expiry_blocks: int) -> dict:
+        """Fund a channel for this offer and open it. Returns the channel's public record, or one with
+        state "pending" when the funding has not reached the offer's minConf within `open_wait_s`."""
         extra = acc.get("extra") or {}
         if extra.get("derivation") != DERIVATION:  # checked before funding: a mismatch strands the coins
             # no provider text in the wallet's own errors: the model reads them unlabelled (AGP-005 L12)
             raise RuntimeError(f"provider payee-key derivation is not {DERIVATION!r}; refused before funding")
         close_fee = int(extra.get("closeFeeSat") or 600)
+        if self.close_fee_max and close_fee > self.close_fee_max:
+            raise RuntimeError(f"offer closeFeeSat {close_fee} is above this wallet's cap {self.close_fee_max}; "
+                               "refused before funding")
+        # min/maxCapacity bound the funding output (B1 check_funding), which is cap + closeFeeSat.
+        # AGP-017: comparing the cap alone funded 10,600 for a 10,000-only offer, which the provider refuses.
         min_cap = int(extra.get("minCapacity") or 0)
-        max_cap = int(extra.get("maxCapacity") or cap_sats)
-        cap = max(cap_sats, min_cap)
-        if cap > max_cap:
-            raise RuntimeError(f"channel cap {cap} above provider max {max_cap}")
+        max_cap = int(extra.get("maxCapacity") or (cap_sats + close_fee))
+        cap = max(cap_sats, min_cap - close_fee)
+        if cap + close_fee > max_cap:
+            raise RuntimeError(f"channel capacity {cap + close_fee} above provider max {max_cap}")
         min_exp = int(extra.get("minExpiryBlocks") or 1)
         max_exp = int(extra.get("maxExpiryBlocks") or 100_000)
         blocks = min(max(expiry_blocks, min_exp + 6), max_exp - 1)
@@ -138,31 +164,98 @@ class Xbt402Session:
         params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex(),
                                       network=acc["network"])
         funded = cap + close_fee
-        txid, vout = self.hot.fund(params.spk, funded)
-        params.funding_txid, params.funding_vout, params.capacity = txid, vout, funded
-        if self.mine:
-            self.mine(1)
-        origin = dest
-        open_url = origin + extra.get("openUrl", "/x402/xbt-channel/open")
+        try:
+            min_conf = max(0, int(extra.get("minConf", 1)))
+        except (TypeError, ValueError):
+            min_conf = 1
+        prep = self.hot.prepare_fund(params.spk, funded)
+        params.funding_txid, params.funding_vout, params.capacity = prep["txid"], 0, funded
+        # P1 write-ahead: the payer key is sealed on disk, with everything the refund needs, before
+        # the funding exists anywhere but here
+        self.book.add_pending(dest, secret=secret, params=params, origin=dest, cap_sats=cap,
+                              open_height=open_height, open_url=dest + extra.get("openUrl", "/x402/xbt-channel/open"),
+                              network=acc["network"], min_conf=min_conf, funding_hex=prep["hex"])
+        try:
+            self.hot.broadcast(prep)
+        except Exception:
+            self.book.drop_pending(dest, params.channel_id)
+            raise
+        self.hot.commit(prep)
+        _log("funding", dest=dest, chan=params.channel_id, txid=prep["txid"], capacity=funded, expiry=expiry,
+             min_conf=min_conf)
+        return self.complete_open(dest, wait_s=self.open_wait_s)
+
+    def funding_confirmations(self, rec) -> int | None:
+        """Confirmations of a channel's funding output; None when the node does not have it at all."""
+        r = self.rpc.call("gettxout", rec.funding_txid, int(rec.funding_vout), True)
+        return None if not r else int(r.get("confirmations") or 0)
+
+    def complete_open(self, dest: str, wait_s: float = 0) -> dict:
+        """P2: post a pending channel's open once its funding has `min_conf` confirmations (waiting up
+        to `wait_s`), and mark it open when the provider accepts it (`duplicate_channel` counts: the
+        provider already has it). Otherwise it stays pending, and the watcher retries or refunds it."""
+        rec = self.book.get(dest)
+        if rec is None or rec.state != "pending":
+            return rec.public() if rec else {}
+        confs = self.funding_confirmations(rec)
+        if confs is None and rec.funding_hex:          # never reached the node, or was evicted: send it again
+            try:
+                self.rpc.call("sendrawtransaction", rec.funding_hex)
+                confs = 0
+            except Exception:
+                pass
+        if confs is not None and confs < rec.min_conf and self.mine:
+            self.mine(rec.min_conf - confs)            # regtest only (P3)
+            confs = self.funding_confirmations(rec)
+        deadline = time.time() + max(0.0, wait_s)
+        while (confs is None or confs < rec.min_conf) and time.time() < deadline:
+            time.sleep(min(self.OPEN_POLL_S, max(0.05, deadline - time.time())))
+            confs = self.funding_confirmations(rec)
+        if confs is None or confs < rec.min_conf:
+            return {**rec.public(), "confirmations": confs or 0, "min_conf": rec.min_conf}
+        if confs >= 1 and not rec.funding_height:
+            where = netparams.block_of(self.rpc, rec.funding_txid, rec.funding_vout)
+            if where:
+                self.book.note_pending(dest, funding_height=where[0])
+        if self.height() >= rec.expiry - self.refund_margin:
+            self.book.note_pending(dest, open_error="too close to expiry to open; refunded at expiry")
+            return {**self.book.get(dest).public(), "confirmations": confs, "min_conf": rec.min_conf}
         body = {
             "x402Version": 2,
-            "network": acc["network"],
+            "network": rec.network,
             "channel": {
-                "txid": txid,
-                "vout": vout,
-                "capacity": funded,
-                "expiry": expiry,
-                "payerPub": params.payer_pub,
-                "payerSpk": params.payer_spk,
-                "redeemScript": params.script.hex(),
+                "txid": rec.funding_txid,
+                "vout": rec.funding_vout,
+                "capacity": rec.funding_sats,
+                "expiry": rec.expiry,
+                "payerPub": rec.payer_pub,
+                "payerSpk": rec.payer_spk,
+                "redeemScript": ChannelParams(payer_pub=rec.payer_pub, payee_pub=rec.payee_pub, expiry=rec.expiry,
+                                              payer_spk=rec.payer_spk, payee_spk=rec.payee_spk,
+                                              close_fee=rec.close_fee).script.hex(),
             },
         }
-        st, _, out = XbtChannelClient.http("POST", open_url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        try:
+            st, _, out = XbtChannelClient.http("POST", rec.open_url, json.dumps(body).encode(),
+                                               {"Content-Type": "application/json"})
+        except Exception as e:
+            self.book.note_pending(dest, open_error=f"open unreachable: {type(e).__name__}")
+            raise RuntimeError(f"open failed: provider unreachable ({type(e).__name__}); the channel stays "
+                               "pending: retried by the watcher, refunded at expiry if never opened")
+        code = ""
         if st != 200:
-            raise RuntimeError(f"open failed: HTTP {st}")
-        rec = self.book.add_funded(dest, secret=secret, params=params, origin=origin, cap_sats=cap,
-                                   open_height=open_height)
-        return rec.public()
+            try:
+                code = json.loads(out).get("error", "")
+            except (ValueError, AttributeError):
+                code = ""
+            code = code if safe_code(code) else ""     # no provider text in the wallet's errors (L12)
+        if st == 200 or code == "duplicate_channel":
+            opened = self.book.mark_open(dest)
+            _log("opened", dest=dest, chan=opened.chan, confirmations=confs, duplicate=st != 200)
+            return {**opened.public(), "confirmations": confs}
+        self.book.note_pending(dest, open_error=f"open refused: HTTP {st}{' ' + code if code else ''}")
+        raise RuntimeError(f"open failed: HTTP {st}{' ' + code if code else ''}; the channel stays pending: "
+                           "retried by the watcher, refunded at expiry if never opened")
 
     def _with_auth(self, payload: dict, method: str, url: str, body: bytes) -> dict:
         """H3: bind this payload to (method, path, body). The ECDH key stays in the book."""
@@ -223,8 +316,17 @@ class Xbt402Session:
         opened = None
         if rec is None or rec.state != "open":  # a closed or refunded channel is replaced by a new one
             t1 = time.time()
-            rec_pub = self.open_from_offer(dest, acc, cap_sats=cap_sats, expiry_blocks=expiry_blocks)
+            if rec is not None and rec.state == "pending":     # funded earlier, not yet open (P1, P2)
+                rec_pub = self.complete_open(dest, wait_s=self.open_wait_s)
+            else:
+                rec_pub = self.open_from_offer(dest, acc, cap_sats=cap_sats, expiry_blocks=expiry_blocks)
             rec = self.book.get(dest)
+            if rec.state == "pending":
+                return {"verdict": "pending", "rule": "funding_unconfirmed", "chan": rec.chan,
+                        "funding_txid": rec.funding_txid, "confirmations": rec_pub.get("confirmations", 0),
+                        "min_conf": rec.min_conf, "charged_sats": 0,
+                        "reason": "channel funded; its open waits for the funding to confirm. Call again later: "
+                                  "the watcher also opens it, and refunds it at expiry if it never opens"}
             opened = {**rec_pub, "funding_txid": rec.funding_txid, "funding_sats": rec.funding_sats}
             _log("open", url=url, chan=rec.chan, txid=rec.funding_txid, capacity=rec.funding_sats,
                  cap=rec.cap_sats, ms=round(1000 * (time.time() - t1), 1))
@@ -468,7 +570,7 @@ class Xbt402Session:
         txid = reply.get("txid") if isinstance(reply, dict) else None
         doc = {"txid": txid if isinstance(txid, str) and len(txid) == 64 and all(c in "0123456789abcdef" for c in txid) else None}
         self.book.mark_closed(dest, doc.get("txid") or "")
-        if self.mine and doc.get("txid"):
+        if self.mine and doc.get("txid"):     # regtest only (P3)
             try:
                 self.mine(1)
             except Exception:

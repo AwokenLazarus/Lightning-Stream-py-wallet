@@ -51,6 +51,8 @@ class FakeRpc:
             return []
         if method == "estimatesmartfee":
             return {"feerate": 0.00001}
+        if method == "getblockchaininfo":      # AGP-017: the signer learns its chain at start
+            return {"chain": "regtest", "blocks": 200, "initialblockdownload": False}
         raise RuntimeError(method)
 
 

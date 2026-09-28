@@ -12,7 +12,7 @@ This is the wallet hook XBT-060 / the B1 SDK should use (`fund(address, sats)` �
 | `sign_state` | `dest`, `cum` | policy-checked `{sig, chan, cum}` |
 | `open_channel` | `dest`, `pay_to?`, `cap_sats?`, `expiry_blocks?` | opens a Spillman channel; cap defaults to `per_counterparty_cap_sats` |
 | `channels` | — | `{channels:[{dest,chan,cap_sats,used_sats,expiry,residual_sats}]}` |
-| `xbt402_pay` | `url`, `method`, `body`, `max_sats` | policy-checked 402 payment; streamed results: digest + stored path; provider body + receipt verbatim under `untrusted_provider_response` (untrusted data, not key-filtered) |
+| `xbt402_pay` | `url`, `method`, `body`, `max_sats` | policy-checked 402 payment; streamed results: digest + stored path; provider body + receipt verbatim under `untrusted_provider_response` (untrusted data, not key-filtered). AGP-017: `verdict: pending, rule: funding_unconfirmed` while a new channel's funding waits for the offer's `minConf` (call again; the watcher also opens it) |
 | `notice_hot_txid` | `txid` | register a send-to-hot UTXO |
 | `fund_treasury` | `sats` | 0x21 fund of the CSV-4320 treasury |
 | `recover_treasury` | `signature`, `expiry`, `to` | human-signed CSV recovery (not an MCP tool) |
@@ -44,3 +44,9 @@ MCP tools are exactly: `balance`, `quote_payment`, `pay`, `history`, `channels`,
 - **AGP-016: treasury secrets sealed.** `treasury.json` keeps the three pubkeys, the CSV and the funding outpoint in the clear; the human, cosigner and recovery secrets are one AES-256-GCM blob under the same wrapping key (AAD `b2/treasury-keys`). A plaintext file from before is re-sealed on first start.
 - **Channel lifecycle.** `open` → `closed` | `refunded`. No new state is signed on a channel that is not open or is within `refund_margin_blocks` (default 6) of its expiry; a closed or refunded channel is replaced by a new one on the next payment.
 - **Forward rail.** Policy `"forward": {"markets": [...], "per_lot_max_sats": N, "daily_budget_sats": N}` (absent = rail off); see `agentwallet/forward.py`.
+
+## AGP-017 (signer-side)
+- `health` also returns `chain`, `hrp` and `mining`.
+- `channels` lists a `pending` state (funded, open not yet accepted) with `funding_txid` and `open_error`.
+- `forward_recover` takes an optional `blockhash` (a pruned node finds a confirmed close only with it).
+- `sweep_hot` refuses a destination of another network's hrp and reports `fee_sats` (dust change included), `change_sats`, `outputs`.

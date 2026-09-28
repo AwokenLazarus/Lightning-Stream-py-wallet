@@ -98,6 +98,13 @@ class PolicyConfig:
     # AGP-016: the signature-log anchor (agentwallet/anchor.py; the witness socket is B2_ANCHOR_SOCK)
     anchor_interval_s: int = 60          # periodic anchor; 0 = only on closes, refunds, sweeps, rotations
     anchor_required: bool = False        # true: the signer refuses to start without a reachable witness
+    # AGP-017 (mainnet readiness)
+    regtest_mine: bool | None = None     # the signer mines a block after its own spends; None = regtest only.
+                                         # True on any other chain: the signer refuses to start (P3)
+    open_wait_s: int = 1800              # xbt402_pay waits this long for the offer's minConf, then returns
+                                         # "pending" (the open is retried; unopened fundings are refunded) (P2)
+    open_retry_s: int = 60               # the watcher re-posts a pending open at most this often
+    close_fee_max_sats: int = 2000       # refuse an offer whose closeFeeSat is above this (spec SHOULD)
 
     def normalized_allowlist(self) -> frozenset[str]:
         out = set()
@@ -130,12 +137,17 @@ class PolicyConfig:
             "refund_margin_blocks",
             "hot_balance_cap_sats",
             "anchor_interval_s",
+            "open_wait_s",
+            "open_retry_s",
+            "close_fee_max_sats",
         }
         kwargs = {k: int(raw[k]) for k in fields if k in raw}
         if "refund_enabled" in raw:
             kwargs["refund_enabled"] = bool(raw["refund_enabled"])
         if "anchor_required" in raw:
             kwargs["anchor_required"] = bool(raw["anchor_required"])
+        if raw.get("regtest_mine") is not None:
+            kwargs["regtest_mine"] = bool(raw["regtest_mine"])
         if isinstance(raw.get("forward"), dict):
             kwargs["forward"] = dict(raw["forward"])
         cps = raw.get("counterparties") or {}

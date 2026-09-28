@@ -27,3 +27,15 @@ AGP-016: the signature log's head is anchored with a witness process (`python -m
 serve --store DIR --sock PATH`, run as its own Unix user; the signer finds it through
 `B2_ANCHOR_SOCK`), the hot UTXO set is sealed on disk and reconciled against the node at start, and
 `treasury.json`'s secrets are sealed like the hot key.
+
+AGP-017 (mainnet readiness, `agentwallet/netparams.py`): the signer learns its chain from the node
+(`B2_CHAIN`, if set, must agree). Off regtest it never mines (a policy `regtest_mine: true` there
+refuses to start; the RPC client refuses `generate*`), addresses use that chain's hrp (`bc1…` on
+mainnet), and the xbt402 network id is block 961640's. A channel is recorded, payer key sealed,
+*before* its funding is broadcast (state `pending`), and its open is posted once the funding has the
+offer's `minConf`: `xbt402_pay` returns `verdict: pending` until then, the watcher finishes the open,
+and a channel that never opens is refunded at expiry. Nothing needs txindex (pruned nodes work).
+Offers are bounded by `close_fee_max_sats`; `minCapacity`/`maxCapacity` bound the funding output
+(cap + closeFeeSat). Ten 500-sat calls now sign exactly 5,000 (the first state's dust top-up is no
+longer charged twice). Policy: `regtest_mine`, `open_wait_s`, `open_retry_s`, `close_fee_max_sats`;
+`B2_SIGNER_TIMEOUT` sets the socket client's timeout.

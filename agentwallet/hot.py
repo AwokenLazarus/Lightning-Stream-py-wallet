@@ -259,10 +259,16 @@ class HotWallet:
             self._stale = [u for u in self._stale if (u["txid"], int(u["vout"])) != (txid, int(vout))]
             self._persist_utxos()
 
-    def scan_from_txid(self, txid: str, *, unspent_only: bool = False) -> int:
+    def scan_from_txid(self, txid: str, *, unspent_only: bool = False, blockhash: str = "") -> int:
         """Notice this tx's outputs to any hot key. `unspent_only` (AGP-016, for closes found after the
-        fact) skips outputs the node says are already spent, so a swept coin is never counted twice."""
-        raw = self.rpc.call("getrawtransaction", txid, True)
+        fact) skips outputs the node says are already spent, so a swept coin is never counted twice.
+
+        AGP-017 P6: without txindex (a pruned node) a confirmed tx is found only with its block hash;
+        without one, the UTXO set is scanned for this tx's unspent outputs to our keys."""
+        from .netparams import get_tx
+        raw = get_tx(self.rpc, txid, blockhash)
+        if raw is None:
+            return self._scan_utxoset_for(txid)
         added = 0
         for o in raw.get("vout") or []:
             spk = (o.get("scriptPubKey") or {})
@@ -272,6 +278,17 @@ class HotWallet:
                 continue
             if k is not None:
                 self.notice_utxo(txid, int(o["n"]), int(round(float(o["value"]) * XBT_SATS)), k.spk.hex())
+                added += 1
+        return added
+
+    def _scan_utxoset_for(self, txid: str) -> int:
+        """Unspent outputs of `txid` to any hot key, from scantxoutset (confirmed coins only)."""
+        res = self.rpc.call("scantxoutset", "start", [f"raw({k.spk.hex()})" for k in self._keys()])
+        added = 0
+        for c in (res or {}).get("unspents") or []:
+            k = self._key_for_spk(c.get("scriptPubKey", ""))
+            if c.get("txid") == txid and k is not None:
+                self.notice_utxo(txid, int(c["vout"]), int(round(float(c["amount"]) * XBT_SATS)), k.spk.hex())
                 added += 1
         return added
 
@@ -311,6 +328,15 @@ class HotWallet:
     # --- spending ----------------------------------------------------------------------------------
     def _spend(self, utxos: list[dict], outs: list[TxOut], kind: str, **audit) -> str:
         """Sign every input 0x21 with the key that owns it, broadcast, forget the spent coins."""
+        prep = self._prepare(utxos, outs, kind, **audit)
+        txid = self.broadcast(prep)
+        self.commit(prep)
+        return txid
+
+    def _prepare(self, utxos: list[dict], outs: list[TxOut], kind: str, **audit) -> dict:
+        """AGP-017 P1: build and 0x21-sign, but do not broadcast. The caller can persist what it needs
+        (a channel's payer key) before `broadcast`, then `commit` forgets the spent coins. Every
+        signature is logged here, whether or not the transaction is ever broadcast."""
         tx = Tx(version=2, inputs=[TxIn(bytes.fromhex(u["txid"])[::-1], int(u["vout"])) for u in utxos],
                 outputs=outs, locktime=0)
         keys = [self._key_for_spk(u.get("spk") or self.spk.hex()) for u in utxos]
@@ -325,17 +351,49 @@ class HotWallet:
                 raise RuntimeError("hot signature is not 0x21")
             tx.inputs[i].witness = [sig, k.pub]
             sigs.append((k, sig))
-        txid = self.rpc.call("sendrawtransaction", tx.hex())
+        txid = tx.txid()
         for k, sig in sigs:
             self.audit.record(kind, sig=sig, txid=txid, key_spk=k.spk.hex(), sighash="0x21",
                               amount_sats=sum(o.value for o in outs), **audit)
-        spent = {(u["txid"], int(u["vout"])) for u in utxos}
+        return {"hex": tx.hex(), "txid": txid, "inputs": [(u["txid"], int(u["vout"])) for u in utxos],
+                "outputs": [(o.value, o.script_pubkey.hex()) for o in outs]}
+
+    def broadcast(self, prep: dict) -> str:
+        """Send a prepared transaction. A failed send whose transaction the node already has (a lost
+        RPC answer, a re-send) counts as sent; anything else raises and nothing is forgotten."""
+        try:
+            return self.rpc.call("sendrawtransaction", prep["hex"])
+        except Exception:
+            try:
+                known = self.rpc.call("gettxout", prep["txid"], 0, True)
+            except Exception:
+                known = None
+            if not known:
+                raise
+            return prep["txid"]
+
+    def commit(self, prep: dict) -> None:
+        """The prepared transaction is sent: forget its inputs, learn its outputs to our keys."""
+        spent = {(t, int(v)) for t, v in prep["inputs"]}
         self._utxos = [u for u in self._utxos if (u["txid"], int(u["vout"])) not in spent]
         self._persist_utxos()
-        return txid
+        for n, (value, spk) in enumerate(prep["outputs"]):
+            if self._key_for_spk(spk) is not None and value >= DUST:
+                self.notice_utxo(prep["txid"], n, value, spk)
+        self._persist_utxos()
+
+    def holds(self, txid: str, vout: int) -> bool:
+        return any(u["txid"] == txid and int(u["vout"]) == int(vout) for u in self._utxos)
 
     def fund(self, dest_spk: bytes, sats: int, fee: int = DEFAULT_FEE) -> tuple[str, int]:
         """Build, 0x21-sign and broadcast a 1-in/2-out payment to dest_spk. Returns (txid, vout)."""
+        prep = self.prepare_fund(dest_spk, sats, fee)
+        txid = self.broadcast(prep)
+        self.commit(prep)
+        return txid, 0
+
+    def prepare_fund(self, dest_spk: bytes, sats: int, fee: int = DEFAULT_FEE) -> dict:
+        """`fund` without the broadcast (AGP-017 P1): output 0 pays dest_spk, output 1 is our change."""
         if sats <= 0:
             raise ValueError("fund amount must be positive")
         need = sats + fee
@@ -346,10 +404,7 @@ class HotWallet:
         outs = [TxOut(sats, dest_spk)]
         if change >= DUST:
             outs.append(TxOut(change, self.spk))
-        txid = self._spend([utxo], outs, "funding", dest_spk=dest_spk.hex())
-        if change >= DUST:
-            self.notice_utxo(txid, 1, change)
-        return txid, 0
+        return self._prepare([utxo], outs, "funding", dest_spk=dest_spk.hex())
 
     def _sweep(self, utxos: list[dict], dest_spk: bytes, kind: str, **audit) -> dict:
         total = sum(int(u["value"]) for u in utxos)
@@ -357,8 +412,6 @@ class HotWallet:
         if total - fee < DUST:
             raise RuntimeError(f"nothing to sweep ({total} sats)")
         txid = self._spend(utxos, [TxOut(total - fee, dest_spk)], kind, **audit)
-        if self._key_for_spk(dest_spk.hex()) is not None:
-            self.notice_utxo(txid, 0, total - fee, dest_spk.hex())
         return {"txid": txid, "swept_sats": total - fee, "inputs": len(utxos), "fee_sats": fee}
 
     def rotate(self) -> dict:
@@ -393,10 +446,11 @@ class HotWallet:
         outs = [TxOut(amount_sats, dest_spk)]
         if change >= DUST:
             outs.append(TxOut(change, self.spk))
+        else:
+            fee += change         # zero change, or change below dust: it goes to the fee, and is reported
         txid = self._spend(coins, outs, "human_sweep", dest_spk=dest_spk.hex())
-        if change >= DUST:
-            self.notice_utxo(txid, 1, change)
-        return {"txid": txid, "swept_sats": amount_sats, "fee_sats": fee, "hot_sats": self.balance_sats()}
+        return {"txid": txid, "swept_sats": amount_sats, "fee_sats": fee, "change_sats": change if change >= DUST else 0,
+                "outputs": len(outs), "hot_sats": self.balance_sats()}
 
 
 __all__ = ["HotWallet", "HotCapError", "KnotsRpcError"]

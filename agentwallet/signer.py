@@ -10,6 +10,13 @@ B2_HOT_KEYFILE / B2_HOT_PASSPHRASE in the signer's environment only), every sign
 provider never closed, `rotate_hot_key` moves the hot key, `sweep_hot` (human-signed) empties it
 below its balance cap, and xbt402_pay has a forward rail (forward.py).
 
+AGP-017 (mainnet readiness): the signer learns its chain from the node at start (netparams). On any
+chain but regtest it never mines (and refuses to start if the policy asks it to), addresses use that
+chain's hrp (`bc` on mainnet), and the xbt402 network id is the spec's anchor block. A channel is
+recorded, payer key sealed, before its funding is broadcast; its open is posted once the funding has
+the offer's minConf; the watcher retries pending opens and refunds whatever never opened. Nothing
+needs txindex (a pruned node works).
+
 AGP-016: the signature log's head is anchored with a witness process (anchor.py, B2_ANCHOR_SOCK) at
 start, periodically, and after every close, refund, sweep, rotation and treasury recovery; the signer
 refuses to start when its log no longer matches the latest anchor. The hot UTXO set is sealed on disk
@@ -25,7 +32,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import anchor as anchoring, sigaudit
+from . import anchor as anchoring, netparams, sigaudit
 from .approval import verify, verify_approval, x2b
 from .channels import ChannelBook, ChannelCapError
 from .forward import ForwardPolicy, ForwardSession
@@ -76,6 +83,15 @@ class Signer:
         conf = Path(os.environ.get("B2_CONF", self.root / "bitcoin-b2.conf"))
         wallet = os.environ.get("B2_WALLET", "agent")
         self.rpc = rpc if rpc is not None else KnotsRpc(datadir, conf, wallet=wallet)
+        # AGP-017 P3/P5: the chain decides the hrp and whether this process may ever mine
+        self.chain = netparams.detect_chain(self.rpc)
+        if self.config.regtest_mine and not netparams.mining_allowed(self.chain):
+            raise netparams.ChainError(f"policy regtest_mine is set but the node is on {self.chain!r}: "
+                                       "refusing to start (only regtest may mine)")
+        self.mining = netparams.mining_allowed(self.chain) and self.config.regtest_mine is not False
+        if hasattr(self.rpc, "allow_generate"):
+            self.rpc.allow_generate = self.mining
+        self.hrp = netparams.hrp(self.chain)
         recovery = raw.get("recovery_address") or os.environ.get("B2_RECOVERY", "")
         self.vault = PresignedVault(run / "vault.json", self.rpc, recovery)
         self.sock_path = Path(os.environ.get("B2_SIGNER_SOCK", run / "signer.sock"))
@@ -89,17 +105,21 @@ class Signer:
         self.sigaudit = sigaudit.SigAudit(run / "signatures.jsonl")
         self.anchor = anchoring.Anchorer(self.sigaudit, anchoring.client_from_env(), self.config.anchor_interval_s)
         self._check_anchor_at_start()
-        self.hot = HotWallet(run / "hot.json", self.rpc, keystore=self.keystore, audit=self.sigaudit,
+        self.hot = HotWallet(run / "hot.json", self.rpc, hrp=self.hrp, keystore=self.keystore, audit=self.sigaudit,
                              cap_sats=self.config.hot_balance_cap_sats)
         self.hot.reconcile(scan=os.environ.get("B2_HOT_SCAN", "1") != "0")
         self.treasury = Treasury(run / "treasury.json", csv=int(getattr(self.config, "treasury_csv", TREASURY_CSV) or TREASURY_CSV),
-                                 keystore=self.keystore)
+                                 hrp=self.hrp, keystore=self.keystore)
         self.channels = ChannelBook(run / "channels.json", run / "channel_keys.json", keystore=self.keystore,
                                     audit=self.sigaudit)
         self.channels.expiry_guard = (self._height, self.config.refund_margin_blocks)
-        self._xbt402 = ForwardSession(self.channels, self.hot, self.rpc, height=self._height, mine=self._mine,
+        self._xbt402 = ForwardSession(self.channels, self.hot, self.rpc, height=self._height,
+                                      mine=self._mine if self.mining else None, chain=self.chain,
+                                      open_wait_s=self.config.open_wait_s, close_fee_max=self.config.close_fee_max_sats,
+                                      refund_margin=self.config.refund_margin_blocks,
                                       forward_path=run / "forward.json",
                                       policy=ForwardPolicy.from_dict(self.config.forward))
+        self._open_tried: dict[str, float] = {}
         self._watch_stop = threading.Event()
         self.watch_interval = float(os.environ.get("B2_WATCH_INTERVAL", "10"))
 
@@ -169,7 +189,7 @@ class Signer:
         if method == "recover_vault":
             return sanitize(self._recover_signed(params))
         if method == "health":
-            return {"ok": True, "wallet": self.rpc.wallet}
+            return {"ok": True, "wallet": self.rpc.wallet, "chain": self.chain, "hrp": self.hrp, "mining": self.mining}
         if method == "channels":
             return sanitize({"channels": self.channels.list_public(), "height": self._height_safe()})
         if method == "hot_address":
@@ -183,7 +203,7 @@ class Signer:
 
             sats = int(params.get("sats") or params.get("amount_sats") or 0)
             addr = params.get("address") or params.get("to") or ""
-            txid, vout = self.hot.fund(address_to_spk(addr), sats)
+            txid, vout = self.hot.fund(address_to_spk(addr, self.hrp), sats)
             return sanitize({"txid": txid, "vout": vout, "sats": sats, "sighash": "0x21"})
         if method == "open_channel":
             with self._spend_lock:
@@ -224,7 +244,7 @@ class Signer:
             return sanitize({"actions": self.watch_tick()})
         if method == "forward_recover":
             with self._spend_lock:
-                res = self._xbt402.forward_recover(params.get("txid") or "")
+                res = self._xbt402.forward_recover(params.get("txid") or "", params.get("blockhash") or "")
                 if res.get("recovered"):     # the policy ledger learns the spend it could not see live
                     self.engine.commit(Payment(dest=res["dest"], amount_sats=res["price"],
                                                memo=f"forward {res['outpoint']} (recovered)"), txid=res["transfer_txid"])
@@ -280,10 +300,17 @@ class Signer:
             return 0
 
     def _mine(self, n: int = 1) -> None:
+        """Regtest demos only (P3): refused unless the chain was regtest at start and still is."""
+        if not self.mining:
+            raise netparams.ChainError(f"mining is off on {self.chain!r}")
+        if (self.rpc.call("getblockchaininfo") or {}).get("chain", "regtest") != "regtest":
+            raise netparams.ChainError("the node is no longer regtest: refusing to mine")
         addr = self.rpc.call("getnewaddress", "mine", "bech32")
         self.rpc.call("generatetoaddress", int(n), addr)
 
     def _mine_safe(self) -> None:
+        if not self.mining:
+            return
         try:
             self._mine(1)
         except Exception:
@@ -316,8 +343,12 @@ class Signer:
         except KnotsRpcError as e:
             return _deny("refund_rpc", str(e)[:200])
         if not utxo:
-            spender = self._spender(rec.funding_txid, rec.funding_vout)
-            if spender or self._tx_known(rec.funding_txid):
+            # P6: no txindex. The spend is found in the mempool or by scanning blocks from the funding's
+            # block; the funding counts as known once seen confirmed (funding_height) or in the mempool.
+            start = rec.funding_height or rec.open_height
+            spender = netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, start)
+            known = bool(spender or rec.funding_height or netparams.get_tx(self.rpc, rec.funding_txid))
+            if known:
                 self.channels.mark_closed(dest, spender or "")
                 self._notice_close_change(spender)
                 return {**_deny("channel_closed", "the funding output is already spent (the provider closed)"),
@@ -353,18 +384,6 @@ class Signer:
         except Exception:
             pass
 
-    def _spender(self, txid: str, vout: int) -> str | None:
-        try:
-            r = self.rpc.call("gettxspendingprevout", [{"txid": txid, "vout": int(vout)}])
-            return (r[0] or {}).get("spendingtxid") if r else None
-        except Exception:
-            return None
-
-    def _tx_known(self, txid: str) -> bool:
-        try:
-            return bool(self.rpc.call("getrawtransaction", txid, True))
-        except Exception:
-            return False
 
     def watch_tick(self) -> list[dict]:
         """One watcher pass: refund every open channel at or past its CLTV expiry, and sweep coins that
@@ -374,7 +393,21 @@ class Signer:
             h = self._height()
         except Exception:
             return actions
-        for rec in self.channels.open_records():
+        for rec in self.channels.pending_records():       # P1/P2: finish opens a crash or a wait left behind
+            if h >= rec.expiry - self.config.refund_margin_blocks:
+                continue
+            if time.time() - self._open_tried.get(rec.dest, 0.0) < self.config.open_retry_s:
+                continue
+            self._open_tried[rec.dest] = time.time()
+            with self._spend_lock, sigaudit.context(method="watcher", rule="watcher:open_retry"):
+                try:
+                    r = self._xbt402.complete_open(rec.dest, wait_s=0)
+                    act = {"state": r.get("state"), "confirmations": r.get("confirmations")}
+                except Exception as e:
+                    act = {"state": "pending", "error": str(e)[:160]}
+            if act["state"] == "open" or act.get("error"):
+                actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, "open_retry": act})
+        for rec in self.channels.unsettled_records():
             if h >= rec.expiry:
                 with self._spend_lock, sigaudit.context(method="watcher"):
                     r = self._refund_locked(rec.dest, auto=True)
@@ -421,7 +454,7 @@ class Signer:
             return {"ok": False, "reason": "sweep signature expired"}
         sigaudit.set_rule("human:sweep_signature")
         try:
-            out = self.hot.sweep_to(address_to_spk(to), amount)
+            out = self.hot.sweep_to(address_to_spk(to, self.hrp), amount)   # P5: this chain's hrp only
         except (RuntimeError, ValueError, KnotsRpcError) as e:
             return {"ok": False, "reason": str(e)[:200]}
         self.engine.audit.append({"type": "hot_sweep", "to": to, "sats": amount, "txid": out["txid"],
@@ -506,13 +539,19 @@ class Signer:
         p = ChannelParams.derive(pay_to, payer_pub, expiry, close_fee, self.hot.spk.hex(),
                                  network=self._xbt402.network())
         funded = cap + close_fee
-        txid, vout = self.hot.fund(p.spk, funded)
-        p.funding_txid, p.funding_vout, p.capacity = txid, vout, funded
+        prep = self.hot.prepare_fund(p.spk, funded)
+        p.funding_txid, p.funding_vout, p.capacity = prep["txid"], 0, funded
+        # P1 write-ahead: this rail has no provider open, so the channel is open once the funding is sent
+        self.channels.add_pending(dest, secret=secret, params=p, cap_sats=cap, open_height=open_height,
+                                  funding_hex=prep["hex"])
         try:
-            self._mine(1)
+            self.hot.broadcast(prep)
         except Exception:
-            pass
-        rec = self.channels.add_funded(dest, secret=secret, params=p, cap_sats=cap, open_height=open_height)
+            self.channels.drop_pending(dest, p.channel_id)
+            raise
+        self.hot.commit(prep)
+        rec = self.channels.mark_open(dest)
+        self._mine_safe()
         return {"verdict": "allow", "rail": "channel", **rec.public(), "funding_sighash": "0x21"}
 
     def _xbt402_pay_locked(self, params: dict) -> dict:
@@ -573,7 +612,7 @@ class Signer:
             return _deny(e.code, str(e))
         except Exception as e:
             return _deny("xbt402", str(e))
-        if result.get("verdict") == "deny":
+        if result.get("verdict") in ("deny", "pending"):
             return result
         charged = int(result.get("charged_sats") or 0)
         if charged:
@@ -629,10 +668,7 @@ class Signer:
         sats = int(params.get("sats") or params.get("amount_sats") or 0)
         txid, vout = self.hot.fund(self.treasury.spk, sats)
         self.treasury.record_funding(txid, vout, sats)
-        try:
-            self._mine(1)
-        except Exception:
-            pass
+        self._mine_safe()
         return {**self.treasury.status(), "txid": txid, "vout": vout, "sighash": "0x21"}
 
     def _recover_treasury_locked(self, params: dict) -> dict:
@@ -657,7 +693,11 @@ class Signer:
             return {"ok": False, "reason": "recover_treasury requires a valid human signature"}
         if expiry < now:
             return {"ok": False, "reason": "recover signature expired"}
-        tx = self.treasury.recovery_tx(address_to_spk(dest))
+        try:
+            dest_spk = address_to_spk(dest, self.hrp)
+        except ValueError as e:
+            return {"ok": False, "reason": str(e)}
+        tx = self.treasury.recovery_tx(dest_spk)
         self.sigaudit.record("treasury_recovery", sig=tx.inputs[0].witness[0], dest=dest, txid=tx.txid(),
                              rule="human:recover_signature", sighash="0x21")
         try:
@@ -816,7 +856,7 @@ class SignerClient:
 
     def call(self, op: str, **params):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(60)
+        sock.settimeout(float(os.environ.get("B2_SIGNER_TIMEOUT", "60")))
         sock.connect(str(self.sock_path))
         req = {"id": 1, "method": op, "params": params}
         sock.sendall((json.dumps(req) + "\n").encode())

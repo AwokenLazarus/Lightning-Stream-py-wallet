@@ -46,13 +46,31 @@ class Hot:
     def fund(self, spk, sats):
         return "ab" * 32, 0
 
+    # AGP-017 P1: the session prepares, records, then broadcasts
+    def prepare_fund(self, spk, sats):
+        return {"hex": "", "txid": "ab" * 32, "inputs": [], "outputs": []}
+
+    def broadcast(self, prep):
+        return prep["txid"]
+
+    def commit(self, prep):
+        pass
+
     def scan_from_txid(self, txid):
         pass
 
 
+class Rpc:
+    """The funding is confirmed (so the open is posted) and its block is known."""
+
+    def call(self, method, *a):
+        return {"gettxout": {"confirmations": 1, "bestblock": "00" * 32}, "getblockheader": {"height": 1000},
+                "getblockhash": "00" * 32, "getblockcount": 1000}[method]
+
+
 def session(book=None):
     tmp = Path(tempfile.mkdtemp())
-    return Xbt402Session(book or ChannelBook(tmp / "c.json", tmp / "k.json"), Hot(), rpc=None, height=lambda: 1000)
+    return Xbt402Session(book or ChannelBook(tmp / "c.json", tmp / "k.json"), Hot(), rpc=Rpc(), height=lambda: 1000)
 
 
 class ErrorTextTests(unittest.TestCase):

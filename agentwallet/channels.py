@@ -7,6 +7,16 @@ AGP-013: payer keys are sealed at rest when the book has a KeyStore; every signa
 signature audit log; a channel has a lifecycle (open -> closed | refunded) and the book refuses to
 sign a new state on a channel that is not open or is within `expiry_margin` blocks of its CLTV
 expiry (the provider needs those blocks to close before the payer's refund becomes valid).
+
+AGP-017 P1: a channel is written to disk, payer key sealed, in state "pending" *before* its funding
+is broadcast (`add_pending`), and becomes "open" only once the provider accepts the open
+(`mark_open`). A crash, a dead provider or a refused open leaves a pending record that the signer
+retries and, failing that, refunds at expiry: the coins can no longer be stranded. A settled record
+(closed or refunded) that a new channel replaces is kept under "archived".
+
+`spent_sats` is what the calls actually cost; `used_sats` stays the cumulative amount signed, which
+is at least the 546-sat dust floor. The dust top-up of the first state is no longer charged again on
+top of the next call (10 calls of 500 sign 5,000, not 5,046).
 """
 
 from __future__ import annotations
@@ -58,10 +68,24 @@ class ChannelRecord:
     closed_txid: str = ""
     refund_txid: str = ""
     open_height: int = 0
+    # AGP-017
+    spent_sats: int = -1        # charges so far; -1 (a record from before AGP-017) means used_sats
+    open_url: str = ""          # where a pending channel's open is (re)posted
+    network: str = ""
+    min_conf: int = 0           # the offer's minConf: the open is posted once the funding has this many
+    funding_hex: str = ""       # the signed funding (public once broadcast), re-sent if it went missing
+    funding_height: int = 0     # block of the funding once seen confirmed (lookups on a pruned node)
+    open_error: str = ""
+
+    def spent(self) -> int:
+        return self.used_sats if self.spent_sats < 0 else self.spent_sats
 
     def public(self) -> dict:
         return {
             "state": self.state,
+            "funding_txid": self.funding_txid or None,
+            "spent_sats": self.spent(),
+            **({"open_error": self.open_error} if self.open_error and self.state == "pending" else {}),
             "closed_txid": self.closed_txid or None,
             "refund_txid": self.refund_txid or None,
             "dest": self.dest,
@@ -88,6 +112,7 @@ class ChannelBook:
         self.records_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._records: dict[str, ChannelRecord] = {}
+        self._archived: list[dict] = []
         self._secrets: dict[str, int] = {}
         self._load()
 
@@ -96,6 +121,7 @@ class ChannelBook:
             raw = json.loads(self.records_path.read_text(encoding="utf-8"))
             for dest, rec in (raw.get("channels") or {}).items():
                 self._records[dest] = ChannelRecord(**rec)
+            self._archived = list(raw.get("archived") or [])
         if self.keys_path.exists():
             raw = json.loads(self.keys_path.read_text(encoding="utf-8"))
             if "sealed" in raw:
@@ -108,20 +134,15 @@ class ChannelBook:
             self._secrets = {k: int(v, 16) for k, v in (raw.get("secrets") or {}).items()}
 
     def _persist(self) -> None:
-        tmp = self.records_path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(
-                {"channels": {d: asdict(r) for d, r in self._records.items()}},
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self.records_path)
+        # keys first: a record on disk never names a channel whose payer key is not on disk (P1)
         doc = json.dumps({"secrets": {k: f"{v:064x}" for k, v in self._secrets.items()}}, indent=2)
         if self.keystore is not None:
             doc = json.dumps({"sealed": self.keystore.seal(doc.encode(), self.KEYS_AAD)}, indent=2)
         write_private(self.keys_path, doc)
+        body = {"channels": {d: asdict(r) for d, r in self._records.items()}}
+        if self._archived:
+            body["archived"] = self._archived
+        write_private(self.records_path, json.dumps(body, indent=2, sort_keys=True))
 
     def list_public(self) -> list[dict]:
         with self._lock:
@@ -199,6 +220,7 @@ class ChannelBook:
             sig = payer.sign_state_a3(amount)
             self.audit.record("channel_state_a3", sig=sig, chan=rec.chan, dest=rec.dest, cum=amount, sighash="0xa3")
             rec.used_sats = max(rec.used_sats, amount)
+            rec.spent_sats = max(rec.spent(), amount)
             self._persist()
             return sig
 
@@ -214,6 +236,63 @@ class ChannelBook:
         secret = secrets.randbelow(ecc.N - 1) + 1
         return secret, ecc.pubkey(secret).hex()
 
+    def add_pending(self, dest: str, *, secret: int, params: ChannelParams, origin: str = "",
+                    cap_sats: int | None = None, open_height: int = 0, open_url: str = "", network: str = "",
+                    min_conf: int = 0, funding_hex: str = "") -> ChannelRecord:
+        """AGP-017 P1: record a channel and seal its payer key before its funding is broadcast. A
+        pending or open channel to the same dest is never replaced; a settled one is archived."""
+        with self._lock:
+            old = self._records.get(dest)
+            if old is not None and old.state in ("open", "pending"):
+                raise ChannelError(f"channel_{old.state}", f"{dest} already has a {old.state} channel {old.chan[:16]}")
+            if old is not None:
+                self._archived.append(asdict(old))
+            rec = self._record(dest, params, origin, cap_sats, open_height)
+            rec.state, rec.open_url, rec.network, rec.min_conf = "pending", open_url, network, int(min_conf)
+            rec.funding_hex, rec.spent_sats = funding_hex, 0
+            self._records[dest] = rec
+            self._secrets[params.channel_id] = secret
+            self._persist()
+            return ChannelRecord(**asdict(rec))
+
+    def drop_pending(self, dest: str, chan: str) -> None:
+        """The funding of a pending channel was never broadcast: forget the record and its key."""
+        with self._lock:
+            rec = self._records.get(dest)
+            if rec is None or rec.chan != chan or rec.state != "pending":
+                return
+            del self._records[dest]
+            self._secrets.pop(chan, None)
+            if self._archived and self._archived[-1].get("dest") == dest:
+                self._records[dest] = ChannelRecord(**self._archived.pop())
+            self._persist()
+
+    def mark_open(self, key: str) -> ChannelRecord:
+        with self._lock:
+            rec = self._rec_locked(key)
+            if rec.state == "pending":
+                rec.state, rec.open_error = "open", ""
+                self._persist()
+            return ChannelRecord(**asdict(rec))
+
+    def note_pending(self, key: str, *, open_error: str | None = None, funding_height: int | None = None) -> None:
+        with self._lock:
+            rec = self._rec_locked(key)
+            if open_error is not None:
+                rec.open_error = open_error[:200]
+            if funding_height:
+                rec.funding_height = int(funding_height)
+            self._persist()
+
+    def _record(self, dest, params: ChannelParams, origin, cap_sats, open_height) -> ChannelRecord:
+        return ChannelRecord(
+            dest=dest, chan=params.channel_id,
+            cap_sats=int(cap_sats if cap_sats is not None else params.max_amount), used_sats=0,
+            expiry=params.expiry, payer_pub=params.payer_pub, payee_pub=params.payee_pub,
+            close_fee=params.close_fee, payer_spk=params.payer_spk, payee_spk=params.payee_spk,
+            funding_txid=params.funding_txid, funding_vout=params.funding_vout, funding_sats=params.capacity,
+            seq=0, origin=origin, open_height=int(open_height or 0), spent_sats=0)
+
     def add_funded(
         self,
         dest: str,
@@ -224,25 +303,13 @@ class ChannelBook:
         cap_sats: int | None = None,
         open_height: int = 0,
     ) -> ChannelRecord:
-        rec = ChannelRecord(
-            dest=dest,
-            chan=params.channel_id,
-            cap_sats=int(cap_sats if cap_sats is not None else params.max_amount),
-            used_sats=0,
-            expiry=params.expiry,
-            payer_pub=params.payer_pub,
-            payee_pub=params.payee_pub,
-            close_fee=params.close_fee,
-            payer_spk=params.payer_spk,
-            payee_spk=params.payee_spk,
-            funding_txid=params.funding_txid,
-            funding_vout=params.funding_vout,
-            funding_sats=params.capacity,
-            seq=0,
-            origin=origin,
-            open_height=int(open_height or 0),
-        )
+        rec = self._record(dest, params, origin, cap_sats, open_height)
         with self._lock:
+            old = self._records.get(dest)
+            if old is not None and old.state == "pending":
+                raise ChannelError("channel_pending", f"{dest} has a pending channel {old.chan[:16]}")
+            if old is not None and old.state != "open":
+                self._archived.append(asdict(old))
             self._records[dest] = rec
             self._secrets[params.channel_id] = secret
             self._persist()
@@ -287,13 +354,14 @@ class ChannelBook:
             rec = self._records.get(dest)
             if rec is None:
                 raise ChannelError("unknown_channel", dest)
-            if rec.used_sats + amount_sats > rec.cap_sats:
-                raise ChannelCapError(rec.used_sats, amount_sats, rec.cap_sats)
-            new_used = rec.used_sats + amount_sats
-            sign_cum = new_used
+            spent = rec.spent()
+            if spent + amount_sats > rec.cap_sats:
+                raise ChannelCapError(spent, amount_sats, rec.cap_sats)
+            new_spent = spent + amount_sats
+            sign_cum = max(new_spent, rec.used_sats)
             if 0 < sign_cum < DUST:
                 if DUST > rec.cap_sats:
-                    raise ChannelCapError(rec.used_sats, DUST - rec.used_sats, rec.cap_sats)
+                    raise ChannelCapError(spent, DUST - spent, rec.cap_sats)
                 sign_cum = DUST
             payer = self._payer_locked(rec)
             sig = b""
@@ -303,6 +371,7 @@ class ChannelBook:
                 sig = payer.sign_state(sign_cum)
                 self.audit.record("channel_state", sig=sig, chan=rec.chan, dest=rec.dest, cum=sign_cum, sighash="0x21")
             rec.used_sats = sign_cum
+            rec.spent_sats = new_spent
             rec.seq += 1
             self._persist()
             return ChannelRecord(**asdict(rec)), sig
@@ -322,6 +391,7 @@ class ChannelBook:
             if sig:
                 self.audit.record("channel_state", sig=sig, chan=rec.chan, dest=rec.dest, cum=cum, sighash="0x21")
             rec.used_sats = max(rec.used_sats, cum)
+            rec.spent_sats = max(rec.spent(), cum)
             rec.seq += 1
             self._persist()
             return sig
@@ -331,11 +401,23 @@ class ChannelBook:
         with self._lock:
             return [ChannelRecord(**asdict(r)) for r in self._records.values() if r.state == "open"]
 
+    def unsettled_records(self) -> list[ChannelRecord]:
+        """Open and pending channels: their funding output may still be ours to refund (P1)."""
+        with self._lock:
+            return [ChannelRecord(**asdict(r)) for r in self._records.values() if r.state in ("open", "pending")]
+
+    def pending_records(self) -> list[ChannelRecord]:
+        with self._lock:
+            return [ChannelRecord(**asdict(r)) for r in self._records.values() if r.state == "pending"]
+
     def mark_closed(self, key: str, txid: str = "") -> None:
         with self._lock:
             rec = self._rec_locked(key)
-            if rec.state == "open":
+            if rec.state in ("open", "pending"):
                 rec.state, rec.closed_txid = "closed", txid or rec.closed_txid
+                self._persist()
+            elif rec.state == "closed" and txid and not rec.closed_txid:
+                rec.closed_txid = txid
                 self._persist()
 
     def refund_tx(self, key: str, dest_spk: bytes, fee: int | None = None):
@@ -343,7 +425,7 @@ class ChannelBook:
         Only for an open channel: a closed or refunded one has no funding output left to spend."""
         with self._lock:
             rec = self._rec_locked(key)
-            if rec.state != "open":
+            if rec.state not in ("open", "pending"):     # a pending channel's funding is refundable too (P1)
                 raise ChannelError(f"channel_{rec.state}", rec.refund_txid or rec.closed_txid)
             secret = self._secrets.get(rec.chan)
             if secret is None:
