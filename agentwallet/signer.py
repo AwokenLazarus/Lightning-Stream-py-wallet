@@ -26,10 +26,12 @@ and reconciled against the node at start. The treasury secrets are sealed like t
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from . import anchor as anchoring, chain as chainbackend, netparams, sigaudit
@@ -49,17 +51,59 @@ from .xbt402 import Xbt402Session, origin_of
 
 XBT_SATS = 100_000_000
 
+# Shared with xbt-signer. Agents see these texts on quote_payment / pay.
+ERR_NOT_DECIMAL = "amount_xbt is not a decimal number"
+ERR_NOT_FINITE = "amount_xbt must be a finite number"
+ERR_NEGATIVE = "amount_xbt must not be negative"
+ERR_PRECISION = "amount_xbt has more than 8 decimal places"
+
+_NON_FINITE = frozenset({
+    "nan", "+nan", "-nan",
+    "inf", "+inf", "-inf",
+    "infinity", "+infinity", "-infinity",
+})
+
 
 def sats_from_xbt(amount_xbt) -> int:
-    # Decimal-safe: work in integer millisats via string
-    s = str(amount_xbt).strip()
-    if s.startswith("-"):
-        return -1
-    if "." in s:
-        whole, frac = s.split(".", 1)
-        frac = (frac + "00000000")[:8]
-        return int(whole or "0") * XBT_SATS + int(frac)
-    return int(s) * XBT_SATS
+    """Exact XBT → sats. At most 8 decimal places; refuse negatives, NaN and inf.
+
+    Floats go through ``Decimal(repr(x))`` so 0.00001 / 1e-05 become 1000 sats
+    instead of ``int("1e-05")``. Extra precision is refused, never truncated.
+    """
+    if isinstance(amount_xbt, bool):
+        raise ValueError(ERR_NOT_DECIMAL)
+    if isinstance(amount_xbt, float):
+        if math.isnan(amount_xbt) or math.isinf(amount_xbt):
+            raise ValueError(ERR_NOT_FINITE)
+        text = repr(amount_xbt)
+    elif isinstance(amount_xbt, int):
+        text = str(amount_xbt)
+    elif isinstance(amount_xbt, str):
+        text = amount_xbt.strip()
+    elif isinstance(amount_xbt, Decimal):
+        if not amount_xbt.is_finite():
+            raise ValueError(ERR_NOT_FINITE)
+        text = format(amount_xbt, "f")
+    else:
+        raise ValueError(ERR_NOT_DECIMAL)
+
+    if text.lower() in _NON_FINITE:
+        raise ValueError(ERR_NOT_FINITE)
+    try:
+        d = Decimal(text)
+    except InvalidOperation as e:
+        raise ValueError(ERR_NOT_DECIMAL) from e
+    if not d.is_finite():
+        raise ValueError(ERR_NOT_FINITE)
+    if d < 0:
+        raise ValueError(ERR_NEGATIVE)
+    sats = d * Decimal(XBT_SATS)
+    if sats != sats.to_integral_value():
+        raise ValueError(ERR_PRECISION)
+    as_int = int(sats)
+    if as_int.bit_length() > 63:
+        raise ValueError(ERR_NOT_DECIMAL)
+    return as_int
 
 
 def _deny(rule: str, reason: str) -> dict:
