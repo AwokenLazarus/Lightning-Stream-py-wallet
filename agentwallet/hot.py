@@ -12,6 +12,13 @@ AGP-013 custody:
   * `cap_sats` caps the balance: above it `check_channel_funding` refuses new channels and the
     wallet asks for a human sweep (`sweep_to`, gated by an ed25519 signature in the signer);
   * every signature is recorded in the signature audit log (sigaudit.py).
+
+AGP-016: the UTXO set persists in `hot_utxos.json`, sealed like the key (AES-256-GCM under the same
+wrapping key, so it is integrity-protected too), rewritten on every change. `reconcile()` (the signer
+runs it at start) checks every stored coin against the node with gettxout: a coin the node no longer
+has becomes "stale" (kept, rechecked, not spent or counted), a coin whose script or value disagrees is
+dropped, and `scantxoutset` over every key, current and retired, adds confirmed coins the file never
+heard of (a close's change or a refund that landed while the signer was down).
 """
 
 from __future__ import annotations
@@ -45,6 +52,8 @@ DEFAULT_FEE = 600
 SWEEP_FEE_BASE, SWEEP_FEE_PER_INPUT = 200, 100
 DUST = 546
 AAD = "b2/hot-key"
+UTXO_AAD = "b2/hot-utxos"
+MAX_STALE = 500
 
 
 class HotCapError(RuntimeError):
@@ -76,7 +85,12 @@ class HotWallet:
         self.audit = audit or NullAudit()
         self.cap_sats = int(cap_sats or 0)
         self._current, self._retired = self._load_or_create()
+        self.utxo_path = self.path.with_name(self.path.stem + "_utxos.json")
+        self._utxo_salt = secrets.token_bytes(16)
         self._utxos: list[dict] = []
+        self._stale: list[dict] = []
+        self.last_reconcile: dict = {}
+        self._load_utxos()
 
     # --- the current key (older callers use these attributes) ------------------------------------
     @property
@@ -143,6 +157,94 @@ class HotWallet:
             self._persist()  # first start with a wrapping key: re-seal the plaintext file
         return cur, ret
 
+    def _load_utxos(self) -> None:
+        if not self.utxo_path.exists():
+            return
+        raw = json.loads(self.utxo_path.read_text(encoding="utf-8"))
+        if "sealed" in raw:
+            if self.keystore is None:
+                raise KeyStoreError("hot UTXO set is encrypted: set B2_HOT_KEYFILE or B2_HOT_PASSPHRASE")
+            try:
+                doc = json.loads(self.keystore.open(raw["sealed"], UTXO_AAD))
+            except KeyStoreError as e:
+                raise KeyStoreError(f"{self.utxo_path.name}: {e}. Move it aside to rebuild the set from the node "
+                                    "(scantxoutset at the next start)") from e
+        else:
+            doc = raw
+        self._utxos = [self._coin(u) for u in doc.get("utxos") or []]
+        self._stale = [self._coin(u) for u in doc.get("stale") or []]
+        if self.keystore is not None and "sealed" not in raw:
+            self._persist_utxos()  # first start with a wrapping key: re-seal the plaintext set
+
+    @staticmethod
+    def _coin(u: dict) -> dict:
+        c = {"txid": str(u["txid"]), "vout": int(u["vout"]), "value": int(u["value"]), "spk": str(u.get("spk") or "")}
+        if u.get("why"):
+            c["why"] = str(u["why"])
+        return c
+
+    def _persist_utxos(self) -> None:
+        doc = {"v": 1, "utxos": self._utxos, "stale": self._stale[-MAX_STALE:]}
+        if self.keystore is not None:
+            doc = {"v": 1, "encrypted": True,
+                   "sealed": self.keystore.seal(json.dumps(doc).encode(), UTXO_AAD, salt=self._utxo_salt)}
+        write_private(self.utxo_path, json.dumps(doc, indent=1))
+
+    def reconcile(self, *, scan: bool = True) -> dict:
+        """Check the stored coins against the node; with `scan`, also find coins the file lacks."""
+        out = {"ok": False, "kept": 0, "stale": 0, "restored": 0, "dropped": 0, "found": 0, "scanned": False}
+        try:
+            info = self.rpc.call("getblockchaininfo")
+            if info.get("initialblockdownload"):
+                out["reason"] = "node is in initial block download: stored coins kept unverified"
+                self.last_reconcile = out
+                return out
+        except Exception as e:
+            out["reason"] = f"node unreachable: {str(e)[:160]}; stored coins kept unverified"
+            self.last_reconcile = out
+            return out
+        keep, stale = [], []
+        for u, was_stale in [(u, False) for u in self._utxos] + [(u, True) for u in self._stale]:
+            try:
+                r = self.rpc.call("gettxout", u["txid"], int(u["vout"]), True)
+            except Exception as e:
+                out["reason"] = f"gettxout failed: {str(e)[:160]}; stored coins kept unverified"
+                self.last_reconcile = out
+                return out
+            if not r:
+                stale.append({**u, "why": "not unspent on the node"})
+                out["stale"] += 1
+                continue
+            spk = (r.get("scriptPubKey") or {}).get("hex", "")
+            value = int(round(float(r.get("value", 0)) * XBT_SATS))
+            if (u.get("spk") and spk and spk != u["spk"]) or value != int(u["value"]) or self._key_for_spk(spk or u["spk"]) is None:
+                out["dropped"] += 1   # the node disagrees with the file: the node wins
+                continue
+            keep.append({k: v for k, v in u.items() if k != "why"} | {"spk": spk or u["spk"]})
+            out["restored" if was_stale else "kept"] += 1
+        if scan:
+            try:
+                res = self.rpc.call("scantxoutset", "start", [f"raw({k.spk.hex()})" for k in self._keys()])
+                have = {(u["txid"], int(u["vout"])) for u in keep}
+                for c in (res or {}).get("unspents") or []:
+                    op = (c["txid"], int(c["vout"]))
+                    if op in have or self._key_for_spk(c.get("scriptPubKey", "")) is None:
+                        continue
+                    keep.append({"txid": c["txid"], "vout": int(c["vout"]),
+                                 "value": int(round(float(c["amount"]) * XBT_SATS)), "spk": c["scriptPubKey"]})
+                    stale = [x for x in stale if (x["txid"], int(x["vout"])) != op]
+                    have.add(op)
+                    out["found"] += 1
+                out["scanned"] = bool(res and res.get("success", True))
+            except Exception as e:
+                out["scan_error"] = str(e)[:160]
+        self._utxos, self._stale = keep, stale[-MAX_STALE:]
+        self._persist_utxos()
+        out["ok"] = True
+        out["hot_sats"] = self.balance_sats()
+        self.last_reconcile = out
+        return out
+
     # --- coins -------------------------------------------------------------------------------------
     def _keys(self) -> list[_Key]:
         return [self._current, *self._retired]
@@ -153,7 +255,9 @@ class HotWallet:
     def notice_utxo(self, txid: str, vout: int, value_sats: int, spk: str = "") -> None:
         spk = spk or self.spk.hex()
         if not any(u["txid"] == txid and u["vout"] == vout for u in self._utxos):
-            self._utxos.append({"txid": txid, "vout": vout, "value": int(value_sats), "spk": spk})
+            self._utxos.append({"txid": txid, "vout": int(vout), "value": int(value_sats), "spk": spk})
+            self._stale = [u for u in self._stale if (u["txid"], int(u["vout"])) != (txid, int(vout))]
+            self._persist_utxos()
 
     def scan_from_txid(self, txid: str) -> int:
         raw = self.rpc.call("getrawtransaction", txid, True)
@@ -192,6 +296,7 @@ class HotWallet:
             "hot_spk": self.spk.hex(),
             "hot_sats": self.balance_sats(),
             "hot_utxos": len(self._utxos),
+            "hot_stale_utxos": len(self._stale),
             "hot_encrypted": self.encrypted,
             "hot_retired_keys": len(self._retired),
             "hot_retired_sats": sum(int(u["value"]) for u in self._retired_utxos()),
@@ -222,6 +327,7 @@ class HotWallet:
                               amount_sats=sum(o.value for o in outs), **audit)
         spent = {(u["txid"], int(u["vout"])) for u in utxos}
         self._utxos = [u for u in self._utxos if (u["txid"], int(u["vout"])) not in spent]
+        self._persist_utxos()
         return txid
 
     def fund(self, dest_spk: bytes, sats: int, fee: int = DEFAULT_FEE) -> tuple[str, int]:

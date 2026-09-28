@@ -9,6 +9,11 @@ B2_HOT_KEYFILE / B2_HOT_PASSPHRASE in the signer's environment only), every sign
 `.run/signatures.jsonl` (sigaudit.py), `xbt402_refund` and an expiry watcher refund channels the
 provider never closed, `rotate_hot_key` moves the hot key, `sweep_hot` (human-signed) empties it
 below its balance cap, and xbt402_pay has a forward rail (forward.py).
+
+AGP-016: the signature log's head is anchored with a witness process (anchor.py, B2_ANCHOR_SOCK) at
+start, periodically, and after every close, refund, sweep, rotation and treasury recovery; the signer
+refuses to start when its log no longer matches the latest anchor. The hot UTXO set is sealed on disk
+and reconciled against the node at start. The treasury secrets are sealed like the hot key.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import sigaudit
+from . import anchor as anchoring, sigaudit
 from .approval import verify, verify_approval, x2b
 from .channels import ChannelBook, ChannelCapError
 from .forward import ForwardPolicy, ForwardSession
@@ -82,9 +87,13 @@ class Signer:
             raise KeyStoreError("the signer's hot key must be encrypted at rest: set B2_HOT_KEYFILE (a 32-byte key "
                                 "file outside the run dir) or B2_HOT_PASSPHRASE (B2_HOT_ALLOW_PLAINTEXT=1 for tests)")
         self.sigaudit = sigaudit.SigAudit(run / "signatures.jsonl")
+        self.anchor = anchoring.Anchorer(self.sigaudit, anchoring.client_from_env(), self.config.anchor_interval_s)
+        self._check_anchor_at_start()
         self.hot = HotWallet(run / "hot.json", self.rpc, keystore=self.keystore, audit=self.sigaudit,
                              cap_sats=self.config.hot_balance_cap_sats)
-        self.treasury = Treasury(run / "treasury.json", csv=int(getattr(self.config, "treasury_csv", TREASURY_CSV) or TREASURY_CSV))
+        self.hot.reconcile(scan=os.environ.get("B2_HOT_SCAN", "1") != "0")
+        self.treasury = Treasury(run / "treasury.json", csv=int(getattr(self.config, "treasury_csv", TREASURY_CSV) or TREASURY_CSV),
+                                 keystore=self.keystore)
         self.channels = ChannelBook(run / "channels.json", run / "channel_keys.json", keystore=self.keystore,
                                     audit=self.sigaudit)
         self.channels.expiry_guard = (self._height, self.config.refund_margin_blocks)
@@ -93,6 +102,29 @@ class Signer:
                                       policy=ForwardPolicy.from_dict(self.config.forward))
         self._watch_stop = threading.Event()
         self.watch_interval = float(os.environ.get("B2_WATCH_INTERVAL", "10"))
+
+    def _check_anchor_at_start(self) -> None:
+        """Fail closed if the signature log no longer holds the witness's latest anchor."""
+        if not self.anchor.enabled:
+            if self.config.anchor_required:
+                raise sigaudit.SigAuditError(f"policy anchor_required: set {anchoring.ENV_SOCK} to the anchor witness socket")
+            return
+        try:
+            chk = self.anchor.check()
+        except anchoring.AnchorError as e:
+            if self.config.anchor_required:
+                raise sigaudit.SigAuditError(f"policy anchor_required: {e}") from e
+            self.anchor.last_error = str(e)[:300]
+            return
+        if not chk["ok"]:
+            raise sigaudit.SigAuditError(f"signature log fails its anchor check ({chk['reason']}): refusing to start. "
+                                         f"Keep the log and the witness store as evidence and ask a human.")
+        self.anchor.anchor("signer_start")
+
+    def _anchor(self, reason: str) -> None:
+        """Anchor after a close, refund or sweep. Never fails the operation that triggered it."""
+        if self.anchor.enabled:
+            self.anchor.anchor(reason)
 
     def handle(self, req: dict) -> dict:
         method = req.get("method")
@@ -213,13 +245,27 @@ class Signer:
                                           "sweep_txid": (out.get("sweep") or {}).get("txid")})
                 if out.get("sweep"):
                     self._mine_safe()
+                self._anchor("rotation")
                 return sanitize({**out, **self.hot.status()})
         if method == "sweep_hot":
             with self._spend_lock:
                 return sanitize(self._sweep_hot_signed(params))
         if method == "signatures":
+            try:
+                chk = self.anchor.check()
+            except anchoring.AnchorError as e:
+                chk = {**sigaudit.check_chain(self.sigaudit.path), "anchor_error": str(e)[:200]}
             return sanitize({"signatures": self.sigaudit.read(int(params.get("limit") or 50)),
-                             "chain_ok": sigaudit.verify_chain(self.sigaudit.path)[0]})
+                             "chain_ok": chk["ok"], "chain": chk, "anchor": self.anchor.status()})
+        # --- AGP-016 (signer-side, not MCP tools) ------------------------------------------------------
+        if method == "anchor_now":
+            return sanitize({"result": self.anchor.anchor(str(params.get("reason") or "operator")),
+                             "anchor": self.anchor.status()})
+        if method == "anchor_status":
+            return sanitize(self.anchor.status())
+        if method == "hot_reconcile":
+            with self._spend_lock:
+                return sanitize({**self.hot.reconcile(scan=bool(params.get("scan", True))), **self.hot.status()})
         raise ValueError(f"unknown method {method}")
 
     def _height(self) -> int:
@@ -289,6 +335,7 @@ class Signer:
                 self._xbt402.fwd.save()
         self.engine.audit.append({"type": "refund", "dest": dest, "chan": rec.chan, "txid": txid, "sats": sats,
                                   "auto": auto, "ts": self.engine.clock()})
+        self._anchor("refund")
         return {"verdict": "allow", "rule": "refund", **base, "txid": txid, "sats": sats,
                 "to": self.hot.address, "auto": auto}
 
@@ -326,6 +373,12 @@ class Signer:
                 sw = {"error": str(e)[:200]}
         if sw:
             actions.append({"retired_sweep": sw})
+            if "txid" in sw:
+                self._anchor("retired_sweep")
+        if self.anchor.due():
+            r = self.anchor.anchor("periodic")
+            if not r.get("ok") or not r.get("unchanged"):
+                actions.append({"anchor": {k: r.get(k) for k in ("ok", "n", "seq", "alert", "reason")}})
         return actions
 
     def _watch_loop(self) -> None:
@@ -359,6 +412,7 @@ class Signer:
             return {"ok": False, "reason": str(e)[:200]}
         self.engine.audit.append({"type": "hot_sweep", "to": to, "sats": amount, "txid": out["txid"],
                                   "ts": self.engine.clock()})
+        self._anchor("human_sweep")
         self._mine_safe()
         return {"ok": True, "to": to, **out, **self.hot.status()}
 
@@ -554,6 +608,8 @@ class Signer:
             return self._xbt402.close_channel(dest)
         except Exception as e:
             return _deny("close_channel", str(e))
+        finally:
+            self._anchor("close")
 
     def _fund_treasury_locked(self, params: dict) -> dict:
         sats = int(params.get("sats") or params.get("amount_sats") or 0)
@@ -594,6 +650,8 @@ class Signer:
             txid = self.rpc.call("sendrawtransaction", tx.hex())
         except KnotsRpcError as e:
             return {"ok": False, "reason": str(e), "need_csv": self.treasury.csv}
+        finally:
+            self._anchor("treasury_recovery")
         return {"ok": True, "txid": txid, "csv": self.treasury.csv, "to": dest}
 
     def _approve_signed(self, params: dict) -> dict:

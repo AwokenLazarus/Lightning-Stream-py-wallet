@@ -95,6 +95,9 @@ class PolicyConfig:
     refund_margin_blocks: int = 6        # no new states this close to a channel's expiry
     hot_balance_cap_sats: int = 0        # 0 = no cap; above it no new channel is funded (human sweep)
     forward: dict = field(default_factory=dict)  # forward rail limits (agentwallet/forward.py)
+    # AGP-016: the signature-log anchor (agentwallet/anchor.py; the witness socket is B2_ANCHOR_SOCK)
+    anchor_interval_s: int = 60          # periodic anchor; 0 = only on closes, refunds, sweeps, rotations
+    anchor_required: bool = False        # true: the signer refuses to start without a reachable witness
 
     def normalized_allowlist(self) -> frozenset[str]:
         out = set()
@@ -126,10 +129,13 @@ class PolicyConfig:
             "treasury_csv",
             "refund_margin_blocks",
             "hot_balance_cap_sats",
+            "anchor_interval_s",
         }
         kwargs = {k: int(raw[k]) for k in fields if k in raw}
         if "refund_enabled" in raw:
             kwargs["refund_enabled"] = bool(raw["refund_enabled"])
+        if "anchor_required" in raw:
+            kwargs["anchor_required"] = bool(raw["anchor_required"])
         if isinstance(raw.get("forward"), dict):
             kwargs["forward"] = dict(raw["forward"])
         cps = raw.get("counterparties") or {}

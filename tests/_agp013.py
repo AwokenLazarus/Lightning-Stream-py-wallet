@@ -23,8 +23,9 @@ class FakeRpc:
 
     wallet = "agent"
 
-    def __init__(self, height: int = 1000):
+    def __init__(self, height: int = 1000, *, track_outputs: bool = False):
         self.height = height
+        self.track_outputs = track_outputs  # AGP-016: broadcast outputs become gettxout / scantxoutset coins
         self.sent: list[str] = []          # raw hex, in broadcast order
         self.utxos: dict[tuple, dict] = {}  # (txid, vout) -> gettxout result
         self.txs: dict[str, dict] = {}      # txid -> getrawtransaction verbose
@@ -47,6 +48,9 @@ class FakeRpc:
                 op = (i.txid[::-1].hex(), i.vout)
                 self.utxos.pop(op, None)
                 self.spenders[op] = txid
+            if self.track_outputs:
+                for n, o in enumerate(tx.outputs):
+                    self.utxos[(txid, n)] = {"value": o.value / 1e8, "scriptPubKey": {"hex": o.script_pubkey.hex()}}
             self.sent.append(raw)
             self.txs[txid] = {"txid": txid, "hex": raw, "vout": [
                 {"n": n, "value": o.value / 1e8, "scriptPubKey": {"hex": o.script_pubkey.hex()}}
@@ -63,6 +67,13 @@ class FakeRpc:
         if method == "gettxspendingprevout":
             return [{"txid": o["txid"], "vout": o["vout"], **({"spendingtxid": self.spenders[(o["txid"], o["vout"])]}
                      if (o["txid"], o["vout"]) in self.spenders else {})} for o in params[0]]
+        if method == "getblockchaininfo":
+            return {"blocks": self.height, "initialblockdownload": False}
+        if method == "scantxoutset":
+            want = {d[4:-1] for d in params[1] if d.startswith("raw(")}
+            return {"success": True, "unspents": [
+                {"txid": t, "vout": v, "scriptPubKey": u["scriptPubKey"]["hex"], "amount": u["value"], "height": self.height}
+                for (t, v), u in self.utxos.items() if u.get("scriptPubKey", {}).get("hex") in want]}
         if method == "getnewaddress":
             return "bcrt1qmine"
         if method == "generatetoaddress":

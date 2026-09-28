@@ -22,3 +22,8 @@ with a human sweep (`agentwallet-approve --sweep`), every signature is in `.run/
 (hash-chained), channels the provider never closes are refunded at expiry (`xbt402_refund` + a
 watcher), and `xbt402_pay` buys B5 forward lots atomically (`agentwallet/forward.py`). Socket API:
 `docs/B2_SIGNER_API.md`.
+
+AGP-016: the signature log's head is anchored with a witness process (`python -m agentwallet.anchor
+serve --store DIR --sock PATH`, run as its own Unix user; the signer finds it through
+`B2_ANCHOR_SOCK`), the hot UTXO set is sealed on disk and reconciled against the node at start, and
+`treasury.json`'s secrets are sealed like the hot key.

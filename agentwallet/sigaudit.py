@@ -5,6 +5,10 @@ the SHA-256 of the signature bytes (not the signature), the signer method that a
 policy rule that allowed it. Lines are hash-chained (`prev` = SHA-256 of the previous line), written
 with O_APPEND and fsynced, so a removed or edited line breaks `verify_chain`.
 
+AGP-016: the chain head is anchored with a witness process the signer's user cannot rewrite
+(anchor.py), and `verify_chain(path, anchor)` also checks the log against the latest anchor, so a
+whole-file rewrite is detected too.
+
 The method and rule come from a per-thread context the signer sets while it handles a request
 (`context(...)`), so the low-level signing code (channel book, hot wallet) does not need to know
 which policy decision is behind it.
@@ -44,6 +48,10 @@ def set_rule(rule: str) -> None:
     f = getattr(_ctx, "fields", None)
     if f is not None:
         f["rule"] = rule
+
+
+class SigAuditError(RuntimeError):
+    pass
 
 
 class SigAudit:
@@ -89,6 +97,13 @@ class SigAudit:
             self._last = hashlib.sha256(line).hexdigest()
             return entry
 
+    def raw_lines(self) -> list[bytes]:
+        """The log's lines as written (what the chain hashes), read under the append lock."""
+        with self._lock:
+            if not self.path.exists():
+                return []
+            return [x for x in self.path.read_bytes().splitlines() if x.strip()]
+
     def read(self, limit: int = 0) -> list[dict]:
         if not self.path.exists():
             return []
@@ -96,20 +111,40 @@ class SigAudit:
         return rows[-limit:] if limit else rows
 
 
-def verify_chain(path: Path) -> tuple[bool, int]:
-    """(ok, lines checked). ok is False at the first line whose `prev` does not match."""
-    prev, n = GENESIS, 0
+def check_chain(path: Path, anchor: dict | None = None) -> dict:
+    """Walk the chain; with `anchor` ({"n", "head"} from the anchor witness, anchor.py) also require
+    that the log still has the anchored first n lines, i.e. that the hash of line n is the anchored
+    head. A log rewritten from scratch, even with a self-consistent chain, fails that check."""
+    prev, n, bad = GENESIS, 0, ""
+    heads = [GENESIS]
     p = Path(path)
-    if not p.exists():
-        return True, 0
-    for raw in p.read_bytes().splitlines():
+    for raw in (p.read_bytes().splitlines() if p.exists() else []):
         if not raw.strip():
             continue
         if json.loads(raw).get("prev") != prev:
-            return False, n
+            bad = f"line {n + 1} does not chain from line {n}"
+            break
         prev = hashlib.sha256(raw).hexdigest()
+        heads.append(prev)
         n += 1
-    return True, n
+    out = {"ok": not bad, "lines": n, "head": prev, "reason": bad}
+    if anchor is not None and not bad:
+        an, ah = int(anchor.get("n") or 0), anchor.get("head") or GENESIS
+        out["anchored_n"] = an
+        if n < an:
+            out.update(ok=False, reason=f"the log has {n} lines but {an} were anchored (truncated or rewritten)")
+        elif heads[an] != ah:
+            out.update(ok=False, reason=f"line {an} does not hash to the anchored head (the log was rewritten)")
+        else:
+            out["unanchored_lines"] = n - an
+    return out
+
+
+def verify_chain(path: Path, anchor: dict | None = None) -> tuple[bool, int]:
+    """(ok, lines checked). ok is False at the first line whose `prev` does not match, or (with an
+    anchor from the witness) when the log no longer holds the anchored head."""
+    r = check_chain(path, anchor)
+    return r["ok"], r["lines"]
 
 
 class NullAudit:

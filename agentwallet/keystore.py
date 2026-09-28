@@ -70,8 +70,10 @@ class KeyStore:
             self._kdf_cache[salt] = k
         return k
 
-    def seal(self, plaintext: bytes, aad: str) -> dict:
-        salt = secrets.token_bytes(16)
+    def seal(self, plaintext: bytes, aad: str, *, salt: bytes | None = None) -> dict:
+        """`salt` lets a file that is re-sealed often (the hot UTXO set) reuse one scrypt derivation;
+        every seal still gets a fresh random nonce."""
+        salt = salt or secrets.token_bytes(16)
         nonce = secrets.token_bytes(12)
         ct = AESGCM(self._wrap_key(salt)).encrypt(nonce, plaintext, aad.encode())
         return {"v": 1, "alg": "aes-256-gcm", "kdf": "scrypt" if self._pass is not None else "keyfile",
