@@ -53,3 +53,14 @@ provider's signed receipt); `xbt402_recover_lock` reads t + r off the hub's ch1 
 gave up (the hub completed it later from chain). `RouteSigner` is the same over an in-process
 ChannelBook with B1's signer API, for `RoutePayer(signer=...)`. Uses B1's `xbt402.adaptor` when the
 pinned B1 has it (libsecp256k1 secret multiplications), else `fwd/adaptor.py`.
+
+AGP-024 (light client, `agentwallet/chain.py`, `electrum.py`, `headers.py`; `docs/B2_CHAIN_BACKEND.md`):
+the signer reads the chain through a backend. RPC (`KnotsRpc`) is the default and unchanged;
+`B2_CHAIN_BACKEND=electrum` (or `auto` with `B2_ELECTRUM_SERVERS` and no local node) uses Electrum servers
+instead: the wallet keeps its own BLAKE2b header chain from a pinned checkpoint (961640 on mainnet,
+`B2_ELECTRUM_CHECKPOINT` elsewhere), checking PoW and Knots' retarget rules, needs a Merkle proof for every
+transaction it acts on, takes the union of several servers' answers (`B2_ELECTRUM_MIN_SERVERS`, 2 on
+mainnet), broadcasts to all of them, and wakes its watcher on script and header subscriptions. A light
+signer never mines and has no node wallet (`balance.node_wallet: null`; on-chain `pay` is denied).
+`chain_backend` (and `health`) report the checkpoint, tip, servers and verification failures. Servers need
+electrs with the header-v2 patch and `docs/electrs-0.11.1-knots-29.4.2-rpc.patch`.
