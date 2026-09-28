@@ -119,6 +119,9 @@ class Signer:
                                       refund_margin=self.config.refund_margin_blocks,
                                       forward_path=run / "forward.json",
                                       policy=ForwardPolicy.from_dict(self.config.forward))
+        from .routing import RoutePolicy, RouteSigner
+        self.routing = RouteSigner(self.channels, RoutePolicy.from_dict(self.config.routing),
+                                   state_path=run / "routing.json", engine=self.engine)
         self._open_tried: dict[str, float] = {}
         self._watch_stop = threading.Event()
         self.watch_interval = float(os.environ.get("B2_WATCH_INTERVAL", "10"))
@@ -227,6 +230,34 @@ class Signer:
         if method == "xbt402_sign_state_a3":
             with self._spend_lock:
                 return sanitize(self._xbt402_sign_state_a3(params))
+        # --- AGP-021: routed (adaptor-locked) states through a hub ------------------------------------
+        if method == "xbt402_sign_state_adaptor":
+            with self._spend_lock:
+                return sanitize(self._xbt402_sign_state_adaptor(params))
+        if method == "xbt402_resolve_lock":
+            with self._spend_lock:
+                try:
+                    return sanitize({"t": self.routing.resolve_lock(params.get("chan") or "", params.get("secret") or "")})
+                except ChannelError as e:
+                    return _deny(e.code, str(e))
+        if method == "xbt402_void_lock":
+            with self._spend_lock:
+                try:
+                    return sanitize({"voided": bool(self.routing.void_lock(params.get("chan") or ""))})
+                except ChannelError as e:
+                    return _deny(e.code, str(e))
+        if method == "xbt402_adopt_lock":
+            with self._spend_lock:
+                try:
+                    self.routing.adopt_lock(params.get("chan") or "", int(params.get("cum") or 0))
+                    return {"adopted": True}
+                except ChannelError as e:
+                    return _deny(e.code, str(e))
+        if method == "xbt402_recover_lock":
+            with self._spend_lock:
+                return sanitize(self._xbt402_recover_lock(params))
+        if method == "routing_status":
+            return sanitize(self.routing.status())
         if method == "close_channel":
             with self._spend_lock:
                 return sanitize(self._close_channel_locked(params))
@@ -648,6 +679,33 @@ class Signer:
         except Exception as e:
             return _deny("xbt402_sign_state_a3", str(e))
         return {"sig": sig.hex() if isinstance(sig, bytes) else sig}
+
+    def _xbt402_sign_state_adaptor(self, params: dict) -> dict:
+        """AGP-021: pre-sign a routed lock under the routing policy and the ordinary policy engine."""
+        try:
+            chan, cum, point = params.get("chan") or "", int(params.get("cum") or 0), params.get("point") or ""
+            route = params.get("route") if isinstance(params.get("route"), dict) else {}
+            sigaudit.set_rule("policy:routing")
+            out = self.routing.sign_state_adaptor(chan, cum, point, route)
+        except ChannelCapError as e:
+            return _deny("channel_cap", str(e))
+        except ChannelError as e:
+            return _deny(e.code, str(e))
+        except (TypeError, ValueError) as e:
+            return _deny("bad_request", str(e)[:200])
+        return {"verdict": "allow", **out}
+
+    def _xbt402_recover_lock(self, params: dict) -> dict:
+        """After a restart: t + r from the hub's ch1 close (by txid; blockhash on a pruned node)."""
+        from .netparams import get_tx
+        from xbt402.tx import Tx
+        raw = (get_tx(self.rpc, params.get("txid") or "", params.get("blockhash") or "") or {}).get("hex")
+        if not raw:
+            return _deny("unknown_tx", "close transaction not found")
+        try:
+            return {"t": self.routing.recover_lock(params.get("chan") or "", Tx.parse(bytes.fromhex(raw)))}
+        except ChannelError as e:
+            return _deny(e.code, str(e))
 
     def _close_channel_locked(self, params: dict) -> dict:
         raw = params.get("counterparty") or params.get("dest") or params.get("to") or ""

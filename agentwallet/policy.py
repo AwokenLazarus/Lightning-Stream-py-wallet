@@ -95,6 +95,7 @@ class PolicyConfig:
     refund_margin_blocks: int = 6        # no new states this close to a channel's expiry
     hot_balance_cap_sats: int = 0        # 0 = no cap; above it no new channel is funded (human sweep)
     forward: dict = field(default_factory=dict)  # forward rail limits (agentwallet/forward.py)
+    routing: dict = field(default_factory=dict)  # AGP-021 routed (adaptor-locked) payments (agentwallet/routing.py)
     # AGP-016: the signature-log anchor (agentwallet/anchor.py; the witness socket is B2_ANCHOR_SOCK)
     anchor_interval_s: int = 60          # periodic anchor; 0 = only on closes, refunds, sweeps, rotations
     anchor_required: bool = False        # true: the signer refuses to start without a reachable witness
@@ -150,6 +151,8 @@ class PolicyConfig:
             kwargs["regtest_mine"] = bool(raw["regtest_mine"])
         if isinstance(raw.get("forward"), dict):
             kwargs["forward"] = dict(raw["forward"])
+        if isinstance(raw.get("routing"), dict):
+            kwargs["routing"] = dict(raw["routing"])
         cps = raw.get("counterparties") or {}
         kwargs["counterparties"] = {normalize_dest(k): v for k, v in cps.items()}
         return cls(allowlist=frozenset(allow), **kwargs)

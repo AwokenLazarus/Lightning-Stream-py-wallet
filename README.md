@@ -39,3 +39,17 @@ Offers are bounded by `close_fee_max_sats`; `minCapacity`/`maxCapacity` bound th
 (cap + closeFeeSat). Ten 500-sat calls now sign exactly 5,000 (the first state's dust top-up is no
 longer charged twice). Policy: `regtest_mine`, `open_wait_s`, `open_retry_s`, `close_fee_max_sats`;
 `B2_SIGNER_TIMEOUT` sets the socket client's timeout.
+
+AGP-021 (hub routing, `agentwallet/routing.py`): B2 signs adaptor-locked channel states for xbt402
+hub routing (B1 agp-021 `xbt402/hub.py`, `RoutePayer`): `xbt402_sign_state_adaptor(chan, cum, point,
+route)` pre-signs the next state under T1 = T + r*G (T the provider's invoice point, r fresh) after the
+routing policy (`"routing": {"hubs": {origin: {max_fee_ppm, max_fee_base_msat}}, "max_lock_sats",
+"daily_budget_sats"}`: allowed hub, that hub's fee caps with a 1-sat carry allowance, max lock, 24 h
+routed budget counting pending locks) and the policy engine allow it. One pending lock per channel; a
+plain state below it is refused, one at or above it dominates it. The lock (cum, pre-signature, r, T)
+is on disk before the pre-signature leaves; `xbt402_resolve_lock` takes t + r (hub) or t (the
+provider's signed receipt); `xbt402_recover_lock` reads t + r off the hub's ch1 close after a restart;
+`xbt402_void_lock` gives a lock up and `xbt402_adopt_lock` accepts only the cum of a lock this wallet
+gave up (the hub completed it later from chain). `RouteSigner` is the same over an in-process
+ChannelBook with B1's signer API, for `RoutePayer(signer=...)`. Uses B1's `xbt402.adaptor` when the
+pinned B1 has it (libsecp256k1 secret multiplications), else `fwd/adaptor.py`.
