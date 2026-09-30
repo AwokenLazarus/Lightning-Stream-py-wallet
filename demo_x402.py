@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny xbt-channel provider for the B2 demo / claude session. Port 30310 by default."""
+"""Tiny batch-settlement (XBT channel) provider for the B2 demo / claude session. Port 30310 by default."""
 
 from __future__ import annotations
 

@@ -79,7 +79,7 @@ def _build_server():
 
     @mcp.tool()
     def xbt402_pay(url: str, method: str = "GET", body: str = "", max_sats: int = 1000) -> str:
-        """Pay an xbt-channel 402 through the policy engine. Keys stay in the signer.
+        """Pay a batch-settlement (XBT channel; xbt-channel alias) 402 through the policy engine. Keys stay in the signer.
 
         Streamed results (signed Merkle manifest) are verified and bought inside the
         signer. The response is a digest + stored path, not a truncated body.

@@ -1,6 +1,6 @@
 """Forward rail: buy B5 coinbase-forward lots over xbt402, atomically (AGP-013, from b5 AGP-008).
 
-A rail beside `stream`, inside `xbt402_pay`. When a 402's xbt-channel offer carries `extra.forward`
+A rail beside `stream`, inside `xbt402_pay`. When a 402's channel offer carries `extra.forward`
 (a market's /forward/quote), the session:
 
   1. checks the forward policy: the market is allowed, the price is within the per-lot max, and the

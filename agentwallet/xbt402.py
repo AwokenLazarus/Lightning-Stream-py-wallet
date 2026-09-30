@@ -64,9 +64,10 @@ def request_target(url: str) -> str:
 
 def pick_accept(pr: dict, network: str) -> dict:
     for acc in pr.get("accepts") or []:
-        if acc.get("scheme") == SCHEME and acc.get("network") == network:
+        # SCHEME is batch-settlement on B1 agp-050+; xbt-channel is the one-release alias.
+        if acc.get("scheme") in (SCHEME, "batch-settlement", "xbt-channel") and acc.get("network") == network:
             return acc
-    raise RuntimeError("no xbt-channel offer on this network")
+    raise RuntimeError("no batch-settlement offer on this network")
 
 
 def charged_of(resp, default: int) -> int:
