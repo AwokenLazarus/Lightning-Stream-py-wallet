@@ -6,7 +6,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 export B2_ROOT="$ROOT"
-export B1_ROOT="${B1_ROOT:-$HOME/xbt-rnd/b1}"
+if [[ -z "${B1_ROOT:-}" ]]; then
+  echo "B1_ROOT is not set: point it at a b1 tree or snapshot (for example ~/xbt-rnd/b1, whose master is the accepted line, or a cmp-rails snapshot); B2 never guesses which b1 to test against" >&2
+  exit 2
+fi
+export B1_ROOT
 export B2_RUN="${B2_RUN:-$HOME/xbt-rnd/xbt-062/run}"
 export B2_DATADIR="${B2_DATADIR:-$B2_RUN/node}"
 export B2_CONF="${B2_CONF:-$B2_RUN/bitcoin.conf}"
