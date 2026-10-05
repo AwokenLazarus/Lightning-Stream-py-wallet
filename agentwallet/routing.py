@@ -114,7 +114,7 @@ class RouteSpend:
         self._log: AppendLog | None = None
         self._unpruned = 0
         if self.path:
-            old = self._legacy_rows()
+            old = self._legacy_rows(self.path)
             if old is not None:
                 replace_log(self.path, "route-spend", old)
             self._log = AppendLog(self.path, "route-spend")
@@ -124,12 +124,13 @@ class RouteSpend:
                     raise LogError(f"{self.path}: line {n} is not a spend row")
             self._prune(time.time())
 
-    def _legacy_rows(self) -> list | None:
+    @staticmethod
+    def _legacy_rows(path: Path) -> list | None:
         """The rows of a pre-AGP-055 file, or None when the file is absent or already a log."""
-        if not self.path.exists():
+        if not path.exists():
             return None
         try:
-            doc = json.loads(self.path.read_bytes())
+            doc = json.loads(path.read_bytes())
         except ValueError:
             return None              # not one JSON document: the append-only log (opened strictly next)
         if isinstance(doc, dict) and isinstance(doc.get("resolved"), list):

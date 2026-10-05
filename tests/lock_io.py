@@ -22,13 +22,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from _agp013 import FakeRpc, fund_channel
+
 from agentwallet.channels import ChannelBook
 from agentwallet.keystore import KeyStore
 from agentwallet.policy import AuditLog, PolicyConfig, PolicyEngine, PolicyStore
 from agentwallet.routing import RoutePolicy, RouteSigner, adaptor_mod
 from agentwallet.sigaudit import SigAudit
-
-from _agp013 import FakeRpc, fund_channel
 
 HUB = "http://hub.test"
 A = adaptor_mod()

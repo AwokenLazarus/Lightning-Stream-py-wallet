@@ -14,20 +14,21 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-import tempfile
+
+from lock_io import HUB, Count, lock, rig
 
 from agentwallet import applog
+from agentwallet import policy as policy_mod
+from agentwallet import routing as routing_mod
 from agentwallet.applog import AppendLog, LogError
 from agentwallet.policy import LedgerEntry, PolicyStore
 from agentwallet.routing import DAY_S, RouteSpend, adaptor_mod, point_add
-from agentwallet import policy as policy_mod, routing as routing_mod
 from agentwallet.sigaudit import check_chain
-
-from lock_io import HUB, Count, lock, rig
 
 A = adaptor_mod()
 
@@ -278,7 +279,6 @@ class Keys(unittest.TestCase):
                 r.book.sign_state(HUB, 1500)
                 r.book.fresh_seq(HUB)
                 self.assertEqual((keys.read_bytes(), keys.stat().st_ino), (before, ino))
-                secret, pub = r.book.new_payer_key()
                 from _agp013 import FakeRpc, fund_channel
                 fund_channel(r.book, FakeRpc(), "http://other.test", secret=0xB0B0)
                 self.assertNotEqual(keys.read_bytes(), before)
