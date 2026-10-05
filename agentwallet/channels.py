@@ -90,6 +90,10 @@ class ChannelRecord:
     # {cum, pre, r, T, T1, route, at, prev_used}. Written before the pre-signature leaves (write-ahead).
     pending_lock: dict = field(default_factory=dict)
     given_up: list = field(default_factory=list)     # recent voided locks {cum, at}: adopt_lock only takes these
+    # AGP-055: the last resolved (or adopted) locks {key, amount, hub, lockId, at}, written with the resolve
+    # itself. RouteSigner books each one (spend row, ledger row) under its key, and at start books any that
+    # a crash left unbooked. key = "lock:<chan>:<cum>": the signer's own id for a lock, never the caller's
+    resolved: list = field(default_factory=list)
     # AGP-022: the close's change to the hot key. "pending" until it is counted ("counted"), proven
     # spent ("spent") or absent ("none"); "" on records from before AGP-022. close_scan_from is the next
     # block the watcher reads for the close (no txindex); close_hex is the close, if the provider sent it
@@ -500,9 +504,26 @@ class ChannelBook:
             rec.acked_sats = rec.used_sats                   # the hub holds the completed state
             rec.last_sig = ""
             rec.pending_lock = {}
+            booking = self._note_resolved_locked(rec, int(lk["cum"]), int(lk["cum"]) - int(lk["prev_used"]),
+                                                 lk.get("route") or {})
             self._persist()
             return {"t": f"{t:064x}", "cum": int(lk["cum"]), "amount": int(lk["cum"]) - int(lk["prev_used"]),
-                    "route": lk.get("route") or {}}
+                    "route": lk.get("route") or {}, "booking": booking}
+
+    RESOLVED_KEPT = 16
+
+    @staticmethod
+    def _note_resolved_locked(rec: ChannelRecord, cum: int, amount: int, route: dict) -> dict:
+        """Record a resolved lock in its channel record (the caller persists): what there is to book."""
+        booking = {"key": f"lock:{rec.chan}:{cum}", "amount": int(amount), "hub": route.get("hub", ""),
+                   "lockId": route.get("lockId", ""), "at": round(__import__("time").time(), 3)}
+        rec.resolved = (rec.resolved + [booking])[-ChannelBook.RESOLVED_KEPT:]
+        return booking
+
+    def resolved_bookings(self) -> list[tuple[str, dict]]:
+        """(chan, booking) for the resolved locks every record still remembers, whatever its state."""
+        with self._lock:
+            return [(r.chan, dict(b)) for r in self._records.values() for b in r.resolved]
 
     def void_lock(self, dest: str) -> dict:
         """Give the pending lock up (the hub refused it, or its invoice expired unanswered)."""
@@ -530,8 +551,9 @@ class ChannelBook:
             rec.spent_sats = max(rec.spent(), int(cum))
             rec.acked_sats = rec.used_sats
             rec.given_up = [x for x in rec.given_up if x is not g]
+            booking = self._note_resolved_locked(rec, int(cum), amount, g.get("route") or {}) if amount else None
             self._persist()
-            return {"cum": int(cum), "amount": amount, "route": g.get("route") or {}}
+            return {"cum": int(cum), "amount": amount, "route": g.get("route") or {}, "booking": booking}
 
     def recover_lock(self, dest: str, close_witness) -> dict:
         """After a restart: the hub closed ch1 with our completed pre-signature; t + r is in it."""

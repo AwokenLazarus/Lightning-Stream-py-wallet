@@ -110,6 +110,7 @@ class RouteSpend:
     def __init__(self, path: Path | None):
         self.path, self.lock = (Path(path) if path else None), threading.Lock()
         self.rows: list = []
+        self._keys: set = set()
         self._log: AppendLog | None = None
         self._unpruned = 0
         if self.path:
@@ -135,17 +136,24 @@ class RouteSpend:
     def _prune(self, now: float) -> None:
         self._unpruned = 0
         self.rows = [r for r in self.rows if r["at"] >= now - RETAIN_S]
+        self._keys = {r["key"] for r in self.rows if r.get("key")}
         if self._log is not None and self._log.file_rows > 2 * len(self.rows) + PRUNE_EVERY:
             self._log.compact(self.rows)
 
-    def add(self, row: dict):
+    def add(self, row: dict) -> bool:
+        """Book a row. A row with a "key" this log already holds is not booked again (False)."""
         with self.lock:
+            if row.get("key") and row["key"] in self._keys:
+                return False
             if self._log is not None:
                 self._log.append(row)            # durable before it counts
             self.rows.append(row)
+            if row.get("key"):
+                self._keys.add(row["key"])
             self._unpruned += 1
             if self._unpruned >= PRUNE_EVERY:
                 self._prune(time.time())
+            return True
 
     def since(self, t: float) -> int:
         with self.lock:
@@ -184,6 +192,9 @@ class RouteSigner:
         self.spend = RouteSpend(Path(state_path) if state_path else None)
         self._pending_keys: dict = {}
         self.denials: list = []
+        # AGP-055: a crash between a resolve reaching disk and its rows left the budgets short. Book it now
+        self.recovered_bookings = sum(self._book(chan, b) for chan, b in book.resolved_bookings()
+                                      if b["at"] >= time.time() - RETAIN_S)
 
     # --- channel lifecycle (B1 XbtChannelClient with a signer) --------------------------------------
     def new_key(self, origin: str) -> str:
@@ -248,14 +259,22 @@ class RouteSigner:
         rec = self.book.get(self._dest(chan))
         return dict(rec.pending_lock) if rec else {}
 
+    def _book(self, chan: str, b: dict, **how) -> bool:
+        """Book a resolved lock in the 24 h routing budget and the policy ledger, once per key: a row
+        already there (a restart re-booking what the record remembers) is left alone. True if it wrote."""
+        wrote = self.spend.add({"at": b["at"], "amount": b["amount"], "chan": chan, "lockId": b.get("lockId", ""),
+                                "key": b["key"], **how})
+        if self.engine is not None and not any(e.txid == b["key"] for e in self.engine.store.payments()
+                                               if e.ts >= b["at"] - 1):
+            from .policy import Payment
+            self.engine.commit(Payment(dest=normalize_dest(b.get("hub") or chan), amount_sats=b["amount"],
+                                       memo="routed lock", ts=b["at"]), txid=b["key"])
+            wrote = True
+        return wrote
+
     def resolve_lock(self, chan: str, secret: str) -> str:
         res = self.book.resolve_lock(self._dest(chan), secret)
-        self.spend.add({"at": time.time(), "amount": res["amount"], "chan": chan,
-                        "lockId": (res.get("route") or {}).get("lockId", "")})
-        if self.engine is not None:
-            from .policy import Payment
-            self.engine.commit(Payment(dest=normalize_dest((res.get("route") or {}).get("hub", "") or chan),
-                                       amount_sats=res["amount"], memo="routed lock"), txid=chan)
+        self._book(chan, res["booking"])
         return res["t"]
 
     def void_lock(self, chan: str) -> dict:
@@ -264,12 +283,12 @@ class RouteSigner:
     def adopt_lock(self, chan: str, cum: int) -> None:
         res = self.book.adopt_lock(self._dest(chan), int(cum))
         if res["amount"]:
-            self.spend.add({"at": time.time(), "amount": res["amount"], "chan": chan, "adopted": True})
+            self._book(chan, res["booking"], adopted=True)
 
     def recover_lock(self, chan: str, close_tx) -> str:
         wit = close_tx.inputs[0].witness if hasattr(close_tx, "inputs") else close_tx
         res = self.book.recover_lock(self._dest(chan), wit)
-        self.spend.add({"at": time.time(), "amount": res["amount"], "chan": chan, "recovered": True})
+        self._book(chan, res["booking"], recovered=True)
         return res["t"]
 
     def pending_sats(self) -> int:

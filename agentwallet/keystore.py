@@ -119,7 +119,7 @@ def load_or_create_keyfile(path: Path, run_dir: Path | None = None) -> bytes:
 
 
 def write_private(path: Path, text: str) -> None:
-    """Atomic 0600 write (the temp file is 0600 before any byte lands)."""
+    """Atomic, durable 0600 write: temp file (0600 before any byte lands), fsync, rename, fsync the directory."""
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -131,4 +131,11 @@ def write_private(path: Path, text: str) -> None:
     finally:
         os.close(fd)
     os.replace(tmp, path)
+    # AGP-055: the rename itself must be durable before the caller goes on (a lock is written ahead of
+    # its pre-signature); without this it waits for the filesystem's next journal commit
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
     os.chmod(path, 0o600)

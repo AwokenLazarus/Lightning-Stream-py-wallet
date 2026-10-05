@@ -179,7 +179,7 @@ cat > "$ROOT/policy.json" <<EOF
   "human_pubkey": "$HUMAN_PUB"
 }
 EOF
-rm -f "$ROOT/.run/ledger.json" "$ROOT/.run/audit.jsonl" "$ROOT/.run/vault.json" \
+rm -f "$ROOT/.run/ledger.json" "$ROOT/.run/ledger.payments.jsonl" "$ROOT/.run/audit.jsonl" "$ROOT/.run/vault.json" \
       "$ROOT/.run/channels.json" "$ROOT/.run/channel_keys.json" "$ROOT/.run/hot.json" \
       "$ROOT/.run/treasury.json" "$B2_PENDING"
 

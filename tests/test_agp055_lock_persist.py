@@ -1,6 +1,7 @@
 """AGP-055: the lock path writes only what changed, and a crash at any write step loses nothing signed.
 
   * the keys file is not rewritten by a lock (or any state), only when a key is added or dropped;
+  * a resolved lock is booked once per key, and a restart books one a crash left unbooked;
   * routed-spend rows and ledger payments are appended (applog.py): one line, one fsync, no rename;
   * a torn last line is cut off at open, a damaged complete line refuses to load, compaction is
     atomic, and old-format files are converted once (and again safely after a crash in between);
@@ -279,7 +280,7 @@ class Keys(unittest.TestCase):
                 again.book.sign_close("http://other.test")
 
     def test_fsyncs_per_lock(self):
-        want = {"bare": 3, "keyfile": 7}                  # was 5 and 8 (see lock_io.py)
+        want = {"bare": 5, "keyfile": 9}                  # 2 of each: the directory fsync after a records rename
         for setup, n in want.items():
             r = rig(setup)
             _, y = lock(r.rs, r.chan, 1000, "warm")
@@ -333,16 +334,23 @@ class CrashAtEveryStep(unittest.TestCase):
         elif rec.used_sats != self.CUM:
             self.assertEqual(rec.used_sats, 1000, tag)    # nothing happened
         spent, paid = b.rs.spend.since(0) - spent0, len(b.rs.engine.store.payments()) - paid0
-        self.assertIn(spent, (0, 1000), tag)              # booked at most once
-        self.assertIn(paid, (0, 1), tag)
         if resolved:
-            self.assertEqual((rec.used_sats, lk, spent, paid), (self.CUM, {}, 1000, 1), tag)
-        if spent or paid:
-            self.assertEqual(rec.used_sats, self.CUM, tag)  # booked only after the resolve is on disk
+            self.assertEqual((rec.used_sats, lk), (self.CUM, {}), tag)
+        # a resolve that reached disk is booked exactly once in both budgets, whether the rows were
+        # written before the crash or by the restart (b.rs.recovered_bookings); nothing else is booked
+        want = (1000, 1) if rec.used_sats == self.CUM else (0, 0)
+        self.assertEqual((spent, paid), want, tag)
+        again = rig("keyfile", d=r.d, ks=r.ks, chan=r.chan)   # a second restart books nothing more
+        self.assertEqual((again.rs.recovered_bookings, again.rs.spend.since(0) - spent0), (0, want[0]), tag)
+        again.rs.spend._log.close()
+        again.rs.engine.store._log.close()
+        b = rig("keyfile", d=r.d, ks=r.ks, chan=r.chan)
 
         # the wallet goes on: finish or replace the lock; no nonce and no tweak is used twice
         if lk and secret:
             b.rs.resolve_lock(b.chan, secret)
+        elif lk:                                          # on disk, but it never left: the caller gives it up
+            b.rs.void_lock(b.chan)
         nxt, y = lock(b.rs, b.chan, self.CUM + 500, "L2")
         b.rs.resolve_lock(b.chan, y)
         pres = [first, nxt] + ([out] if out else []) + ([{"adaptor": lk["pre"], "tweak": lk["r"]}] if lk else [])
@@ -363,7 +371,7 @@ class CrashAtEveryStep(unittest.TestCase):
                     break
                 step += 1
             self.assertEqual(step, total)                 # every syscall of the lock was the last one once
-            self.assertGreaterEqual(total, 7 + 7 + 2)     # 7 fsyncs, their writes, 2 renames
+            self.assertEqual(total, 9 + 7 + 2)            # 9 fsyncs, 7 writes, 2 renames
 
 
 if __name__ == "__main__":
