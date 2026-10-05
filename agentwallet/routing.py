@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .applog import AppendLog, replace_log
+from .applog import AppendLog, LogError, replace_log
 from .b1path import ensure_b1
 from .policy import normalize_dest
 
@@ -119,6 +119,9 @@ class RouteSpend:
                 replace_log(self.path, "route-spend", old)
             self._log = AppendLog(self.path, "route-spend")
             self.rows = self._log.take_rows()
+            for n, r in enumerate(self.rows, start=2):
+                if not isinstance(r.get("at"), (int, float)) or not isinstance(r.get("amount"), int):
+                    raise LogError(f"{self.path}: line {n} is not a spend row")
             self._prune(time.time())
 
     def _legacy_rows(self) -> list | None:
@@ -193,7 +196,8 @@ class RouteSigner:
         self._pending_keys: dict = {}
         self.denials: list = []
         # AGP-055: a crash between a resolve reaching disk and its rows left the budgets short. Book it now
-        self.recovered_bookings = sum(self._book(chan, b) for chan, b in book.resolved_bookings()
+        in_ledger = {e.txid for e in engine.store.payments()} if engine is not None else set()
+        self.recovered_bookings = sum(self._book(chan, b, in_ledger=in_ledger) for chan, b in book.resolved_bookings()
                                       if b["at"] >= time.time() - RETAIN_S)
 
     # --- channel lifecycle (B1 XbtChannelClient with a signer) --------------------------------------
@@ -259,13 +263,14 @@ class RouteSigner:
         rec = self.book.get(self._dest(chan))
         return dict(rec.pending_lock) if rec else {}
 
-    def _book(self, chan: str, b: dict, **how) -> bool:
-        """Book a resolved lock in the 24 h routing budget and the policy ledger, once per key: a row
-        already there (a restart re-booking what the record remembers) is left alone. True if it wrote."""
+    def _book(self, chan: str, b: dict, *, in_ledger: frozenset | set = frozenset(), **how) -> bool:
+        """Book a resolved lock in the 24 h routing budget and the policy ledger, under its key. A lock
+        resolves once, so a live call always writes both rows. At start the record's remembered locks
+        come through here again: the spend log skips a key it holds, and `in_ledger` (the ledger's
+        txids) skips a payment it holds. True if anything was written."""
         wrote = self.spend.add({"at": b["at"], "amount": b["amount"], "chan": chan, "lockId": b.get("lockId", ""),
                                 "key": b["key"], **how})
-        if self.engine is not None and not any(e.txid == b["key"] for e in self.engine.store.payments()
-                                               if e.ts >= b["at"] - 1):
+        if self.engine is not None and b["key"] not in in_ledger:
             from .policy import Payment
             self.engine.commit(Payment(dest=normalize_dest(b.get("hub") or chan), amount_sats=b["amount"],
                                        memo="routed lock", ts=b["at"]), txid=b["key"])

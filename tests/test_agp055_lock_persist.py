@@ -164,6 +164,13 @@ class Spend(unittest.TestCase):
         self.assertEqual(s.since(now - DAY_S), 7)
         self.assertEqual(p.read_bytes().split(b"\n")[0], applog.header("route-spend").rstrip())
 
+    def test_a_row_without_its_fields_refuses_to_load(self):
+        p = tmpdir() / "routing.json"
+        for bad in ({"amount": 1}, {"at": 1.0}, {"at": "x", "amount": 1}):
+            p.write_bytes(applog.header("route-spend") + applog._line(bad))
+            with self.assertRaises(LogError):
+                RouteSpend(p)
+
     def test_window_is_bounded_and_the_file_is_compacted(self):
         p = tmpdir() / "routing.json"
         now = time.time()
