@@ -9,11 +9,14 @@ import json
 import os
 import secrets
 import threading
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlparse
+
+from .applog import AppendLog, LogError, write_all
 
 
 DAY_S = 24 * 3600
@@ -172,6 +175,10 @@ class LedgerEntry:
     memo: str = ""
 
 
+def _row_key(row: dict) -> tuple:
+    return (row["dest"], int(row["amount_sats"]), float(row["ts"]), row.get("txid", ""), row.get("memo", ""))
+
+
 class AuditLog:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -181,10 +188,12 @@ class AuditLog:
     def append(self, event: dict) -> None:
         line = json.dumps(event, sort_keys=True, separators=(",", ":"))
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                write_all(fd, (line + "\n").encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     def read(self, limit: int = 50) -> list[dict]:
         if not self.path.exists():
@@ -199,15 +208,67 @@ class AuditLog:
         return out
 
 
+PRUNE_EVERY = 1024           # commits between two prunes of the in-memory payments
+
+
 class PolicyStore:
-    """On-disk committed payments and pending human approvals."""
+    """On-disk committed payments and pending human approvals.
+
+    AGP-055: `ledger.json` holds the approvals. The payments are an append-only log next to it
+    (`ledger.payments.jsonl`, applog.py): a commit is one line and one fsync, and the engine reads
+    the payments from memory. Both used to be one JSON document, read and rewritten whole on every
+    commit. Payments found in `ledger.json` (the old format) move to the log at open.
+
+    `retain_s` (the engine sets it to its longest window plus a day) bounds what stays in memory
+    and what a compaction keeps; None keeps everything. The audit log has every commit regardless.
+    A line {"amend": txid, "amount_sats": n | null} (the Rust signer's Lightning bookings) changes
+    or removes the last payment with that txid."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.path.with_name(self.path.stem + ".payments.jsonl")
+        self.retain_s: float | None = None
         self._lock = threading.Lock()
+        self._unpruned = 0
         if not self.path.exists():
-            self._write({"payments": [], "approvals": {}})
+            self._write({"approvals": {}, "payments_log": self.log_path.name})
+        self._log = AppendLog(self.log_path, "payments")
+        self._entries: list[LedgerEntry] = []
+        for n, row in enumerate(self._log.take_rows(), start=2):
+            self._apply(row, n)
+        self._migrate()
+
+    def _apply(self, row: dict, n: int) -> None:
+        if "amend" not in row:
+            self._entries.append(LedgerEntry(**row))
+            return
+        i = next((i for i in range(len(self._entries) - 1, -1, -1) if self._entries[i].txid == row["amend"]), None)
+        if i is None:
+            raise LogError(f"{self.log_path}: line {n} amends {row['amend']!r}, which the log does not hold")
+        if row.get("amount_sats") is None:
+            del self._entries[i]
+        else:
+            self._entries[i].amount_sats = int(row["amount_sats"])
+
+    def _migrate(self) -> None:
+        """Move the payments of an old-format ledger.json to the log. Safe to run again after a crash
+        between its two writes: only rows the log does not already hold are added."""
+        data = self._read()
+        if "payments" not in data:
+            return
+        missing = Counter(_row_key(e) for e in data["payments"]) - Counter(_row_key(asdict(e)) for e in self._entries)
+        if missing:
+            add = []
+            for e in data["payments"]:
+                if missing[_row_key(e)] > 0:
+                    missing[_row_key(e)] -= 1
+                    add.append(LedgerEntry(**e))
+            self._entries += add
+            self._log.compact([asdict(e) for e in self._entries])
+        del data["payments"]
+        data["payments_log"] = self.log_path.name
+        self._write(data)
 
     def _read(self) -> dict:
         return json.loads(self.path.read_text(encoding="utf-8"))
@@ -219,22 +280,22 @@ class PolicyStore:
 
     def payments(self) -> list[LedgerEntry]:
         with self._lock:
-            raw = self._read().get("payments") or []
-        return [LedgerEntry(**e) for e in raw]
+            return list(self._entries)
 
     def commit(self, entry: LedgerEntry) -> None:
         with self._lock:
-            data = self._read()
-            data.setdefault("payments", []).append(
-                {
-                    "dest": entry.dest,
-                    "amount_sats": entry.amount_sats,
-                    "ts": entry.ts,
-                    "txid": entry.txid,
-                    "memo": entry.memo,
-                }
-            )
-            self._write(data)
+            self._log.append(asdict(entry))          # durable before it counts
+            self._entries.append(entry)
+            self._unpruned += 1
+            if self._unpruned >= PRUNE_EVERY:
+                self._prune(entry.ts)
+
+    def _prune(self, now: float) -> None:
+        self._unpruned = 0
+        if self.retain_s is not None:
+            self._entries = [e for e in self._entries if e.ts >= now - self.retain_s]
+        if self._log.file_rows > 2 * len(self._entries) + PRUNE_EVERY:
+            self._log.compact([asdict(e) for e in self._entries])
 
     def put_approval(self, token: str, payload: dict) -> None:
         with self._lock:
@@ -266,6 +327,8 @@ class PolicyEngine:
         self.config = config
         self.allowlist = config.normalized_allowlist()
         self.store = store
+        # the store keeps what the longest window below can still read, and a day more
+        store.retain_s = max(WEEK_S, config.velocity_window_s, config.split_window_s) + DAY_S
         self.audit = audit
         self.clock = clock or (lambda: __import__("time").time())
 

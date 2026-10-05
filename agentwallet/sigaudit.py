@@ -24,6 +24,8 @@ import threading
 import time
 from pathlib import Path
 
+from .applog import cut_torn_tail
+
 _ctx = threading.local()
 GENESIS = "0" * 64
 
@@ -59,6 +61,9 @@ class SigAudit:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # AGP-055: a crash mid-append leaves a line without its newline. That signature never left
+        # (it is logged before it is returned), and the next line must not be glued onto it.
+        self.torn_bytes = cut_torn_tail(self.path)
         self._last = self._tail_hash()
 
     def _tail_hash(self) -> str:

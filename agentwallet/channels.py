@@ -149,6 +149,9 @@ class ChannelBook:
         self._records: dict[str, ChannelRecord] = {}
         self._archived: list[dict] = []
         self._secrets: dict[str, int] = {}
+        # AGP-055: the keys as the keys file has them (None: no usable file yet). _persist rewrites
+        # the keys file only when _secrets differs: a state, a lock or a seq changes no key.
+        self._keys_on_disk: dict[str, int] | None = None
         self._load()
 
     def _load(self) -> None:
@@ -167,13 +170,17 @@ class ChannelBook:
                 self._secrets = {k: int(v, 16) for k, v in (raw.get("secrets") or {}).items()}
                 self._persist()  # first start with a wrapping key: re-seal the plaintext file
             self._secrets = {k: int(v, 16) for k, v in (raw.get("secrets") or {}).items()}
+            if self._keys_on_disk is None:
+                self._keys_on_disk = dict(self._secrets)
 
     def _persist(self) -> None:
         # keys first: a record on disk never names a channel whose payer key is not on disk (P1)
-        doc = json.dumps({"secrets": {k: f"{v:064x}" for k, v in self._secrets.items()}}, indent=2)
-        if self.keystore is not None:
-            doc = json.dumps({"sealed": self.keystore.seal(doc.encode(), self.KEYS_AAD)}, indent=2)
-        write_private(self.keys_path, doc)
+        if self._secrets != self._keys_on_disk:
+            doc = json.dumps({"secrets": {k: f"{v:064x}" for k, v in self._secrets.items()}}, indent=2)
+            if self.keystore is not None:
+                doc = json.dumps({"sealed": self.keystore.seal(doc.encode(), self.KEYS_AAD)}, indent=2)
+            write_private(self.keys_path, doc)
+            self._keys_on_disk = dict(self._secrets)
         body = {"channels": {d: asdict(r) for d, r in self._records.items()}}
         if self._archived:
             body["archived"] = self._archived

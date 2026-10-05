@@ -30,12 +30,12 @@ the routed client runs with its keys in B2. The Signer's socket exposes the same
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .applog import AppendLog, replace_log
 from .b1path import ensure_b1
 from .policy import normalize_dest
 
@@ -95,26 +95,57 @@ class RoutePolicy:
         return -(-exact_msat // 1000) + 1
 
 
+RETAIN_S = 7 * DAY_S          # rows older than this are never read (the budget looks back 24 h)
+PRUNE_EVERY = 1024           # rows added between two prunes: a prune is O(rows), so it is not per lock
+
+
 class RouteSpend:
-    """Resolved routed spend (fsynced JSON), for the 24 h routing budget."""
+    """Resolved routed spend, for the 24 h routing budget.
+
+    AGP-055: an append-only log (applog.py), one line and one fsync per resolved lock; it used to be
+    seven days of rows rewritten on every lock. Rows older than RETAIN_S leave memory at a prune, and
+    the file is compacted to the rows still in memory once it holds over twice as many (plus
+    PRUNE_EVERY). A file in the old format ({"resolved": [...]}) is converted at open, in one rename."""
 
     def __init__(self, path: Path | None):
         self.path, self.lock = (Path(path) if path else None), threading.Lock()
         self.rows: list = []
-        if self.path and self.path.exists():
-            self.rows = json.loads(self.path.read_text()).get("resolved", [])
+        self._log: AppendLog | None = None
+        self._unpruned = 0
+        if self.path:
+            old = self._legacy_rows()
+            if old is not None:
+                replace_log(self.path, "route-spend", old)
+            self._log = AppendLog(self.path, "route-spend")
+            self.rows = self._log.take_rows()
+            self._prune(time.time())
+
+    def _legacy_rows(self) -> list | None:
+        """The rows of a pre-AGP-055 file, or None when the file is absent or already a log."""
+        if not self.path.exists():
+            return None
+        try:
+            doc = json.loads(self.path.read_bytes())
+        except ValueError:
+            return None              # not one JSON document: the append-only log (opened strictly next)
+        if isinstance(doc, dict) and isinstance(doc.get("resolved"), list):
+            return doc["resolved"]
+        return None
+
+    def _prune(self, now: float) -> None:
+        self._unpruned = 0
+        self.rows = [r for r in self.rows if r["at"] >= now - RETAIN_S]
+        if self._log is not None and self._log.file_rows > 2 * len(self.rows) + PRUNE_EVERY:
+            self._log.compact(self.rows)
 
     def add(self, row: dict):
         with self.lock:
+            if self._log is not None:
+                self._log.append(row)            # durable before it counts
             self.rows.append(row)
-            self.rows = [r for r in self.rows if r["at"] >= time.time() - 7 * DAY_S]
-            if self.path:
-                tmp = self.path.with_suffix(".tmp")
-                with open(tmp, "w") as f:
-                    json.dump({"resolved": self.rows}, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, self.path)
+            self._unpruned += 1
+            if self._unpruned >= PRUNE_EVERY:
+                self._prune(time.time())
 
     def since(self, t: float) -> int:
         with self.lock:
