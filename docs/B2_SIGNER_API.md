@@ -4,15 +4,17 @@ Newline-delimited JSON on a mode-600 Unix socket (`B2_SIGNER_SOCK`).
 Request: `{"id":1,"method":"...","params":{...}}`.
 The MCP process is a client of this socket. **Payer secrets never leave the signer.**
 
-This is the wallet hook XBT-060 / the B1 SDK should use (`fund(address, sats)` → B2, 0x21).
+AGP-063 (review W): nothing on this socket moves coins except inside the owner's policy. `fund` to a bare
+address is gone; the Rust signer funds only a channel for a payer key it issued, to the seller's verified
+terms (`fund` with `origin`, `params`), and B2 issues no such keys, so B2 refuses every `fund`.
 
 | Method | Params | Result |
 |---|---|---|
-| `fund` | `address`, `sats` | `{txid, vout, sighash: "0x21"}` — spends signer hot coins |
-| `sign_state` | `dest`, `cum` | policy-checked `{sig, chan, cum}` |
-| `open_channel` | `dest`, `pay_to?`, `cap_sats?`, `expiry_blocks?` | opens a Spillman channel; cap defaults to `per_counterparty_cap_sats` |
+| `fund` | `origin`, `params`, `sats` | AGP-063: `deny/fund_unbound` without `origin` and `params`, else `deny/bad_key` (B2 issues no client channel keys) |
+| `sign_state` | `dest`, `cum` | policy-checked `{sig, chan, cum}`. AGP-063: the increase over what the ledger holds for the channel is booked (`xbt402:<chan>:<cum>`) before the signature, and the row is dropped if signing fails; a lower `cum` is `deny/amount` |
+| `open_channel` | `dest`, `cap_sats?`, `expiry_blocks?`, `close_fee?` | opens a Spillman channel; cap defaults to `per_counterparty_cap_sats`. AGP-063: allowlisted `dest` only; payTo is the policy's `counterparties[dest].pay_to` (a different `pay_to` param is `deny/pay_to`); `cap_sats` ≤ `per_counterparty_cap_sats` (`channel_cap`), `expiry_blocks` in (`refund_margin_blocks`, max(`channel_expiry_blocks`, 4032)] (`expiry`), `close_fee` ≤ `close_fee_max_sats` (`close_fee`) |
 | `channels` | — | `{channels:[{dest,chan,cap_sats,used_sats,expiry,residual_sats}]}` |
-| `xbt402_pay` | `url`, `method`, `body`, `max_sats` | policy-checked 402 payment; streamed results: digest + stored path; provider body + receipt verbatim under `untrusted_provider_response` (untrusted data, not key-filtered). AGP-017: `verdict: pending, rule: funding_unconfirmed` while a new channel's funding waits for the offer's `minConf` (call again; the watcher also opens it). AGP-020: a signed state refused before the provider records it is re-sent on the next call (same cum and sig; at most one call of slack) |
+| `xbt402_pay` | `url`, `method`, `body`, `max_sats` | policy-checked 402 payment; streamed results: digest + stored path; provider body + receipt verbatim under `untrusted_provider_response` (untrusted data, not key-filtered). AGP-017: `verdict: pending, rule: funding_unconfirmed` while a new channel's funding waits for the offer's `minConf` (call again; the watcher also opens it). AGP-020: a signed state refused before the provider records it is re-sent on the next call (same cum and sig; at most one call of slack). AGP-063 W1: books the signed increase, not `charged`; the budget sums are held to that increase (`PolicyEngine.evaluate_booking`), and a dust floor above the remaining budget is refused before signing (`Xbt402Session.set_spend_check`) |
 | `notice_hot_txid` | `txid` | register a send-to-hot UTXO |
 | `fund_treasury` | `sats` | 0x21 fund of the CSV-4320 treasury |
 | `recover_treasury` | `signature`, `expiry`, `to` | human-signed CSV recovery (not an MCP tool) |
@@ -22,7 +24,7 @@ This is the wallet hook XBT-060 / the B1 SDK should use (`fund(address, sats)` �
 | `forward_status` | — | AGP-013 forward rail: policy limits, 24 h forward spend, pending and delivered lots (no transfer hex). MCP tool. |
 | `forward_recover` | `txid` | rebuild a forward transfer from a market's channel close (adaptor extraction), or void the purchase. MCP tool. |
 | `forward_pending` / `forward_transfers` | — | b5 AGP-008 names: pending purchases / delivered transfers with hex |
-| `rotate_hot_key` | — | AGP-013. New hot key; the old key's coins sweep into it (one 0x21 tx); the old key stays sealed as retired. Not an MCP tool |
+| `rotate_hot_key` | `expiry`, `signature` | AGP-013. New hot key; the old key's coins sweep into it (one 0x21 tx); the old key stays sealed as retired. AGP-063: human-signed (ed25519 over `rotate_message(hot_address, expiry)`, domain `xbt-agentwallet-hot-rotate-v1`, the Rust signer's); `deny/human_key`, `deny/human_sig` or `deny/expired` otherwise. Not an MCP tool |
 | `sweep_hot` | `to`, `amount_sats`, `expiry`, `signature` | AGP-013. Human-signed (ed25519 over `sweep_message(hot_address, to, amount, expiry)`, `agentwallet-approve --sweep`) sweep out of the hot key, for the balance cap. Not an MCP tool |
 | `signatures` | `limit?` | AGP-013. Tail of the signature audit log + `chain_ok`. AGP-016: `chain_ok` is checked against the witness's latest anchor; `chain` has the details, `anchor` the anchoring status |
 | `anchor_now` | `reason?` | AGP-016. Anchor the log head with the witness now (the signer also does it at start, every `anchor_interval_s` in the watcher, and after every close, refund, sweep, rotation and treasury recovery). Not an MCP tool |
@@ -35,8 +37,8 @@ MCP tools are exactly: `balance`, `quote_payment`, `pay`, `history`, `channels`,
 
 ## AGP-013 custody
 
-- **Hot key encrypted at rest.** `hot.json` and `channel_keys.json` hold AES-256-GCM ciphertext only. The wrapping key comes from the signer's environment: `B2_HOT_KEYFILE` (32 bytes, created 0600 if missing, refused inside the run dir) or `B2_HOT_PASSPHRASE` (scrypt N=2^15; removed from `os.environ` once read). Without either the signer does not start (`B2_HOT_ALLOW_PLAINTEXT=1` for old demos only). A plaintext file from an older run is re-sealed on first start.
-- **Rotation.** `rotate_hot_key`; later coins to a retired address (a close's change) are swept by the watcher.
+- **Hot key encrypted at rest.** `hot.json` and `channel_keys.json` hold AES-256-GCM ciphertext only. The wrapping key comes from the signer's environment: `B2_HOT_KEYFILE` (32 bytes, created 0600 if missing, refused inside the run dir) or `B2_HOT_PASSPHRASE` (scrypt N=2^17 since AGP-063, written as `log_n` in each blob; a blob without `log_n` is 2^15; only 15..18 are read; removed from `os.environ` once read). AGP-063: an existing keyfile (after symlinks) must be a regular file with no group or other bits. Without either the signer does not start (`B2_HOT_ALLOW_PLAINTEXT=1` for old demos only). A plaintext file from an older run is re-sealed on first start.
+- **Rotation.** `rotate_hot_key` (human-signed since AGP-063); later coins to a retired address (a close's change) are swept by the watcher.
 - **Balance cap.** Policy `hot_balance_cap_sats` (0 = off). Above it, opening a channel returns `deny/hot_balance_cap` with `action: human_sweep`.
 - **Signature audit log.** `.run/signatures.jsonl`: one line per signature (`kind` funding / channel_state / channel_state_a3 / conditional_state / adaptor_presig / close_auth / refund / rotation_sweep / retired_sweep / human_sweep / treasury_recovery; `chan`, `dest`, amount, `sig_sha256`, signer `method`, policy `rule`), hash-chained (`prev`), O_APPEND + fsync. `sigaudit.verify_chain(path)`.
 - **AGP-055: the lock path writes only what changed.** One process owns a wallet directory. Per routed lock (pre-sign + resolve) the signer writes `channels.json` twice (temp file, fsync, rename, fsync of the directory: the lock is durable before its pre-signature leaves) and appends one line each to `.run/signatures.jsonl`, `.run/routing.json` and `.run/ledger.payments.jsonl`, and two to `.run/audit.jsonl`. `channel_keys.json` is rewritten only when a key is added or dropped.

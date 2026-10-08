@@ -96,6 +96,8 @@ class Rig:
         mod = session_mod or sys.modules["agentwallet.xbt402"]
         self.s = mod.Xbt402Session(self.book, Hot(), rpc=None, height=lambda: 1000)
         self.s.network = lambda: self.prov.network
+        if hasattr(self.s, "set_spend_book"):
+            self.s.set_spend_book(lambda *_args: None)  # this fixture is not the signer; the signer books
         self.strip_cipher = self.bad_cipher = self.drop = self.swap = False
 
     def http(self, method, url, body=b"", headers=None):

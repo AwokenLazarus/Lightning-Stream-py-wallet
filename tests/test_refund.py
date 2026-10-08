@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agentwallet.signer import Signer
 
-from _agp013 import FakeRpc, fund_channel, keyfile_env, write_policy
+from _agp013 import HUMAN_PUB, FakeRpc, fund_channel, keyfile_env, rotate_hot_key, write_policy
 
 from xbt402 import ecc
 from xbt402.tx import SIGHASH_ALL_UNIFIED, Tx
@@ -22,7 +22,7 @@ class Refund(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         keyfile_env()
-        write_policy(self.tmp, refund_margin_blocks=6)
+        write_policy(self.tmp, refund_margin_blocks=6, human_pubkey=HUMAN_PUB.hex())
         self.rpc = FakeRpc(height=1000)
         self.s = Signer(self.tmp, rpc=self.rpc)
         # the provider's change / refund output is the hot key, as in open_from_offer
@@ -151,7 +151,7 @@ class Refund(unittest.TestCase):
         self.assertEqual(self.refund()["rule"], "refund")
 
     def test_refund_after_rotation_pays_the_new_hot_key(self):
-        self.s.handle({"method": "rotate_hot_key"})
+        self.assertTrue(rotate_hot_key(self.s).get("new_address"))
         self.rpc.height = 1100
         self.refund()
         self.assertEqual(Tx.parse(bytes.fromhex(self.rpc.sent[-1])).outputs[0].script_pubkey, self.s.hot.spk)

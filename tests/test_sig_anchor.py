@@ -16,7 +16,7 @@ from agentwallet import sigaudit
 from agentwallet.anchor import AnchorClient, AnchorError, AnchorStore, AnchorWitness, main as anchor_main
 from agentwallet.signer import Signer
 
-from _agp013 import FakeRpc, fund_channel, keyfile_env, write_policy
+from _agp013 import HUMAN_PUB, FakeRpc, fund_channel, keyfile_env, rotate_hot_key, write_policy
 
 
 def rewrite_whole_log(path: Path, n: int) -> None:
@@ -163,10 +163,11 @@ class SignerAnchoring(unittest.TestCase):
         self.assertEqual(AnchorClient(Path(os.environ["B2_ANCHOR_SOCK"])).latest()["n"], 4)
 
     def test_sweep_and_rotation_anchor_and_periodic_tick(self):
-        write_policy(self.tmp, anchor_interval_s=1)
+        write_policy(self.tmp, anchor_interval_s=1, human_pubkey=HUMAN_PUB.hex())
         s = Signer(self.tmp, rpc=self.rpc)
         s.hot.notice_utxo("aa" * 32, 0, 50_000)
-        s.handle({"method": "rotate_hot_key"})
+        self.assertEqual(s.handle({"method": "rotate_hot_key"})["rule"], "human_sig")
+        rotate_hot_key(s)
         self.assertEqual(s.anchor.status()["anchored_n"], 1)
         s.hot.notice_utxo("bb" * 32, 0, 30_000, s.hot._retired[0].spk.hex())
         s.anchor.last_at = 0

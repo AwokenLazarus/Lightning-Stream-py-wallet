@@ -37,6 +37,7 @@ from xbt402.x402_channel import (  # noqa: E402
     b64json,
     facilitator_request,
     network_id,
+    receipt_message,
     receipt_of,
     request_digest,
     safe_code,
@@ -123,6 +124,17 @@ class Xbt402Session:
         self.close_fee_max = int(close_fee_max or 0)
         self.refund_margin = int(refund_margin)
         self._net = None
+        self._spend_book = None
+        self._spend_check = None
+
+    def set_spend_book(self, book) -> None:
+        """AGP-063: commit a signed increase before the signature is sent. `book(dest, delta, chan, cum)`."""
+        self._spend_book = book
+
+    def set_spend_check(self, check) -> None:
+        """AGP-063 W1: the policy's verdict on a signed increase above max_sats (a channel's dust floor).
+        `check(dest, max_sats, delta)` returns a deny dict, which stops the call before anything is signed."""
+        self._spend_check = check
 
     def network(self) -> str:
         if self.chain != "regtest":
@@ -155,7 +167,12 @@ class Xbt402Session:
         # AGP-017: comparing the cap alone funded 10,600 for a 10,000-only offer, which the provider refuses.
         min_cap = int(extra.get("minCapacity") or 0)
         max_cap = int(extra.get("maxCapacity") or (cap_sats + payer_fee))
-        cap = max(cap_sats, min_cap - payer_fee)
+        # AGP-063 W2: the seller's minCapacity must not raise the owner's per-channel cap.
+        owner_funded = cap_sats + payer_fee
+        if min_cap > owner_funded:
+            raise ChannelError("min_capacity",
+                               f"offer minCapacity {min_cap} exceeds this wallet's per-channel cap {owner_funded}")
+        cap = cap_sats
         if cap + payer_fee > max_cap:
             raise RuntimeError(f"channel capacity {cap + payer_fee} above provider max {max_cap}")
         min_exp = int(extra.get("minExpiryBlocks") or 1)
@@ -287,6 +304,61 @@ class Xbt402Session:
         h = {k.upper(): v for k, v in hdrs.items()}
         return st, h, out, unb64json(h["PAYMENT-RESPONSE"]) if "PAYMENT-RESPONSE" in h else None
 
+    @staticmethod
+    def _booked_through(rec) -> int:
+        """Sats of this channel already in the policy ledger. -1 means a pre-AGP-063 record."""
+        if rec is None:
+            return 0
+        if rec.ledger_booked_sats < 0:
+            return rec.used_sats
+        return rec.ledger_booked_sats
+
+    def _book_unbooked(self, dest: str) -> int:
+        """Commit any signed amount the ledger does not yet hold. Idempotent on xbt402:{chan}:{cum}."""
+        rec = self.book.get(dest)
+        if rec is None:
+            return 0
+        delta = rec.used_sats - self._booked_through(rec)
+        if delta <= 0:
+            return 0
+        if self._spend_book is None:
+            raise ChannelError("xbt402", "signed increase has no ledger booking")
+        self._spend_book(dest, delta, rec.chan, rec.used_sats)
+        self.book.mark_ledger_booked(dest, rec.used_sats)
+        return delta
+
+    @staticmethod
+    def check_seller_receipt(rec, resp, method: str, url: str, body: bytes, quote: int) -> int:
+        """The seller's receipt: signature and request binding, and a charged that is not negative
+        and not above the quote. The number itself is never what the wallet books."""
+        r = receipt_of(resp)
+        if str(r.get("req")) != request_digest(method, request_target(url), body or b""):
+            raise ChannelError("bad_receipt", "receipt is for another request")
+        if str(r.get("chan")) != rec.chan:
+            raise ChannelError("bad_receipt", "receipt is for another channel")
+        try:
+            cum = int(r["cum"])
+        except (KeyError, TypeError, ValueError):
+            raise ChannelError("bad_receipt", "receipt cum is not an integer")
+        if cum < 0 or cum > rec.used_sats:
+            raise ChannelError("bad_receipt", "receipt cum is above the amount this wallet signed")
+        try:
+            sig = bytes.fromhex(r.get("sig") or "")
+            payee = bytes.fromhex(rec.payee_pub)
+        except (TypeError, ValueError):
+            raise ChannelError("bad_receipt", "receipt signature is not hex")
+        if not ecc.verify(payee, receipt_message(r), sig):
+            raise ChannelError("bad_receipt", "receipt not signed by the channel payee key")
+        try:
+            charged = int(r["charged"])
+        except (KeyError, TypeError, ValueError):
+            raise ChannelError("bad_receipt", "charged is not an integer")
+        if charged < 0:
+            raise ChannelError("bad_receipt", "negative charged")
+        if charged > quote:
+            raise ChannelError("bad_receipt", f"charged {charged} exceeds the quoted price {quote}")
+        return charged
+
     def pay_once(self, url: str, method: str, body: bytes, max_sats: int, expiry_blocks: int, cap_sats: int) -> dict:
         """One call. The provider's body and receipt come back only under UNTRUSTED_KEY (L7)."""
         res = self._pay_once(url, method, body, max_sats, expiry_blocks, cap_sats)
@@ -347,17 +419,30 @@ class Xbt402Session:
             _log("open", url=url, chan=rec.chan, txid=rec.funding_txid, capacity=rec.funding_sats,
                  cap=rec.cap_sats, ms=round(1000 * (time.time() - t1), 1))
         rec = self.book.get(dest)
+        ledger_before = self._booked_through(rec)
         if rec is not None and rec.last_sig and rec.used_sats > rec.acked_sats:
             rec, sig = self.book.resend_state(dest)   # same (cum, sig); do not sign a higher one (M3)
         else:
+            nxt = self.book.next_cum(dest, price)
+            if nxt - ledger_before > max_sats and self._spend_check is not None:
+                refused = self._spend_check(dest, max_sats, nxt - ledger_before)
+                if refused:
+                    return refused
             rec, sig = self.book.increment(dest, price)
+        # AGP-063 W1: book the signed increase before the signature leaves. Never the seller's charged.
+        booked = self._book_unbooked(dest)
         payload = {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats)}
         if sig:
             payload["sig"] = sig.hex() if isinstance(sig, bytes) else sig
         st2, _, out2, receipt = self._paid(method, url, body, acc, payload)
         if receipt:
             self.book.ack_state(dest, rec.used_sats)
-        charged = charged_of(receipt, price) if st2 < 400 else 0
+        if st2 < 400:
+            if not receipt:
+                raise ChannelError("bad_receipt", "paid call returned no receipt")
+            charged = self.check_seller_receipt(self.book.get(dest), receipt, method, url, body or b"", price)
+        else:
+            charged = 0
         _log("call", url=url, status=st2, ms=round(1000 * (time.time() - t0), 1), chargedSat=charged,
              chan=rec.chan, cum=rec.used_sats, opened=bool(opened))
         preview = out2.decode("utf-8", "replace")[:BODY_CAP]
@@ -365,6 +450,7 @@ class Xbt402Session:
         res = {
             "status": st2,
             "charged_sats": charged,
+            "booked_sats": booked,
             "receipt": receipt,
             "chan": rec.chan,
             "cum": rec.used_sats,
@@ -380,6 +466,8 @@ class Xbt402Session:
             res["receipt_scope"] = "manifest call only; chunk payments are in stream.paid_sats"
             res.update(self.stream(dest, acc, doc, max_sats - charged))
             res["charged_sats"] = charged + res.pop("stream_charged")
+            after = self.book.get(dest)
+            res["booked_sats"] = self._booked_through(after) - ledger_before
         return res
 
     def _route_offer(self, url, method, body, max_sats, expiry_blocks, cap_sats, acc):
@@ -432,6 +520,7 @@ class Xbt402Session:
                 }
             parts.append(data)
             rec, sig = self.book.increment(dest, m["price"])
+            self._book_unbooked(dest)
             self._verify_post(dest, acc, {"chan": rec.chan, "cum": str(rec.used_sats), "sig": sig.hex()})
             spent += m["price"]
             _log("chunk", i=i, ms=round(1000 * (time.time() - t), 1), chargedSat=m["price"], chan=rec.chan, cum=rec.used_sats)
@@ -545,6 +634,7 @@ class Xbt402Session:
             self.book._records[dest].pending_cond = {}
             self.book._persist()
         rec, sig2 = self.book.increment(dest, m["price"])
+        self._book_unbooked(dest)
         self._verify_post(dest, acc, {"chan": rec.chan, "cum": str(rec.used_sats), "sig": sig2.hex()})
         ms = round(1000 * (time.time() - t), 1)
         _log("chunk", i=m["n"] - 1, ms=ms, chargedSat=m["price"], chan=rec.chan, cum=rec.used_sats, hashlock=cond["hash"])

@@ -56,8 +56,17 @@ class Engine:
     def evaluate(self, pay, human=False):
         return Decision(Verdict.ALLOW, "ok", "test")
 
+    def evaluate_booking(self, pay, booked_sats, human=False):
+        return self.evaluate(pay, human)
+
     def commit(self, pay, txid=""):
         self.commits.append((pay.amount_sats, txid))
+
+    def commit_once(self, pay, txid=""):
+        if any(t == txid for _, t in self.commits):
+            return False
+        self.commit(pay, txid)
+        return True
 
 
 class UntrustedBodyTests(unittest.TestCase):
@@ -94,6 +103,7 @@ class UntrustedBodyTests(unittest.TestCase):
         self.signer.engine = Engine()
         self.signer.config = SimpleNamespace(channel_expiry_blocks=2_000, per_counterparty_cap_sats=50_000)
         self.signer._xbt402 = Xbt402Session(self.book, hot=None, rpc=Rpc(), height=lambda: 1_000)
+        self.signer._xbt402.set_spend_book(self.signer._book_signed_delta)
 
     def test_body_that_looks_like_key_material_was_the_hazard(self):
         with self.assertRaises(KeyMaterialError):
@@ -107,7 +117,7 @@ class UntrustedBodyTests(unittest.TestCase):
         self.assertEqual(self.calls, ["/v1/x"])                    # served once
         st = self.prov.ledger.channels[self.chan]
         self.assertEqual(st.spent_msat, 150_000)                   # charged once
-        self.assertEqual(self.signer.engine.commits, [(150, self.chan)])
+        self.assertEqual(self.signer.engine.commits, [(546, f"xbt402:{self.chan}:546")], "AGP-063 W1: the signed floor, not charged")
         u = res[UNTRUSTED_KEY]
         self.assertEqual(u["trust"], "untrusted")
         self.assertIn("untrusted", u["note"])

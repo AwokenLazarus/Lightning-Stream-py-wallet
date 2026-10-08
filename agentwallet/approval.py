@@ -25,6 +25,8 @@ from cryptography.hazmat.primitives.serialization import (
 DOMAIN = b"xbt-agentwallet-approve-v1"
 RECOVER_DOMAIN = b"xbt-agentwallet-recover-v1"
 SWEEP_DOMAIN = b"xbt-agentwallet-hot-sweep-v1"
+# AGP-063 W3 (the Rust signer's AGP-039 message): rotate the hot key whose address is the second line.
+ROTATE_DOMAIN = b"xbt-agentwallet-hot-rotate-v1"
 
 
 def canonical_message(token: str, dest: str, amount_sats: int, expiry: int) -> bytes:
@@ -60,6 +62,11 @@ def sweep_message(hot_address: str, dest: str, amount_sats: int, expiry: int) ->
             str(int(expiry)).encode("ascii"),
         ]
     )
+
+
+def rotate_message(hot_address: str, expiry: int) -> bytes:
+    """AGP-063 W3: a human rotates the hot key whose address is `hot_address` (its coins sweep to the new key)."""
+    return b"\n".join([ROTATE_DOMAIN, (hot_address or "").encode("utf-8"), str(int(expiry)).encode("ascii")])
 
 
 def generate_keypair() -> tuple[bytes, bytes]:

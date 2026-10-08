@@ -46,8 +46,17 @@ class Engine:
         from agentwallet.policy import Decision, Verdict
         return Decision(Verdict.ALLOW, "ok", "test")
 
+    def evaluate_booking(self, pay, booked_sats, human=False):
+        return self.evaluate(pay, human)
+
     def commit(self, pay, txid=""):
         self.commits.append((pay.amount_sats, txid))
+
+    def commit_once(self, pay, txid=""):
+        if any(t == txid for _, t in self.commits):
+            return False
+        self.commit(pay, txid)
+        return True
 
 
 class UnackedStateBook(unittest.TestCase):
@@ -124,6 +133,7 @@ class UnackedStatePay(unittest.TestCase):
         self.signer.engine = Engine()
         self.signer.config = SimpleNamespace(channel_expiry_blocks=2_000, per_counterparty_cap_sats=50_000)
         self.signer._xbt402 = Xbt402Session(self.book, hot=None, rpc=Rpc(), height=lambda: 1_000)
+        self.signer._xbt402.set_spend_book(self.signer._book_signed_delta)
 
     def _pay(self):
         return self.signer._xbt402_pay_locked(
@@ -137,14 +147,16 @@ class UnackedStatePay(unittest.TestCase):
         rec = self.book.get(DEST)
         self.assertGreater(rec.used_sats, rec.acked_sats)
         self.assertTrue(rec.last_sig)
-        self.assertEqual(self.signer.engine.commits, [])
+        # The signature already left, so the signed increase is in the ledger even though the
+        # seller refused it. A resend of the same cum does not add a second row.
+        self.assertEqual(self.signer.engine.commits, [(rec.used_sats, f"xbt402:{rec.chan}:{rec.used_sats}")])
         self.assertEqual(len(self.payloads), 1)
         lost = self.payloads[0]["payload"]
 
         second = self._pay()
         self.assertEqual((second["verdict"], second["status"], second["charged_sats"]), ("allow", 200, 150))
         self.assertEqual(self.calls, ["/v1/x"])
-        self.assertEqual(self.signer.engine.commits, [(150, self.chan)])
+        self.assertEqual(self.signer.engine.commits, [(rec.used_sats, f"xbt402:{rec.chan}:{rec.used_sats}")])
         self.assertEqual(self.prov.ledger.channels[self.chan].spent_msat, 150_000)
         self.assertEqual(len(self.payloads), 2)
         resent = self.payloads[1]["payload"]
@@ -161,14 +173,15 @@ class UnackedStatePay(unittest.TestCase):
         first = self._pay()
         self.assertEqual(first.get("verdict"), "deny")
         self.assertEqual(self.calls, [])
-        self.assertEqual(self.signer.engine.commits, [])
-        lost_cum = self.book.get(DEST).used_sats
-        lost_sig = self.book.get(DEST).last_sig
+        lost = self.book.get(DEST)
+        self.assertEqual(self.signer.engine.commits, [(lost.used_sats, f"xbt402:{lost.chan}:{lost.used_sats}")])
+        lost_cum = lost.used_sats
+        lost_sig = lost.last_sig
 
         second = self._pay()
         self.assertEqual(second["charged_sats"], 150)
         self.assertEqual(self.calls, ["/v1/x"])
-        self.assertEqual(self.signer.engine.commits, [(150, self.chan)])
+        self.assertEqual(self.signer.engine.commits, [(lost_cum, f"xbt402:{lost.chan}:{lost_cum}")])
         resent = self.payloads[-1]["payload"]
         self.assertEqual(int(resent["cum"]), lost_cum)
         self.assertEqual(resent["sig"], lost_sig)
@@ -182,7 +195,9 @@ class UnackedStatePay(unittest.TestCase):
         self.assertEqual(rec.spent(), 300)
         self.assertGreaterEqual(rec.used_sats, first_cum)
         self.assertEqual(self.calls, ["/v1/x", "/v1/x"])
-        self.assertEqual(self.signer.engine.commits, [(150, self.chan), (150, self.chan)])
+        # The first state signs the dust floor. Both 150-sat calls fit under it, so the ledger
+        # holds that one signed amount, not 150 twice.
+        self.assertEqual(self.signer.engine.commits, [(first_cum, f"xbt402:{rec.chan}:{first_cum}")])
         self.assertEqual(self.prov.ledger.channels[self.chan].spent_msat, 300_000)
 
 

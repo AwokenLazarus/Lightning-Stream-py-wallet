@@ -7,6 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from agentwallet.approval import b2x, generate_keypair, rotate_message, sign
 from agentwallet.b1path import ensure_b1
 
 ensure_b1()
@@ -119,3 +120,14 @@ def fund_channel(book, rpc: FakeRpc, dest: str, *, secret: int = 0xA11CE, expiry
     book.add_funded(dest, secret=secret, params=p, origin=origin or dest, cap_sats=capacity - close_fee,
                     open_height=rpc.height)
     return p
+
+
+HUMAN_PRIV, HUMAN_PUB = generate_keypair()
+
+
+def rotate_hot_key(s) -> dict:
+    """AGP-063 W3: the hot-key rotation, signed by the human key (`human_pubkey=b2x(HUMAN_PUB)`)."""
+    exp = int(s.engine.clock()) + 600
+    sig = sign(HUMAN_PRIV, rotate_message(s.hot.address, exp))
+    return s.handle({"method": "rotate_hot_key", "params": {"expiry": exp, "signature": b2x(sig)}})
+

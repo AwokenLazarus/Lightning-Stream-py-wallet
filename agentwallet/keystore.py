@@ -5,7 +5,8 @@ AES-256-GCM. The 32-byte wrapping key comes from the signer's environment, never
 
   B2_HOT_KEYFILE=/path/to/key     32 random bytes (raw or hex). Created 0600 if missing. It must live
                                   outside the signer's run directory, next to nothing it protects.
-  B2_HOT_PASSPHRASE=...           scrypt(N=2^15, r=8, p=1) with a per-blob salt. The signer removes
+  B2_HOT_PASSPHRASE=...           scrypt(N=2^17, r=8, p=1) with a per-blob salt; the blob records its
+                                  `log_n` (AGP-063 K1), one without it is 2^15. The signer removes
                                   it from os.environ once read.
 
 With neither set the signer refuses to start, unless B2_HOT_ALLOW_PLAINTEXT=1 (unit tests, old
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import stat as _stat
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -24,7 +26,11 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 ENV_KEYFILE = "B2_HOT_KEYFILE"
 ENV_PASSPHRASE = "B2_HOT_PASSPHRASE"
 ENV_ALLOW_PLAINTEXT = "B2_HOT_ALLOW_PLAINTEXT"
-SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**15, 8, 1
+SCRYPT_R, SCRYPT_P = 8, 1
+# AGP-063 K1: N=2^17 (128 MiB, ~0.2 s here, ~1-2 s on a Pi-class armv7 core); blobs without `log_n`
+# were sealed at 2^15; anything outside 15..18 is refused before any work is done.
+SCRYPT_LOG_N, SCRYPT_LOG_N_LEGACY, SCRYPT_LOG_N_MAX = 17, 15, 18
+SCRYPT_N = 2**SCRYPT_LOG_N
 
 
 class KeyStoreError(RuntimeError):
@@ -41,7 +47,7 @@ class KeyStore:
             raise ValueError("wrapping key must be 32 bytes")
         self._key = key
         self._pass = passphrase
-        self._kdf_cache: dict[bytes, bytes] = {}
+        self._kdf_cache: dict[tuple[int, bytes], bytes] = {}
         self.kind = "keyfile" if key is not None else "passphrase"
 
     @classmethod
@@ -61,13 +67,13 @@ class KeyStore:
     def plaintext_allowed() -> bool:
         return os.environ.get(ENV_ALLOW_PLAINTEXT, "") == "1"
 
-    def _wrap_key(self, salt: bytes) -> bytes:
+    def _wrap_key(self, salt: bytes, log_n: int = SCRYPT_LOG_N) -> bytes:
         if self._key is not None:
             return self._key
-        k = self._kdf_cache.get(salt)
+        k = self._kdf_cache.get((log_n, salt))
         if k is None:
-            k = Scrypt(salt=salt, length=32, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P).derive(self._pass)
-            self._kdf_cache[salt] = k
+            k = Scrypt(salt=salt, length=32, n=2**log_n, r=SCRYPT_R, p=SCRYPT_P).derive(self._pass)
+            self._kdf_cache[(log_n, salt)] = k
         return k
 
     def seal(self, plaintext: bytes, aad: str, *, salt: bytes | None = None) -> dict:
@@ -76,8 +82,11 @@ class KeyStore:
         salt = salt or secrets.token_bytes(16)
         nonce = secrets.token_bytes(12)
         ct = AESGCM(self._wrap_key(salt)).encrypt(nonce, plaintext, aad.encode())
-        return {"v": 1, "alg": "aes-256-gcm", "kdf": "scrypt" if self._pass is not None else "keyfile",
+        blob = {"v": 1, "alg": "aes-256-gcm", "kdf": "scrypt" if self._pass is not None else "keyfile",
                 "salt": salt.hex(), "nonce": nonce.hex(), "ct": ct.hex(), "aad": aad}
+        if self._pass is not None:
+            blob["log_n"] = SCRYPT_LOG_N
+        return blob
 
     def open(self, blob: dict, aad: str) -> bytes:
         if blob.get("v") != 1 or blob.get("alg") != "aes-256-gcm":
@@ -87,8 +96,11 @@ class KeyStore:
         kdf = "scrypt" if self._pass is not None else "keyfile"
         if blob.get("kdf") != kdf:
             raise KeyStoreError(f"key sealed with {blob.get('kdf')}, signer has a {kdf}")
+        log_n = blob.get("log_n", SCRYPT_LOG_N_LEGACY)
+        if type(log_n) is not int or not SCRYPT_LOG_N_LEGACY <= log_n <= SCRYPT_LOG_N_MAX:
+            raise KeyStoreError(f"sealed blob log_n must be {SCRYPT_LOG_N_LEGACY}..={SCRYPT_LOG_N_MAX}")
         try:
-            return AESGCM(self._wrap_key(bytes.fromhex(blob["salt"]))).decrypt(
+            return AESGCM(self._wrap_key(bytes.fromhex(blob["salt"]), log_n)).decrypt(
                 bytes.fromhex(blob["nonce"]), bytes.fromhex(blob["ct"]), aad.encode())
         except Exception as e:  # InvalidTag: wrong key or tampered file
             raise KeyStoreError("cannot open sealed key: wrong wrapping key or tampered file") from e
@@ -105,6 +117,12 @@ def load_or_create_keyfile(path: Path, run_dir: Path | None = None) -> bytes:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(secrets.token_bytes(32))
+    # AGP-063 K1: the resolved keyfile is a regular file with no bits for group or others
+    st = os.stat(path)
+    if not _stat.S_ISREG(st.st_mode):
+        raise KeyStoreError(f"{ENV_KEYFILE} {path} is not a regular file")
+    if st.st_mode & 0o077:
+        raise KeyStoreError(f"{ENV_KEYFILE} {path} is mode {st.st_mode & 0o777:o}: chmod 600 it")
     raw = path.read_bytes()
     if len(raw) == 32:
         return raw

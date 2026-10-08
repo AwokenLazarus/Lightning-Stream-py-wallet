@@ -241,6 +241,12 @@ class PolicyStore:
 
     def _apply(self, row: dict, n: int) -> None:
         if "amend" not in row:
+            try:
+                amount = int(row["amount_sats"])
+            except (KeyError, TypeError, ValueError):
+                raise LogError(f"{self.log_path}: line {n} is not a payment")
+            if amount < 0:
+                raise LogError(f"{self.log_path}: line {n} is a negative payment")
             self._entries.append(LedgerEntry(**row))
             return
         i = next((i for i in range(len(self._entries) - 1, -1, -1) if self._entries[i].txid == row["amend"]), None)
@@ -249,7 +255,10 @@ class PolicyStore:
         if row.get("amount_sats") is None:
             del self._entries[i]
         else:
-            self._entries[i].amount_sats = int(row["amount_sats"])
+            amount = int(row["amount_sats"])
+            if amount < 0:
+                raise LogError(f"{self.log_path}: line {n} amends {row['amend']!r} to a negative amount")
+            self._entries[i].amount_sats = amount
 
     def _migrate(self) -> None:
         """Move the payments of an old-format ledger.json to the log. Safe to run again after a crash
@@ -274,15 +283,34 @@ class PolicyStore:
         return json.loads(self.path.read_text(encoding="utf-8"))
 
     def _write(self, data: dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.path)
+        """AGP-063 K1: the approvals document like every other state file (fsync, rename, dir fsync, 0600)."""
+        from .keystore import write_private
+
+        write_private(self.path, json.dumps(data, indent=2, sort_keys=True))
 
     def payments(self) -> list[LedgerEntry]:
         with self._lock:
             return list(self._entries)
 
+    def amend(self, txid: str, amount_sats: int | None) -> bool:
+        """Change (or, with None, drop) the latest row for `txid`: one {"amend"} log line, the Rust
+        signer's format. False when the ledger holds no such row."""
+        if amount_sats is not None and int(amount_sats) < 0:
+            raise LogError("negative ledger entry refused")
+        with self._lock:
+            i = next((i for i in range(len(self._entries) - 1, -1, -1) if self._entries[i].txid == txid), None)
+            if i is None:
+                return False
+            self._log.append({"amend": txid, "amount_sats": None if amount_sats is None else int(amount_sats)})
+            if amount_sats is None:
+                del self._entries[i]
+            else:
+                self._entries[i].amount_sats = int(amount_sats)
+            return True
+
     def commit(self, entry: LedgerEntry) -> None:
+        if entry.amount_sats < 0:
+            raise LogError("negative ledger entry refused")
         with self._lock:
             self._log.append(asdict(entry))          # durable before it counts
             self._entries.append(entry)
@@ -339,6 +367,8 @@ class PolicyEngine:
                 continue
             if dest is not None and p.dest != dest:
                 continue
+            if p.amount_sats < 0:
+                raise LogError("negative ledger entry")
             total += p.amount_sats
         return total
 
@@ -346,6 +376,12 @@ class PolicyEngine:
         return sum(1 for p in payments if now - p.ts <= window_s)
 
     def evaluate(self, payment: Payment, *, human: bool = False) -> Decision:
+        return self.evaluate_booking(payment, payment.amount_sats, human=human)
+
+    def evaluate_booking(self, payment: Payment, booked_sats: int, *, human: bool = False) -> Decision:
+        """AGP-063 W1: `payment.amount_sats` is what the caller asked for (per-tx and human threshold,
+        approvals); `booked_sats` is the most the ledger gains from it (the sums). They differ on a
+        channel, where the signed increase is known only from its state."""
         now = self.clock()
         p = payment.normalized(now)
         cfg = self.config
@@ -404,7 +440,7 @@ class PolicyEngine:
                 f"{p.amount_sats} sats exceeds max_per_tx {cfg.max_per_tx_sats}",
             )
 
-        split_sum = self._spent(ledger, cfg.split_window_s, now, dest=p.dest) + p.amount_sats
+        split_sum = self._spent(ledger, cfg.split_window_s, now, dest=p.dest) + booked_sats
         if split_sum > cfg.max_per_tx_sats:
             return decide(
                 Verdict.DENY,
@@ -418,23 +454,23 @@ class PolicyEngine:
                 f"split window sum {split_sum} evades human_threshold {cfg.human_threshold_sats}",
             )
 
-        if daily + p.amount_sats > cfg.daily_budget_sats:
+        if daily + booked_sats > cfg.daily_budget_sats:
             return decide(
                 Verdict.DENY,
                 "daily_budget",
-                f"daily spend {daily + p.amount_sats} exceeds budget {cfg.daily_budget_sats}",
+                f"daily spend {daily + booked_sats} exceeds budget {cfg.daily_budget_sats}",
             )
-        if weekly + p.amount_sats > cfg.weekly_budget_sats:
+        if weekly + booked_sats > cfg.weekly_budget_sats:
             return decide(
                 Verdict.DENY,
                 "weekly_budget",
-                f"weekly spend {weekly + p.amount_sats} exceeds budget {cfg.weekly_budget_sats}",
+                f"weekly spend {weekly + booked_sats} exceeds budget {cfg.weekly_budget_sats}",
             )
-        if cpty + p.amount_sats > cfg.per_counterparty_cap_sats:
+        if cpty + booked_sats > cfg.per_counterparty_cap_sats:
             return decide(
                 Verdict.DENY,
                 "per_counterparty",
-                f"counterparty spend {cpty + p.amount_sats} exceeds cap {cfg.per_counterparty_cap_sats}",
+                f"counterparty spend {cpty + booked_sats} exceeds cap {cfg.per_counterparty_cap_sats}",
             )
         if self._count(ledger, cfg.velocity_window_s, now) >= cfg.velocity_max:
             return decide(
@@ -494,7 +530,17 @@ class PolicyEngine:
             ts=now,
         )
 
+    def commit_once(self, payment: Payment, txid: str = "") -> bool:
+        """Commit `txid` once. A repeat (the write-ahead ran, then the process restarted) does not
+        add a second row. False when this txid was already in the ledger."""
+        if txid and any(e.txid == txid for e in self.store.payments()):
+            return False
+        self.commit(payment, txid)
+        return True
+
     def commit(self, payment: Payment, txid: str = "") -> None:
+        if int(payment.amount_sats) < 0:
+            raise LogError("negative ledger entry refused")
         now = self.clock()
         p = payment.normalized(now)
         self.store.commit(

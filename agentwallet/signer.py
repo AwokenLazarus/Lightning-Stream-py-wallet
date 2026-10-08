@@ -35,7 +35,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from . import anchor as anchoring, chain as chainbackend, netparams, sigaudit
-from .approval import verify, verify_approval, x2b
+from .approval import rotate_message, verify, verify_approval, x2b
 from .channels import ChannelBook, ChannelCapError
 from .forward import ForwardPolicy, ForwardSession
 from .hot import HotCapError, HotWallet
@@ -169,6 +169,9 @@ class Signer:
                                       refund_margin=self.config.refund_margin_blocks,
                                       forward_path=run / "forward.json",
                                       policy=ForwardPolicy.from_dict(self.config.forward))
+        # AGP-063 W1: the signed increase is committed before the signature is sent.
+        self._xbt402.set_spend_book(self._book_signed_delta)
+        self._xbt402.set_spend_check(lambda dest, asked, delta: self._floor_check(dest, asked, delta, human=False))
         from .routing import RoutePolicy, RouteSigner
         self.routing = RouteSigner(self.channels, RoutePolicy.from_dict(self.config.routing),
                                    state_path=run / "routing.json", engine=self.engine)
@@ -275,27 +278,17 @@ class Signer:
             n = self.hot.scan_from_txid(params.get("txid") or "")
             return sanitize({**self.hot.status(), "noticed": n})
         if method == "fund":
-            # B1 / XBT-060 wallet hook: 0x21 funding from the signer hot key.
-            from xbt402.tx import address_to_spk
-
-            sats = int(params.get("sats") or params.get("amount_sats") or 0)
-            addr = params.get("address") or params.get("to") or ""
-            txid, vout = self.hot.fund(address_to_spk(addr, self.hrp), sats)
-            return sanitize({"txid": txid, "vout": vout, "sats": sats, "sighash": "0x21"})
+            # AGP-063 W3: the Rust signer funds only a channel for a key it issued, paying the seller's
+            # verified terms. B2 issues no client channel keys, so nothing on this socket is fundable.
+            if not params.get("origin") or not params.get("params"):
+                return _deny("fund_unbound", "fund needs the channel (origin, params) a key was issued for, never a bare address")
+            return _deny("bad_key", "this signer issued no channel key for that origin")
         if method == "open_channel":
             with self._spend_lock:
-                return sanitize(self._open_channel_locked(params))
+                return sanitize(self._open_channel_checked(params))
         if method == "sign_state":
-            dest = normalize_dest(params.get("dest") or params.get("to") or "")
-            cum = int(params.get("cum") or 0)
-            pay = Payment(dest=dest, amount_sats=max(0, cum - (self.channels.get(dest).used_sats if self.channels.get(dest) else 0)))
-            d = self.engine.evaluate(pay, human=False)
-            if d.verdict is not Verdict.ALLOW:
-                return sanitize(d.as_dict())
-            sigaudit.set_rule(f"policy:{d.rule}")
-            sig = self.channels.sign_state(dest, cum)
-            self.engine.commit(pay, txid=(self.channels.get(dest) or type("R", (), {"chan": ""})).chan)
-            return sanitize({"verdict": "allow", "chan": self.channels.get(dest).chan, "cum": cum, "sig": sig.hex() if sig else ""})
+            with self._spend_lock:
+                return sanitize(self._sign_state_locked(params))
         if method == "xbt402_pay":
             with self._spend_lock:
                 return sanitize(self._xbt402_pay_locked(params))
@@ -351,8 +344,8 @@ class Signer:
             with self._spend_lock:
                 res = self._xbt402.forward_recover(params.get("txid") or "", params.get("blockhash") or "")
                 if res.get("recovered"):     # the policy ledger learns the spend it could not see live
-                    self.engine.commit(Payment(dest=res["dest"], amount_sats=res["price"],
-                                               memo=f"forward {res['outpoint']} (recovered)"), txid=res["transfer_txid"])
+                    self._book_forward(res["dest"], res["chan"], int(res["cum"]), int(res["price"]),
+                                       f"forward {res['outpoint']} (recovered)")
                 return sanitize(res)
         if method == "forward_status":
             return sanitize(self._xbt402.status())
@@ -363,7 +356,10 @@ class Signer:
                 return sanitize({"delivered": json.loads(json.dumps(self._xbt402.fwd.data["delivered"]))})
         if method == "rotate_hot_key":
             with self._spend_lock:
-                sigaudit.set_rule("operator:rotate_hot_key")
+                denied = self._human_signed(rotate_message(self.hot.address, self._int(params.get("expiry"))), params)
+                if denied:
+                    return denied
+                sigaudit.set_rule("human:rotate_signature")
                 out = self.hot.rotate()
                 self.engine.audit.append({"type": "hot_rotation", "ts": self.engine.clock(),
                                           "old_address": out["old_address"], "new_address": out["new_address"],
@@ -645,7 +641,7 @@ class Signer:
         sigaudit.set_rule("human:approval_signature" if human else f"policy:{d.rule}")
         dest = pay.normalized(self.engine.clock()).dest
         if self._uses_channel(dest):
-            return self._channel_pay(pay, dest, d)
+            return self._channel_pay(pay, dest, d, human=human)
         if self.light:
             return _deny("light_backend", "on-chain pay spends the node wallet, and a light client has none: "
                                           "pay through a channel")
@@ -657,28 +653,143 @@ class Signer:
             pass
         return {**d.as_dict(), "txid": txid, "rail": "onchain"}
 
-    def _channel_pay(self, pay: Payment, dest: str, d) -> dict:
+    @staticmethod
+    def _int(v) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _human_signed(self, message: bytes, params: dict) -> dict | None:
+        """None when `params["signature"]` is the human key's over `message` and `params["expiry"]` has
+        not passed; else the deny (the Rust signer's rules and codes)."""
+        if not self.human_pubkey:
+            return _deny("human_key", "no human key is enrolled: run the setup first")
+        try:
+            sig = x2b(params.get("signature") or "")
+        except ValueError:
+            sig = b""
+        if not sig or not verify(self.human_pubkey, message, sig):
+            return _deny("human_sig", "missing or invalid human signature")
+        if self._int(params.get("expiry")) < self.engine.clock():
+            return _deny("expired", "the signature has expired")
+        return None
+
+    def _booked_increase(self, dest: str, cum: int, memo: str, sign):
+        """Raise `dest`'s signed amount to `cum`: the increase over what the ledger already holds for
+        the channel is evaluated and committed before `sign` runs (AGP-063 W1/K1); the row is taken
+        out again when `sign` raises. Returns (result, None) or (None, deny)."""
+        rec = self.channels.get(dest)
+        origin = (rec.origin or dest) if rec is not None else dest
+        booked = Xbt402Session._booked_through(rec)
+        txid = f"xbt402:{rec.chan if rec else ''}:{cum}"
+        if rec is not None and cum < rec.used_sats:
+            return None, _deny("amount", f"never sign a lower cumulative amount: have {rec.used_sats}, got {cum}")
+        increase = cum - booked
+        added = False
+        if increase > 0:
+            pay = Payment(dest=origin, amount_sats=increase, memo=memo)
+            d = self.engine.evaluate(pay, human=False)
+            if d.verdict is not Verdict.ALLOW:
+                return None, d.as_dict()
+            sigaudit.set_rule(f"policy:{d.rule}")
+            added = self.engine.commit_once(pay, txid)
+        else:
+            sigaudit.set_rule("policy:no_increase")
+        try:
+            out = sign()
+        except Exception:
+            if added:
+                self.engine.store.amend(txid, None)
+            raise
+        if increase > 0 and rec is not None:
+            self.channels.mark_ledger_booked(dest, cum)
+        return out, None
+
+    def _sign_state_locked(self, params: dict) -> dict:
+        key = params.get("dest") or params.get("to") or params.get("chan") or ""
+        dest = self.channels.find_dest(key) or normalize_dest(key)
+        cum = self._int(params.get("cum") or params.get("amount"))
+        sig, denied = self._booked_increase(dest, cum, "", lambda: self.channels.sign_state(dest, cum))
+        if denied:
+            return denied
+        rec = self.channels.get(dest)
+        return {"verdict": "allow", "chan": rec.chan if rec else "", "cum": cum, "sig": sig.hex() if sig else ""}
+
+    def _floor_check(self, dest: str, asked: int, delta: int, *, human: bool) -> dict | None:
+        """AGP-063 W1: a channel's dust floor signs more than the amount the policy approved, so the
+        budgets are checked again on the whole increase. A human-threshold verdict is a refusal here."""
+        d = self.engine.evaluate_booking(Payment(dest=dest, amount_sats=asked, memo="dust floor"), delta, human=human)
+        if d.verdict is Verdict.ALLOW:
+            return None
+        if d.approval_token:
+            self.engine.store.pop_approval(d.approval_token)
+        return _deny(d.rule, f"the channel's dust floor signs {delta} sat: {d.reason}")
+
+    def _channel_pay(self, pay: Payment, dest: str, d, *, human: bool = False) -> dict:
         rec = self.channels.get(dest)
         if rec is None or rec.state != "open":
             opened = self._open_channel_locked({"dest": dest})
             if opened.get("verdict") == "deny":
                 return opened
+        rec = self.channels.get(dest)
         try:
-            rec, _sig = self.channels.increment(dest, pay.amount_sats)
+            cum = self.channels.next_cum(dest, pay.amount_sats)
         except ChannelCapError as e:
             return _deny("channel_cap", str(e))
-        except ChannelError as e:
-            return _deny(e.code, str(e))
-        self.engine.commit(pay, txid=rec.chan)
+        except (ChannelError, ValueError) as e:
+            return _deny(getattr(e, "code", "bad_amount"), str(e))
+        # AGP-063 W1/K1: book what this call signs (the dust floor on a first state), before it signs
+        booked = Xbt402Session._booked_through(rec)
+        if cum - booked > pay.amount_sats:
+            refused = self._floor_check(pay.dest, pay.amount_sats, cum - booked, human=human)
+            if refused:
+                return refused
+        txid = f"xbt402:{rec.chan}:{cum}"
+        added = cum > booked and self.engine.commit_once(
+            Payment(dest=pay.dest, amount_sats=cum - booked, memo=pay.memo, ts=pay.ts), txid)
+        try:
+            rec, _sig = self.channels.increment(dest, pay.amount_sats)
+        except (ChannelCapError, ChannelError) as e:
+            if added:
+                self.engine.store.amend(txid, None)
+            return _deny("channel_cap" if isinstance(e, ChannelCapError) else e.code, str(e))
+        if cum > booked:
+            self.channels.mark_ledger_booked(dest, rec.used_sats)
         return {
             **d.as_dict(),
             "rail": "channel",
+            "booked_sats": max(0, cum - booked),
             "chan": rec.chan,
             "cum": rec.used_sats,
             "seq": rec.seq,
             "cap_sats": rec.cap_sats,
             "used_sats": rec.used_sats,
         }
+
+    def _max_expiry_blocks(self) -> int:
+        return max(self.config.channel_expiry_blocks, 4032)
+
+    def _open_channel_checked(self, params: dict) -> dict:
+        """AGP-063 W3: a caller on the agent socket opens a channel only to an allowlisted dest, to the
+        policy's payTo, within the owner's cap, expiry and close-fee bounds."""
+        dest = normalize_dest(params.get("dest") or params.get("to") or "")
+        if dest and dest not in self.engine.allowlist:
+            return _deny("allowlist", f"destination not on allowlist: {dest}")
+        given = str(params.get("pay_to") or "").strip().lower()
+        if given and given != (self.config.pay_to_for(dest) or "").strip().lower():
+            return _deny("pay_to", "payTo comes from the policy's counterparties, never from the caller")
+        cfg = self.config
+        cap = self._int(params.get("cap_sats"))
+        if cap < 0 or cap > cfg.per_counterparty_cap_sats:
+            return _deny("channel_cap", f"cap_sats {cap} is above per_counterparty_cap_sats {cfg.per_counterparty_cap_sats}")
+        blocks = self._int(params.get("expiry_blocks"))
+        if blocks and (blocks <= cfg.refund_margin_blocks or blocks > self._max_expiry_blocks()):
+            return _deny("expiry", f"expiry_blocks {blocks} outside ({cfg.refund_margin_blocks}, {self._max_expiry_blocks()}]")
+        close_fee = self._int(params.get("close_fee"))
+        if close_fee < 0 or (cfg.close_fee_max_sats > 0 and close_fee > cfg.close_fee_max_sats):
+            return _deny("close_fee", f"close_fee {close_fee} is above close_fee_max_sats {cfg.close_fee_max_sats}")
+        return self._open_channel_locked(params)
 
     def _open_channel_locked(self, params: dict) -> dict:
         dest = normalize_dest(params.get("dest") or params.get("to") or "")
@@ -687,7 +798,7 @@ class Signer:
         existing = self.channels.get(dest)
         if existing is not None and existing.state == "open":
             return {"verdict": "allow", "already": True, **existing.public()}
-        pay_to = (params.get("pay_to") or self.config.pay_to_for(dest) or "").strip()
+        pay_to = (self.config.pay_to_for(dest) or "").strip()
         if not pay_to:
             return _deny("pay_to", f"no payTo pubkey registered for {dest}")
         cap = int(params.get("cap_sats") or self.config.per_counterparty_cap_sats)
@@ -757,8 +868,19 @@ class Signer:
             if result.get("verdict") == "deny":
                 return result
             return {"verdict": "allow", "rule": "free", **result, "rail": "xbt402"}
+        # AGP-063 W1: on an open channel the most this call can book (price <= max_sats) is known
+        # before the 402, so the budgets are held to that
+        bound = max_sats
+        rec = self._xbt402.book.get(dest)
+        if rec is not None and rec.state == "open":
+            try:
+                bound = self._xbt402.book.next_cum(dest, max_sats) - Xbt402Session._booked_through(rec)
+            except (ChannelError, ValueError):
+                pass
+            if bound <= 0:
+                bound = max_sats
         pay = Payment(dest=dest, amount_sats=max_sats, memo=f"xbt402 {method} {url}")
-        d = self.engine.evaluate(pay, human=False)
+        d = self.engine.evaluate_booking(pay, bound, human=False)
         if d.verdict is not Verdict.ALLOW:
             return d.as_dict()
         sigaudit.set_rule(f"policy:{d.rule}")
@@ -781,10 +903,26 @@ class Signer:
             return _deny("xbt402", str(e))
         if result.get("verdict") in ("deny", "pending"):
             return result
-        charged = int(result.get("charged_sats") or 0)
-        if charged:
-            self.engine.commit(Payment(dest=dest, amount_sats=charged, memo=pay.memo), txid=result.get("chan") or "")
+        # The signed delta was committed inside the session, before the signature left (AGP-063). A forward
+        # lot is booked once delivered (its pre-signature pays nothing until the transfer is out).
+        if result.get("rail") == "forward" and result.get("delivered"):
+            self._book_forward(dest, result["chan"], int(result["cum"]), int(result["charged_sats"]),
+                               f"forward {result['outpoint']}")
         return {**d.as_dict(), **result, "rail": "xbt402"}
+
+    def _book_forward(self, dest: str, chan: str, cum: int, price: int, memo: str) -> None:
+        """A delivered forward lot, under the signed state's id (xbt402:{chan}:{cum}) so neither a
+        recovery nor the next call's catch-up books it twice."""
+        if price > 0:
+            self.engine.commit_once(Payment(dest=dest, amount_sats=price, memo=memo), txid=f"xbt402:{chan}:{cum}")
+        if self.channels.get(dest) is not None:
+            self.channels.mark_ledger_booked(dest, cum)
+
+    def _book_signed_delta(self, dest: str, delta: int, chan: str, cum: int) -> None:
+        if delta <= 0:
+            raise ChannelError("amount", "signed delta must be positive")
+        self.engine.commit_once(Payment(dest=dest, amount_sats=delta, memo="xbt402 signed delta"),
+                                txid=f"xbt402:{chan}:{cum}")
 
     def _xbt402_request_auth(self, params: dict) -> dict:
         chan = params.get("chan") or ""
