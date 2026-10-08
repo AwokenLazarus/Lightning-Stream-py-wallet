@@ -46,6 +46,9 @@ class Engine:
         from agentwallet.policy import Decision, Verdict
         return Decision(Verdict.ALLOW, "ok", "test")
 
+    def evaluate_booking(self, pay, booked_sats, human=False):
+        return self.evaluate(pay, human)
+
     def commit(self, pay, txid=""):
         self.commits.append((pay.amount_sats, txid))
 

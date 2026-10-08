@@ -186,6 +186,84 @@ class ReviewWSignerTests(unittest.TestCase):
         self.assertEqual(self.s.sigaudit.read()[-1]["rule"], "human:rotate_signature")
 
 
+class ReviewWBudgetTests(unittest.TestCase):
+    """W1: the budgets are held to what a call signs: the increase on an open channel, and a
+    channel's dust floor when that is above the amount asked."""
+
+    def rig(self, budget: int):
+        import sys
+        from types import SimpleNamespace
+
+        sec = str(Path.home() / "xbt-rnd" / "b1" / "tests" / "security")
+        if sec not in sys.path:
+            sys.path.insert(0, sec)
+        import xbt402.x402_channel as xc
+        from sechelp import FakeNode, make_provider
+        from test_request_auth import DEST as RDEST, funded
+        from xbt402.x402_channel import XbtChannelClient
+
+        tmp = Path(tempfile.mkdtemp())
+        book, _, p = funded(tmp)
+        node = FakeNode()
+        prov = make_provider(xc, node)
+        prov.price = lambda m, path: 500
+        node.add_funding(p, confirmations=6)
+        prov.open({"x402Version": 2, "network": prov.network, "channel": {
+            "txid": p.funding_txid, "vout": 0, "capacity": p.capacity, "expiry": p.expiry,
+            "payerPub": p.payer_pub, "redeemScript": p.script.hex()}})
+
+        def http(method, url, body=b"", headers=None):
+            st, h, out = prov.serve(method, "/" + url.split("/", 3)[3], headers or {}, body or b"", url)
+            return st, {k.upper(): v for k, v in h.items()}, out
+
+        orig = XbtChannelClient.http
+        XbtChannelClient.http = staticmethod(http)
+        self.addCleanup(setattr, XbtChannelClient, "http", orig)
+        s = Signer.__new__(Signer)
+        s.engine = PolicyEngine(PolicyConfig(allowlist=frozenset({RDEST}), max_per_tx_sats=5_000, daily_budget_sats=budget,
+                                             weekly_budget_sats=budget, per_counterparty_cap_sats=50_000, split_window_s=0),
+                                PolicyStore(tmp / "ledger.json"), AuditLog(tmp / "audit.jsonl"))
+        s.config = SimpleNamespace(channel_expiry_blocks=2_000, per_counterparty_cap_sats=50_000)
+        rpc = type("Rpc", (), {"call": lambda self, m, *a: "11" * 32})()
+        s._xbt402 = Xbt402Session(book, hot=None, rpc=rpc, height=lambda: 1_000)
+        s._xbt402.set_spend_book(s._book_signed_delta)
+        s._xbt402.set_spend_check(lambda dest, asked, delta: s._floor_check(dest, asked, delta, human=False))
+        return s, RDEST + "/v1/x"
+
+    def test_w1_the_budget_is_checked_on_the_signed_increase_not_max_sats(self):
+        s, url = self.rig(1_000)
+        pay = lambda: s._xbt402_pay_locked({"url": url, "method": "GET", "body": "", "max_sats": 500})  # noqa: E731
+        r = pay()
+        self.assertEqual((r["verdict"], r["cum"]), ("allow", 546), r)
+        r = pay()
+        self.assertEqual((r["verdict"], r["cum"], r["booked_sats"]), ("allow", 1_000, 454), r)
+        self.assertEqual(ledger_sum(s), 1_000)
+        r = pay()
+        self.assertEqual((r["verdict"], rule(r)), ("deny", "daily_budget"), r)
+        self.assertEqual(ledger_sum(s), 1_000)
+
+    def test_w1_a_dust_floor_above_the_remaining_budget_is_refused(self):
+        s, url = self.rig(520)
+        r = s._xbt402_pay_locked({"url": url, "method": "GET", "body": "", "max_sats": 500})
+        self.assertEqual((r["verdict"], rule(r)), ("deny", "daily_budget"), r)
+        r = s._xbt402.pay_once(url, "GET", b"", max_sats=500, expiry_blocks=2_000, cap_sats=50_000)
+        self.assertEqual((r["verdict"], rule(r)), ("deny", "daily_budget"), r)
+        self.assertIn("dust floor", r["reason"])
+        self.assertEqual(ledger_sum(s), 0, "the floor was neither booked nor signed")
+        self.assertEqual(s._xbt402.book.list_public()[0]["used_sats"], 0)
+
+    def test_w1_the_dust_floor_on_the_pay_rail_is_held_to_the_budget(self):
+        tmp = Path(tempfile.mkdtemp())
+        keyfile_env()
+        write_policy(tmp, per_counterparty_cap_sats=100_000, split_window_s=0, daily_budget_sats=300, weekly_budget_sats=300)
+        s = Signer(tmp, rpc=FakeRpc(height=1000))
+        s.hot.notice_utxo("aa" * 32, 0, 300_000)
+        r = s.handle({"method": "pay", "params": {"to": API, "amount_sats": 100, "memo": "a"}})
+        self.assertEqual((r["verdict"], rule(r)), ("deny", "daily_budget"), r)
+        self.assertEqual(ledger_sum(s), 0)
+        self.assertTrue(all(c["used_sats"] == 0 for c in s.channels.list_public()), "nothing signed")
+
+
 class ReviewK1Tests(unittest.TestCase):
     def test_k1_scrypt_cost_is_recorded_per_blob(self):
         ks = KeyStore(passphrase=b"pw")

@@ -125,10 +125,16 @@ class Xbt402Session:
         self.refund_margin = int(refund_margin)
         self._net = None
         self._spend_book = None
+        self._spend_check = None
 
     def set_spend_book(self, book) -> None:
         """AGP-063: commit a signed increase before the signature is sent. `book(dest, delta, chan, cum)`."""
         self._spend_book = book
+
+    def set_spend_check(self, check) -> None:
+        """AGP-063 W1: the policy's verdict on a signed increase above max_sats (a channel's dust floor).
+        `check(dest, max_sats, delta)` returns a deny dict, which stops the call before anything is signed."""
+        self._spend_check = check
 
     def network(self) -> str:
         if self.chain != "regtest":
@@ -417,6 +423,11 @@ class Xbt402Session:
         if rec is not None and rec.last_sig and rec.used_sats > rec.acked_sats:
             rec, sig = self.book.resend_state(dest)   # same (cum, sig); do not sign a higher one (M3)
         else:
+            nxt = self.book.next_cum(dest, price)
+            if nxt - ledger_before > max_sats and self._spend_check is not None:
+                refused = self._spend_check(dest, max_sats, nxt - ledger_before)
+                if refused:
+                    return refused
             rec, sig = self.book.increment(dest, price)
         # AGP-063 W1: book the signed increase before the signature leaves. Never the seller's charged.
         booked = self._book_unbooked(dest)

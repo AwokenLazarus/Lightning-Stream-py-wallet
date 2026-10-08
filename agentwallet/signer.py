@@ -171,6 +171,7 @@ class Signer:
                                       policy=ForwardPolicy.from_dict(self.config.forward))
         # AGP-063 W1: the signed increase is committed before the signature is sent.
         self._xbt402.set_spend_book(self._book_signed_delta)
+        self._xbt402.set_spend_check(lambda dest, asked, delta: self._floor_check(dest, asked, delta, human=False))
         from .routing import RoutePolicy, RouteSigner
         self.routing = RouteSigner(self.channels, RoutePolicy.from_dict(self.config.routing),
                                    state_path=run / "routing.json", engine=self.engine)
@@ -640,7 +641,7 @@ class Signer:
         sigaudit.set_rule("human:approval_signature" if human else f"policy:{d.rule}")
         dest = pay.normalized(self.engine.clock()).dest
         if self._uses_channel(dest):
-            return self._channel_pay(pay, dest, d)
+            return self._channel_pay(pay, dest, d, human=human)
         if self.light:
             return _deny("light_backend", "on-chain pay spends the node wallet, and a light client has none: "
                                           "pay through a channel")
@@ -715,7 +716,17 @@ class Signer:
         rec = self.channels.get(dest)
         return {"verdict": "allow", "chan": rec.chan if rec else "", "cum": cum, "sig": sig.hex() if sig else ""}
 
-    def _channel_pay(self, pay: Payment, dest: str, d) -> dict:
+    def _floor_check(self, dest: str, asked: int, delta: int, *, human: bool) -> dict | None:
+        """AGP-063 W1: a channel's dust floor signs more than the amount the policy approved, so the
+        budgets are checked again on the whole increase. A human-threshold verdict is a refusal here."""
+        d = self.engine.evaluate_booking(Payment(dest=dest, amount_sats=asked, memo="dust floor"), delta, human=human)
+        if d.verdict is Verdict.ALLOW:
+            return None
+        if d.approval_token:
+            self.engine.store.pop_approval(d.approval_token)
+        return _deny(d.rule, f"the channel's dust floor signs {delta} sat: {d.reason}")
+
+    def _channel_pay(self, pay: Payment, dest: str, d, *, human: bool = False) -> dict:
         rec = self.channels.get(dest)
         if rec is None or rec.state != "open":
             opened = self._open_channel_locked({"dest": dest})
@@ -730,6 +741,10 @@ class Signer:
             return _deny(getattr(e, "code", "bad_amount"), str(e))
         # AGP-063 W1/K1: book what this call signs (the dust floor on a first state), before it signs
         booked = Xbt402Session._booked_through(rec)
+        if cum - booked > pay.amount_sats:
+            refused = self._floor_check(pay.dest, pay.amount_sats, cum - booked, human=human)
+            if refused:
+                return refused
         txid = f"xbt402:{rec.chan}:{cum}"
         added = cum > booked and self.engine.commit_once(
             Payment(dest=pay.dest, amount_sats=cum - booked, memo=pay.memo, ts=pay.ts), txid)
@@ -853,8 +868,19 @@ class Signer:
             if result.get("verdict") == "deny":
                 return result
             return {"verdict": "allow", "rule": "free", **result, "rail": "xbt402"}
+        # AGP-063 W1: on an open channel the most this call can book (price <= max_sats) is known
+        # before the 402, so the budgets are held to that
+        bound = max_sats
+        rec = self._xbt402.book.get(dest)
+        if rec is not None and rec.state == "open":
+            try:
+                bound = self._xbt402.book.next_cum(dest, max_sats) - Xbt402Session._booked_through(rec)
+            except (ChannelError, ValueError):
+                pass
+            if bound <= 0:
+                bound = max_sats
         pay = Payment(dest=dest, amount_sats=max_sats, memo=f"xbt402 {method} {url}")
-        d = self.engine.evaluate(pay, human=False)
+        d = self.engine.evaluate_booking(pay, bound, human=False)
         if d.verdict is not Verdict.ALLOW:
             return d.as_dict()
         sigaudit.set_rule(f"policy:{d.rule}")

@@ -376,6 +376,12 @@ class PolicyEngine:
         return sum(1 for p in payments if now - p.ts <= window_s)
 
     def evaluate(self, payment: Payment, *, human: bool = False) -> Decision:
+        return self.evaluate_booking(payment, payment.amount_sats, human=human)
+
+    def evaluate_booking(self, payment: Payment, booked_sats: int, *, human: bool = False) -> Decision:
+        """AGP-063 W1: `payment.amount_sats` is what the caller asked for (per-tx and human threshold,
+        approvals); `booked_sats` is the most the ledger gains from it (the sums). They differ on a
+        channel, where the signed increase is known only from its state."""
         now = self.clock()
         p = payment.normalized(now)
         cfg = self.config
@@ -434,7 +440,7 @@ class PolicyEngine:
                 f"{p.amount_sats} sats exceeds max_per_tx {cfg.max_per_tx_sats}",
             )
 
-        split_sum = self._spent(ledger, cfg.split_window_s, now, dest=p.dest) + p.amount_sats
+        split_sum = self._spent(ledger, cfg.split_window_s, now, dest=p.dest) + booked_sats
         if split_sum > cfg.max_per_tx_sats:
             return decide(
                 Verdict.DENY,
@@ -448,23 +454,23 @@ class PolicyEngine:
                 f"split window sum {split_sum} evades human_threshold {cfg.human_threshold_sats}",
             )
 
-        if daily + p.amount_sats > cfg.daily_budget_sats:
+        if daily + booked_sats > cfg.daily_budget_sats:
             return decide(
                 Verdict.DENY,
                 "daily_budget",
-                f"daily spend {daily + p.amount_sats} exceeds budget {cfg.daily_budget_sats}",
+                f"daily spend {daily + booked_sats} exceeds budget {cfg.daily_budget_sats}",
             )
-        if weekly + p.amount_sats > cfg.weekly_budget_sats:
+        if weekly + booked_sats > cfg.weekly_budget_sats:
             return decide(
                 Verdict.DENY,
                 "weekly_budget",
-                f"weekly spend {weekly + p.amount_sats} exceeds budget {cfg.weekly_budget_sats}",
+                f"weekly spend {weekly + booked_sats} exceeds budget {cfg.weekly_budget_sats}",
             )
-        if cpty + p.amount_sats > cfg.per_counterparty_cap_sats:
+        if cpty + booked_sats > cfg.per_counterparty_cap_sats:
             return decide(
                 Verdict.DENY,
                 "per_counterparty",
-                f"counterparty spend {cpty + p.amount_sats} exceeds cap {cfg.per_counterparty_cap_sats}",
+                f"counterparty spend {cpty + booked_sats} exceeds cap {cfg.per_counterparty_cap_sats}",
             )
         if self._count(ledger, cfg.velocity_window_s, now) >= cfg.velocity_max:
             return decide(
