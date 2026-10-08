@@ -197,8 +197,8 @@ class ForwardSession(Xbt402Session):
         self._delivered(dest, tx)
         _log("forward", url=url, chan=rec.chan, cum=cum, chargedSat=price, txid=tx.txid(),
              ms=round(1000 * (time.time() - t0), 1))
-        return {**res, "charged_sats": price, "delivered": True, "transfer_txid": tx.txid(), "transfer_hex": tx.hex(),
-                "receipt": receipt}
+        return {**res, "charged_sats": price, "delivered": True, "cum": cum, "transfer_txid": tx.txid(),
+                "transfer_hex": tx.hex(), "receipt": receipt}
 
     def _delivered(self, dest: str, tx, via: str = "http"):
         with self.book._lock, self.fwd.lock:
@@ -238,6 +238,7 @@ class ForwardSession(Xbt402Session):
                     if tx is not None:
                         self._delivered(dest, tx, via=f"close {close_txid}")
                         return {"recovered": True, "dest": dest, "outpoint": p["offer"]["outpoint"], "price": p["price"],
+                                "chan": p["chan"], "cum": p["cum"],
                                 "transfer_txid": tx.txid(), "transfer_hex": tx.hex(), "via": "channel close witness"}
             with self.fwd.lock:
                 self.fwd.data["pending"].pop(dest, None)

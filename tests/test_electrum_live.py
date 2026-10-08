@@ -150,7 +150,10 @@ class LiveElectrs(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="agp024-signer-"))
         self.addCleanup(shutil.rmtree, root, True)
         keyfile_env()
-        write_policy(root, allowlist=["probe://x"], counterparties={}, per_counterparty_cap_sats=20_000,
+        from xbt402 import ecc
+        pay_to = ecc.pubkey(0xB0B).hex()
+        # AGP-063 W3: payTo comes from the policy's counterparties, never from the open_channel caller
+        write_policy(root, allowlist=["probe://x"], counterparties={"probe://x": {"pay_to": pay_to}}, per_counterparty_cap_sats=20_000,
                      channel_expiry_blocks=12, refund_margin_blocks=2, hot_balance_cap_sats=0, regtest_mine=False)
         b = self.backend()
         self.addCleanup(b.close)
@@ -161,10 +164,7 @@ class LiveElectrs(unittest.TestCase):
         self.mine(1)
         self.settle(b)
         self.assertEqual(signer.handle({"method": "notice_hot_txid", "params": {"txid": ftx}})["noticed"], 1)
-        from xbt402 import ecc
-        pay_to = ecc.pubkey(0xB0B).hex()
-        op = signer.handle({"method": "open_channel", "params": {"dest": "probe://x", "pay_to": pay_to,
-                                                                    "cap_sats": 20_000, "expiry_blocks": 12}})
+        op = signer.handle({"method": "open_channel", "params": {"dest": "probe://x", "cap_sats": 20_000, "expiry_blocks": 12}})
         self.assertEqual((op["verdict"], op["funding_sighash"]), ("allow", "0x21"), op)
         self.mine(1)
         self.settle(b)

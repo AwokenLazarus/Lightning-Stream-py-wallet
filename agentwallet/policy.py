@@ -283,13 +283,30 @@ class PolicyStore:
         return json.loads(self.path.read_text(encoding="utf-8"))
 
     def _write(self, data: dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.path)
+        """AGP-063 K1: the approvals document like every other state file (fsync, rename, dir fsync, 0600)."""
+        from .keystore import write_private
+
+        write_private(self.path, json.dumps(data, indent=2, sort_keys=True))
 
     def payments(self) -> list[LedgerEntry]:
         with self._lock:
             return list(self._entries)
+
+    def amend(self, txid: str, amount_sats: int | None) -> bool:
+        """Change (or, with None, drop) the latest row for `txid`: one {"amend"} log line, the Rust
+        signer's format. False when the ledger holds no such row."""
+        if amount_sats is not None and int(amount_sats) < 0:
+            raise LogError("negative ledger entry refused")
+        with self._lock:
+            i = next((i for i in range(len(self._entries) - 1, -1, -1) if self._entries[i].txid == txid), None)
+            if i is None:
+                return False
+            self._log.append({"amend": txid, "amount_sats": None if amount_sats is None else int(amount_sats)})
+            if amount_sats is None:
+                del self._entries[i]
+            else:
+                self._entries[i].amount_sats = int(amount_sats)
+            return True
 
     def commit(self, entry: LedgerEntry) -> None:
         if entry.amount_sats < 0:

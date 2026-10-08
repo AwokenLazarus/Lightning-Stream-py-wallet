@@ -402,24 +402,38 @@ class ChannelBook:
         payer.signed = rec.used_sats
         return payer
 
-    def increment(self, dest: str, amount_sats: int) -> tuple[ChannelRecord, bytes]:
-        """Atomically raise the signed cumulative amount. Raises ChannelCapError."""
+    @staticmethod
+    def _plan_increment(rec: ChannelRecord, amount_sats: int) -> tuple[int, int]:
+        """(new spent, cumulative amount to sign) for a charge of `amount_sats`. Raises ChannelCapError."""
         if amount_sats <= 0:
             raise ValueError("amount must be positive")
+        spent = rec.spent()
+        if spent + amount_sats > rec.cap_sats:
+            raise ChannelCapError(spent, amount_sats, rec.cap_sats)
+        new_spent = spent + amount_sats
+        sign_cum = max(new_spent, rec.used_sats)
+        floor = getattr(rec.params(), "min_amount", 546)   # dust, + close_fee on a payee-pays channel (v1.2)
+        if 0 < sign_cum < floor:
+            if floor > rec.cap_sats:
+                raise ChannelCapError(spent, floor - spent, rec.cap_sats)
+            sign_cum = floor
+        return new_spent, sign_cum
+
+    def next_cum(self, dest: str, amount_sats: int) -> int:
+        """The cumulative amount `increment(dest, amount_sats)` would sign (AGP-063: booked first)."""
         with self._lock:
             rec = self._records.get(dest)
             if rec is None:
                 raise ChannelError("unknown_channel", dest)
-            spent = rec.spent()
-            if spent + amount_sats > rec.cap_sats:
-                raise ChannelCapError(spent, amount_sats, rec.cap_sats)
-            new_spent = spent + amount_sats
-            sign_cum = max(new_spent, rec.used_sats)
-            floor = getattr(rec.params(), "min_amount", 546)   # dust, + close_fee on a payee-pays channel (v1.2)
-            if 0 < sign_cum < floor:
-                if floor > rec.cap_sats:
-                    raise ChannelCapError(spent, floor - spent, rec.cap_sats)
-                sign_cum = floor
+            return self._plan_increment(rec, amount_sats)[1]
+
+    def increment(self, dest: str, amount_sats: int) -> tuple[ChannelRecord, bytes]:
+        """Atomically raise the signed cumulative amount. Raises ChannelCapError."""
+        with self._lock:
+            rec = self._records.get(dest)
+            if rec is None:
+                raise ChannelError("unknown_channel", dest)
+            new_spent, sign_cum = self._plan_increment(rec, amount_sats)
             self._plain_over_lock_locked(rec, sign_cum)
             payer = self._payer_locked(rec)
             sig = b""

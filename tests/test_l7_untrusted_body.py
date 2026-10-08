@@ -114,7 +114,7 @@ class UntrustedBodyTests(unittest.TestCase):
         self.assertEqual(self.calls, ["/v1/x"])                    # served once
         st = self.prov.ledger.channels[self.chan]
         self.assertEqual(st.spent_msat, 150_000)                   # charged once
-        self.assertEqual(self.signer.engine.commits, [(150, self.chan)])
+        self.assertEqual(self.signer.engine.commits, [(546, f"xbt402:{self.chan}:546")], "AGP-063 W1: the signed floor, not charged")
         u = res[UNTRUSTED_KEY]
         self.assertEqual(u["trust"], "untrusted")
         self.assertIn("untrusted", u["note"])
