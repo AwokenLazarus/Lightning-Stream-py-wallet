@@ -21,7 +21,7 @@ import time
 import unittest
 from pathlib import Path
 
-from agentwallet.electrum import ElectrumBackend, ElectrumError, ImplausibleChain, Plausibility
+from agentwallet.electrum import TIP_CAP_SPACING_S, ElectrumBackend, ElectrumError, ImplausibleChain, Plausibility
 from agentwallet.headers import (
     MAINNET_CHECKPOINT,
     MAINNET_PINS,
@@ -270,7 +270,7 @@ class BackendE1E2(unittest.TestCase):
         honest, liar = self.fake(sim), self.fake(sim)
         liar.fake_tip = mine_header("44" * 32, b"\x45" * 32, 4_000_000_000, 1, SIM_T0 + 60 * 300)
         liar.junk_above = 300
-        b = light(sim, liar, honest)
+        b = light(sim, liar, honest, tip_cap_spacing_s=TIP_CAP_SPACING_S)
         self.addCleanup(b.close)
         t = time.monotonic()
         self.assertEqual(b.call("getblockcount"), 300)
@@ -292,6 +292,22 @@ class BackendE1E2(unittest.TestCase):
         self.assertLess(held, 0.7, f"held up {held:.2f}s by the slow server's sync")
         syncing.join(10)
         self.assertEqual(got, [301], "the honest server's block still arrives")
+
+    def test_tip_cap_is_mainnet_only(self):
+        """The tip cap is a mainnet rule (regtest mines as fast as it is asked to); where it is set, a chain
+        that outran it is caught up over more than one sync, and the server is flagged."""
+        sim = SimChain(height=CHECKPOINT + 4000)             # 60 s blocks: faster than one per 150 s
+        tip_time = SIM_T0 + 60 * (CHECKPOINT + 4000)
+        f = self.fake(sim)
+        b = light(sim, f, clock=lambda: tip_time)
+        self.addCleanup(b.close)
+        self.assertEqual(b.call("getblockcount"), CHECKPOINT + 4000)
+        self.assertEqual(b.flags, [])
+        capped = light(sim, f, clock=lambda: tip_time, tip_cap_spacing_s=TIP_CAP_SPACING_S)
+        self.addCleanup(capped.close)
+        self.assertEqual(capped.call("getblockcount"), CHECKPOINT + 60 * 4000 // TIP_CAP_SPACING_S + 2016)
+        self.assertTrue(any("beyond the plausible" in x["reason"] for x in capped.flags), capped.flags)
+        self.assertEqual(capped.sync(force=True), CHECKPOINT + 4000)
 
     def test_hostile_cheap_fork_is_not_believed(self):
         """A fresh client whose only server serves the real checkpoint and then a few cheap blocks with a

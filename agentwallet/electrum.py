@@ -270,7 +270,10 @@ class ElectrumBackend:
     def __init__(self, servers: list[str], *, chain: str, checkpoint: tuple[int, str] | None = None,
                  store_path: Path | None = None, timeout: float = 15.0, min_servers: int | None = None,
                  sync_interval: float = 1.0, connection=ElectrumConnection, clock=time.time,
-                 plausibility: Plausibility | None = None):
+                 plausibility: Plausibility | None = None, tip_cap_spacing_s: int | None = None):
+        """`tip_cap_spacing_s`: a claimed tip is believed up to one block per this many seconds since our
+        tip's time, plus HEADERS_CHUNK. None: TIP_CAP_SPACING_S on mainnet, no cap elsewhere (regtest
+        mines blocks as fast as it is asked to)."""
         if not servers:
             raise ElectrumError("no Electrum servers configured (B2_ELECTRUM_SERVERS)")
         try:
@@ -293,6 +296,7 @@ class ElectrumBackend:
         self.clock = clock
         self.headers = HeaderChain(chain, checkpoint, store_path, clock=clock)
         self.plausibility = plausibility or (Plausibility.mainnet(checkpoint) if chain == "main" else None)
+        self.tip_cap_spacing_s = tip_cap_spacing_s or (TIP_CAP_SPACING_S if chain == "main" else None)
         self.conns = [connection(u, timeout=timeout, on_notify=self._on_notify) for u in servers]
         self.min_servers = max(1, min(len(self.conns), int(min_servers if min_servers is not None
                                                            else (2 if chain == "main" else 1))))
@@ -439,7 +443,9 @@ class ElectrumBackend:
         mine = self.headers.at(th)
         if mine is not None and mine.hash == tip_h.hash:
             return                                   # its tip is on our chain already
-        cap = ours + max(0, int(self.clock()) - our_time) // TIP_CAP_SPACING_S + HEADERS_CHUNK
+        cap = th
+        if self.tip_cap_spacing_s:
+            cap = ours + max(0, int(self.clock()) - our_time) // self.tip_cap_spacing_s + HEADERS_CHUNK
         end = min(th, cap)
         if th > cap:
             self._flag(conn, f"headers: claims tip {th}, beyond the plausible {cap}: nothing above it is fetched")
