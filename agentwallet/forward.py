@@ -8,7 +8,7 @@ A rail beside `stream`, inside `xbt402_pay`. When a 402's channel offer carries 
      the signer already applied to `max_sats`);
   2. checks the lot on the wallet's own node and rebuilds the transfer to its own hot key
      (fwd.buyer.verify_offer), and recomputes the adaptor point S from R.x;
-  3. opens the channel from the offer if needed (v1.1, derivation v2);
+  3. opens the channel from the offer if needed (v1.3, derivation v3);
   4. pre-signs the next channel state, cum + price, under S (never a plain signature for it),
      writes the pending purchase to disk, and sends it as the x402 payload's `adaptor`;
   5. on 200 checks the transfer's key-path signature and only then counts the price as spent.

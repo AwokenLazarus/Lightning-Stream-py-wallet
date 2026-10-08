@@ -141,6 +141,9 @@ class Rig:
 
 class FinalChunkM7(unittest.TestCase):
     def test_repro_signs_the_hash_lock_without_the_ciphertext(self):
+        import xbt402.x402_channel as xc
+        if not hasattr(xc, "request_digest"):
+            self.skipTest(f"the {BASE} wallet speaks request binding v1; this B1 speaks v1.3 (AGP-068)")
         r = Rig(shipped())
         r.strip_cipher, r.drop = True, True
         with self.assertRaises(Exception):

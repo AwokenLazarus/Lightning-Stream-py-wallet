@@ -42,7 +42,7 @@ class V11OfferTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         hot = Hot()
         s = Xbt402Session(ChannelBook(tmp / "c.json", tmp / "k.json"), hot, rpc=None, height=lambda: 1000)
-        for d in (None, "v1", "v3"):
+        for d in (None, "v1", "v2"):
             with self.assertRaises(RuntimeError) as err:
                 s.open_from_offer("http://127.0.0.1:9", offer(d), cap_sats=50_000, expiry_blocks=100)
             self.assertIn("derivation", str(err.exception))

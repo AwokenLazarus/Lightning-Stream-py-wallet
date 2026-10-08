@@ -22,7 +22,7 @@ from test_v11_offer import NET, offer  # noqa: E402
 
 ensure_b1()
 from xbt402 import ecc  # noqa: E402
-from xbt402.channel import DUST, ChannelError, ChannelParams, Payee, channel_payee_secret  # noqa: E402
+from xbt402.channel import DERIVATION, DUST, ChannelError, ChannelParams, Payee, channel_payee_secret  # noqa: E402
 
 from agentwallet.xbt402 import Xbt402Session  # noqa: E402
 
@@ -46,7 +46,7 @@ def session():
 
 
 def payee_offer(fee_payer="payee"):
-    acc = offer("v2")
+    acc = offer(DERIVATION)
     acc["extra"]["closeFeePayer"] = fee_payer
     return acc
 
@@ -89,7 +89,7 @@ class PayeePaysOffer(unittest.TestCase):
         s, hot = session()
         http, seen = provider()
         with mock.patch("agentwallet.xbt402.XbtChannelClient.http", side_effect=http):
-            opened = s.open_from_offer(DEST, offer("v2"), cap_sats=50_000, expiry_blocks=100)
+            opened = s.open_from_offer(DEST, offer(DERIVATION), cap_sats=50_000, expiry_blocks=100)
         self.assertEqual(hot.funded, [50_600])
         self.assertNotIn("closeFeePayer", seen[0]["channel"])
         self.assertNotIn("close_fee_payer", opened)
