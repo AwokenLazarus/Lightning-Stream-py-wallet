@@ -59,6 +59,12 @@ class Engine:
     def commit(self, pay, txid=""):
         self.commits.append((pay.amount_sats, txid))
 
+    def commit_once(self, pay, txid=""):
+        if any(t == txid for _, t in self.commits):
+            return False
+        self.commit(pay, txid)
+        return True
+
 
 class UntrustedBodyTests(unittest.TestCase):
     def setUp(self):
@@ -94,6 +100,7 @@ class UntrustedBodyTests(unittest.TestCase):
         self.signer.engine = Engine()
         self.signer.config = SimpleNamespace(channel_expiry_blocks=2_000, per_counterparty_cap_sats=50_000)
         self.signer._xbt402 = Xbt402Session(self.book, hot=None, rpc=Rpc(), height=lambda: 1_000)
+        self.signer._xbt402.set_spend_book(self.signer._book_signed_delta)
 
     def test_body_that_looks_like_key_material_was_the_hazard(self):
         with self.assertRaises(KeyMaterialError):

@@ -241,6 +241,12 @@ class PolicyStore:
 
     def _apply(self, row: dict, n: int) -> None:
         if "amend" not in row:
+            try:
+                amount = int(row["amount_sats"])
+            except (KeyError, TypeError, ValueError):
+                raise LogError(f"{self.log_path}: line {n} is not a payment")
+            if amount < 0:
+                raise LogError(f"{self.log_path}: line {n} is a negative payment")
             self._entries.append(LedgerEntry(**row))
             return
         i = next((i for i in range(len(self._entries) - 1, -1, -1) if self._entries[i].txid == row["amend"]), None)
@@ -249,7 +255,10 @@ class PolicyStore:
         if row.get("amount_sats") is None:
             del self._entries[i]
         else:
-            self._entries[i].amount_sats = int(row["amount_sats"])
+            amount = int(row["amount_sats"])
+            if amount < 0:
+                raise LogError(f"{self.log_path}: line {n} amends {row['amend']!r} to a negative amount")
+            self._entries[i].amount_sats = amount
 
     def _migrate(self) -> None:
         """Move the payments of an old-format ledger.json to the log. Safe to run again after a crash
@@ -283,6 +292,8 @@ class PolicyStore:
             return list(self._entries)
 
     def commit(self, entry: LedgerEntry) -> None:
+        if entry.amount_sats < 0:
+            raise LogError("negative ledger entry refused")
         with self._lock:
             self._log.append(asdict(entry))          # durable before it counts
             self._entries.append(entry)
@@ -339,6 +350,8 @@ class PolicyEngine:
                 continue
             if dest is not None and p.dest != dest:
                 continue
+            if p.amount_sats < 0:
+                raise LogError("negative ledger entry")
             total += p.amount_sats
         return total
 
@@ -494,7 +507,17 @@ class PolicyEngine:
             ts=now,
         )
 
+    def commit_once(self, payment: Payment, txid: str = "") -> bool:
+        """Commit `txid` once. A repeat (the write-ahead ran, then the process restarted) does not
+        add a second row. False when this txid was already in the ledger."""
+        if txid and any(e.txid == txid for e in self.store.payments()):
+            return False
+        self.commit(payment, txid)
+        return True
+
     def commit(self, payment: Payment, txid: str = "") -> None:
+        if int(payment.amount_sats) < 0:
+            raise LogError("negative ledger entry refused")
         now = self.clock()
         p = payment.normalized(now)
         self.store.commit(

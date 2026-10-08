@@ -169,6 +169,8 @@ class Signer:
                                       refund_margin=self.config.refund_margin_blocks,
                                       forward_path=run / "forward.json",
                                       policy=ForwardPolicy.from_dict(self.config.forward))
+        # AGP-063 W1: the signed increase is committed before the signature is sent.
+        self._xbt402.set_spend_book(self._book_signed_delta)
         from .routing import RoutePolicy, RouteSigner
         self.routing = RouteSigner(self.channels, RoutePolicy.from_dict(self.config.routing),
                                    state_path=run / "routing.json", engine=self.engine)
@@ -781,10 +783,14 @@ class Signer:
             return _deny("xbt402", str(e))
         if result.get("verdict") in ("deny", "pending"):
             return result
-        charged = int(result.get("charged_sats") or 0)
-        if charged:
-            self.engine.commit(Payment(dest=dest, amount_sats=charged, memo=pay.memo), txid=result.get("chan") or "")
+        # The signed delta was committed inside the session, before the signature left (AGP-063).
         return {**d.as_dict(), **result, "rail": "xbt402"}
+
+    def _book_signed_delta(self, dest: str, delta: int, chan: str, cum: int) -> None:
+        if delta <= 0:
+            raise ChannelError("amount", "signed delta must be positive")
+        self.engine.commit_once(Payment(dest=dest, amount_sats=delta, memo="xbt402 signed delta"),
+                                txid=f"xbt402:{chan}:{cum}")
 
     def _xbt402_request_auth(self, params: dict) -> dict:
         chan = params.get("chan") or ""

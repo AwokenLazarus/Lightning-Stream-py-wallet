@@ -49,6 +49,14 @@ class ChannelCapError(RuntimeError):
         self.used, self.amount, self.cap = used, amount, cap
 
 
+def _omit_legacy_booking(rec: dict) -> dict:
+    """A record from before AGP-063 has no `ledger_booked_sats` (loaded as -1). Do not write the
+    key, so that file's field set stays what B2 and the Rust signer already agree on."""
+    if int(rec.get("ledger_booked_sats", -1)) < 0:
+        rec.pop("ledger_booked_sats", None)
+    return rec
+
+
 @dataclass
 class ChannelRecord:
     dest: str
@@ -86,6 +94,9 @@ class ChannelRecord:
     # (same cum, same sig) instead of signing a higher one (M3: one call of slack).
     last_sig: str = ""
     acked_sats: int = 0
+    # AGP-063: cumulative sats already in the policy ledger. -1 (a record from before this field)
+    # means booked through used_sats, so an upgrade does not book history again. A new channel is 0.
+    ledger_booked_sats: int = -1
     # AGP-021: the one adaptor-locked state out on this channel (a routed payment through a hub):
     # {cum, pre, r, T, T1, route, at, prev_used}. Written before the pre-signature leaves (write-ahead).
     pending_lock: dict = field(default_factory=dict)
@@ -185,9 +196,9 @@ class ChannelBook:
                 doc = json.dumps({"sealed": self.keystore.seal(doc.encode(), self.KEYS_AAD)}, indent=2)
             write_private(self.keys_path, doc)
             self._keys_on_disk = dict(self._secrets)
-        body = {"channels": {d: asdict(r) for d, r in self._records.items()}}
+        body = {"channels": {d: _omit_legacy_booking(asdict(r)) for d, r in self._records.items()}}
         if self._archived:
-            body["archived"] = self._archived
+            body["archived"] = [_omit_legacy_booking(dict(a)) for a in self._archived]
         write_private(self.records_path, json.dumps(body, indent=2, sort_keys=True))
 
     def list_public(self) -> list[dict]:
@@ -321,6 +332,14 @@ class ChannelBook:
                 self._persist()
             return ChannelRecord(**asdict(rec))
 
+    def mark_ledger_booked(self, dest: str, cum: int) -> None:
+        """The policy ledger now holds this channel through `cum` (AGP-063 write-ahead)."""
+        with self._lock:
+            rec = self._rec_locked(dest)
+            if int(cum) > rec.ledger_booked_sats:
+                rec.ledger_booked_sats = int(cum)
+                self._persist()
+
     def note_pending(self, key: str, *, open_error: str | None = None, funding_height: int | None = None) -> None:
         with self._lock:
             rec = self._rec_locked(key)
@@ -338,7 +357,8 @@ class ChannelBook:
             close_fee=params.close_fee, payer_spk=params.payer_spk, payee_spk=params.payee_spk,
             funding_txid=params.funding_txid, funding_vout=params.funding_vout, funding_sats=params.capacity,
             seq=0, origin=origin, open_height=int(open_height or 0), spent_sats=0,
-            close_fee_payer=getattr(params, "close_fee_payer", "payer"))
+            close_fee_payer=getattr(params, "close_fee_payer", "payer"),
+            ledger_booked_sats=0)
 
     def add_funded(
         self,
