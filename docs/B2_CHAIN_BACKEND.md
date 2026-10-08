@@ -17,7 +17,7 @@ unchanged on either.
 | Variable | Meaning |
 |---|---|
 | `B2_CHAIN_BACKEND` | `rpc` (the default without servers), `electrum`, or `auto` (the default with servers): the local node when it answers, else Electrum |
-| `B2_ELECTRUM_SERVERS` | comma-separated `tcp://host:port` or `ssl://host:port` (certificates are verified) |
+| `B2_ELECTRUM_SERVERS` | comma-separated `tcp://host:port` or `ssl://host:port` (certificates are verified). Mainnet needs `ssl://`; `tcp://` only to a loopback host (AGP-069) |
 | `B2_ELECTRUM_CHECKPOINT` | `<height>:<hash>`. Mainnet defaults to `961640:0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb`, the first BLAKE2b block. Other chains must set it (regtest: block 101 of the rig) |
 | `B2_ELECTRUM_MIN_SERVERS` | servers that must answer (default 2 on mainnet, 1 elsewhere). Configure at least one more than this, so one server down does not stop the wallet |
 | `B2_ELECTRUM_TIMEOUT` | seconds per request (default 15) |
@@ -57,11 +57,22 @@ From the pinned checkpoint on, a header is accepted only if:
 - its nBits follow Knots' `pow.cpp`: unchanged inside a 2016-block period; at a boundary exactly
   `CalculateNextWorkRequired` when the period's first header is in the chain (every period after the
   first), else within `PermittedDifficultyTransition`'s 4x bounds (the period 961632-963647, whose first
-  header is below the checkpoint). Regtest allows the parent's nBits or powLimit;
-- its time is above the median of the previous 11 and at most 2 h in the future.
+  header is below the checkpoint). Regtest follows the min-difficulty walk-back (`pow.cpp:42-56`);
+- the top two bits of its flags are clear (`bad-flags-highbits`) and its version without bit 31 is at
+  least 4 (`bad-version`);
+- at a pinned height it is the pinned block (mainnet: 964264, Knots' assumevalid block);
+- its time is above the median of the previous 11, from the first header above the checkpoint on, and
+  at most 2 h in the future.
 
 The checkpoint header itself must hash to the pinned hash and meet the chain's powLimit (so a regtest
-checkpoint pinned for mainnet by a copied environment is refused). Of two branches the one with more
+checkpoint pinned for mainnet by a copied environment is refused). The 10 v1 headers below it are
+fetched once, each hash-linked to the one above, for the median and the walk-back only (AGP-069); a
+store from an older release lacks them and is resynced. Testnet3, testnet4 and signet have no header
+rules here and are refused.
+
+On mainnet nothing is answered (`ImplausibleChain`, status `implausible`) until the chain reaches every
+pinned block, carries Knots' nMinimumChainWork less the checkpoint's chainwork, and trails one block
+per 600 s since the newest pin by at most 2016 blocks (`Plausibility`). Of two branches the one with more
 work wins (a tie keeps ours); nothing below the checkpoint is ever read. A light signer whose servers
 answer but cannot serve the checkpoint refuses to start (the wrong chain); servers that are down only
 delay it, as an unreachable node does on the RPC path.
@@ -81,7 +92,11 @@ Cannot:
   funding spent, so the watcher still refunds at expiry (if the spend was real the refund fails at
   broadcast, harmlessly, and the close is counted once it confirms);
 - hide anything that another configured server shows: histories and unspent lists are the union over
-  every server.
+  every server;
+- get a short cheap fork believed on mainnet: it is below the pins or the minimum work (AGP-069);
+- stall other callers: no lock is held across a network read, servers sync in parallel, and once a
+  chain is held a caller that finds a sync running answers from it. Each chunk of headers is checked
+  as it arrives, and on mainnet nothing above ours + (time since our tip / 150 s) + 2016 is fetched.
 
 Can (and how it is bounded):
 - **Hide a transaction** from us until another server or a block shows it. A hidden close delays
@@ -96,7 +111,10 @@ Can (and how it is bounded):
 - **Report mempool facts that are false**: an invented unconfirmed coin or spend can make a broadcast
   fail or a pending change look counted until reconcile; it moves no coins.
 - **Lie about fee estimates** (reported as unverified; B2's fundings use its own fixed fees).
-- **Stall or disconnect** (a timeout drops the connection; the next request reconnects).
+- **Be slow or disconnect** (a timeout drops the connection; the next request reconnects). A call
+  that asks every server waits for the slowest, up to the timeout.
+- **Build a fork above the newest pin**, where blocks are cheap (difficulty `1a00f0b5`): the
+  minimum work and the height floor only raise the bar. Releases should bump the pins.
 - **Learn which scripts we watch** (privacy): every hot key and every unsettled channel's funding script.
 
 ## Operation notes
@@ -107,6 +125,9 @@ Can (and how it is bounded):
   `getblock` reads; without it `get_merkle` fails with "failed to get block txids"). The Lazarus hub's
   electrs has the equivalent fix in its `bitcoincore-rpc-json`.
 - Tests run only against local electrs on regtest, never `electrum.lazarus-xbt.xyz`.
+- The hot wallet spends a coinbase coin only at the depth the node's `getdeploymentinfo` reports
+  (`long_coinbase_maturity`). Electrum has no such call, so a light hot wallet holds coinbase coins
+  (AGP-069).
 - Status: signer method `chain_backend` (also in `health`): checkpoint, tip, tip age, each server's
   tip, whether it is on our best chain and its errors, the scripts watched, and the last verification
   failures.
@@ -121,5 +142,8 @@ Can (and how it is bounded):
   with a real B1 provider: open, pay, close, a late close counted when its subscription fires (AGP-022),
   a close confirmed before we look, refund at expiry, an invented close that does not stop the refund,
   the wrong chain refused at start.
+- `tests/test_review_e.py` (AGP-069, the same names as xbt-rs): the Knots header rules, the real
+  mainnet headers 961630-961700, TLS on mainnet, a lying server that cannot stall, a cheap fork not
+  believed, the tip cap, and coinbase maturity in the hot wallet.
 - `tests/test_electrum_live.py` (Knots 29.4.2 + electrs; skipped without them): every client RPC answers
   as the node does, and a light signer's 0x21 funding and CLTV refund go through Electrum.
