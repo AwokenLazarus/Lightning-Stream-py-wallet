@@ -19,6 +19,11 @@ runs it at start) checks every stored coin against the node with gettxout: a coi
 has becomes "stale" (kept, rechecked, not spent or counted), a coin whose script or value disagrees is
 dropped, and `scantxoutset` over every key, current and retired, adds confirmed coins the file never
 heard of (a close's change or a refund that landed while the signer was down).
+
+AGP-069 M1: a coin records whether it is a coinbase output and its block ("coinbase", "height", from
+scantxoutset, gettxout's confirmations at its bestblock, or the transaction's vin[0]). A coinbase coin
+is spent only once the node's coinbase maturity (getdeploymentinfo, maturity.py) allows; when the node
+cannot say (the light backend has no getdeploymentinfo), it waits.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from pathlib import Path
 
 from .b1path import ensure_b1
 from .keystore import KeyStore, KeyStoreError, write_private
+from .maturity import Maturity
 from .rpc import KnotsRpc, KnotsRpcError
 from .sigaudit import NullAudit
 
@@ -56,6 +62,15 @@ UTXO_AAD = "b2/hot-utxos"
 MAX_STALE = 500
 CLOSE_MAX_OUTPUTS = 4        # a close has 1-3 outputs (payee, our change, a hash lock)
 CLOSE_SCAN_MAX = 144         # blocks one learn_close_change call reads; the next call goes on from there
+
+
+def _coinbase_fields(height: int | None) -> dict:
+    return {"coinbase": True, **({"height": int(height)} if isinstance(height, int) else {})}
+
+
+def _scanned(c: dict) -> dict:
+    """The coinbase flag and block of one scantxoutset unspent."""
+    return _coinbase_fields(c.get("height")) if c.get("coinbase") else {}
 
 
 class HotCapError(RuntimeError):
@@ -183,6 +198,9 @@ class HotWallet:
         c = {"txid": str(u["txid"]), "vout": int(u["vout"]), "value": int(u["value"]), "spk": str(u.get("spk") or "")}
         if u.get("why"):
             c["why"] = str(u["why"])
+        if u.get("coinbase"):
+            h = u.get("height")
+            c |= _coinbase_fields(h if isinstance(h, int) and not isinstance(h, bool) and 0 <= h < 1 << 32 else None)
         return c
 
     def _persist_utxos(self) -> None:
@@ -222,7 +240,11 @@ class HotWallet:
             if (u.get("spk") and spk and spk != u["spk"]) or value != int(u["value"]) or self._key_for_spk(spk or u["spk"]) is None:
                 out["dropped"] += 1   # the node disagrees with the file: the node wins
                 continue
-            keep.append({k: v for k, v in u.items() if k != "why"} | {"spk": spk or u["spk"]})
+            c = {k: v for k, v in u.items() if k not in ("why", "coinbase", "height")} | {"spk": spk or u["spk"]}
+            if r.get("coinbase"):
+                h = u.get("height") if u.get("coinbase") else None
+                c |= _coinbase_fields(h if h is not None else self._txout_height(r))
+            keep.append(c)
             out["restored" if was_stale else "kept"] += 1
         if scan:
             try:
@@ -233,7 +255,7 @@ class HotWallet:
                     if op in have or self._key_for_spk(c.get("scriptPubKey", "")) is None:
                         continue
                     keep.append({"txid": c["txid"], "vout": int(c["vout"]),
-                                 "value": int(round(float(c["amount"]) * XBT_SATS)), "spk": c["scriptPubKey"]})
+                                 "value": int(round(float(c["amount"]) * XBT_SATS)), "spk": c["scriptPubKey"]} | _scanned(c))
                     stale = [x for x in stale if (x["txid"], int(x["vout"])) != op]
                     have.add(op)
                     out["found"] += 1
@@ -254,12 +276,36 @@ class HotWallet:
     def _key_for_spk(self, spk_hex: str) -> _Key | None:
         return next((k for k in self._keys() if k.spk.hex() == spk_hex), None)
 
-    def notice_utxo(self, txid: str, vout: int, value_sats: int, spk: str = "") -> None:
+    def notice_utxo(self, txid: str, vout: int, value_sats: int, spk: str = "", *, extra: dict | None = None) -> None:
         spk = spk or self.spk.hex()
         if not any(u["txid"] == txid and u["vout"] == vout for u in self._utxos):
-            self._utxos.append({"txid": txid, "vout": int(vout), "value": int(value_sats), "spk": spk})
+            self._utxos.append({"txid": txid, "vout": int(vout), "value": int(value_sats), "spk": spk} | (extra or {}))
             self._stale = [u for u in self._stale if (u["txid"], int(u["vout"])) != (txid, int(vout))]
             self._persist_utxos()
+
+    def _txout_height(self, r: dict) -> int | None:
+        """A coinbase output's block from a gettxout answer: its confirmations counted back from the
+        bestblock they were counted at."""
+        try:
+            conf = int(r.get("confirmations") or 0)
+            if conf <= 0 or not r.get("bestblock"):
+                return None
+            return int(self.rpc.call("getblockheader", r["bestblock"], True)["height"]) - conf + 1
+        except Exception:
+            return None
+
+    def _tx_height(self, raw: dict, looked_in: str) -> int | None:
+        """The block of a confirmed transaction from its verbose form (height, else its blockhash, else
+        the block it was looked up in)."""
+        if isinstance(raw.get("height"), int):
+            return raw["height"]
+        bh = raw.get("blockhash") or looked_in
+        if not bh:
+            return None
+        try:
+            return int(self.rpc.call("getblockheader", bh, True)["height"])
+        except Exception:
+            return None
 
     def scan_from_txid(self, txid: str, *, unspent_only: bool = False, blockhash: str = "") -> int:
         """Notice this tx's outputs to any hot key. `unspent_only` (AGP-016, for closes found after the
@@ -271,6 +317,8 @@ class HotWallet:
         raw = get_tx(self.rpc, txid, blockhash)
         if raw is None:
             return self._scan_utxoset_for(txid)
+        vin = raw.get("vin") or []
+        cb = _coinbase_fields(self._tx_height(raw, blockhash)) if vin and "coinbase" in vin[0] else {}
         added = 0
         for o in raw.get("vout") or []:
             spk = (o.get("scriptPubKey") or {})
@@ -279,7 +327,7 @@ class HotWallet:
             if k is not None and unspent_only and not self.rpc.call("gettxout", txid, int(o["n"]), True):
                 continue
             if k is not None:
-                self.notice_utxo(txid, int(o["n"]), int(round(float(o["value"]) * XBT_SATS)), k.spk.hex())
+                self.notice_utxo(txid, int(o["n"]), int(round(float(o["value"]) * XBT_SATS)), k.spk.hex(), extra=cb)
                 added += 1
         return added
 
@@ -367,7 +415,8 @@ class HotWallet:
         for c in (res or {}).get("unspents") or []:
             k = self._key_for_spk(c.get("scriptPubKey", ""))
             if c.get("txid") == txid and k is not None:
-                self.notice_utxo(txid, int(c["vout"]), int(round(float(c["amount"]) * XBT_SATS)), k.spk.hex())
+                self.notice_utxo(txid, int(c["vout"]), int(round(float(c["amount"]) * XBT_SATS)), k.spk.hex(),
+                                 extra=_scanned(c))
                 added += 1
         return added
 
@@ -396,6 +445,7 @@ class HotWallet:
             "hot_spk": self.spk.hex(),
             "hot_sats": self.balance_sats(),
             "hot_utxos": len(self._utxos),
+            "hot_coinbase_sats": sum(int(u["value"]) for u in self._utxos if u.get("coinbase")),
             "hot_stale_utxos": len(self._stale),
             "hot_encrypted": self.encrypted,
             "hot_retired_keys": len(self._retired),
@@ -405,6 +455,30 @@ class HotWallet:
         }
 
     # --- spending ----------------------------------------------------------------------------------
+    def spendable(self, coins: list[dict]) -> tuple[list[dict], int]:
+        """`coins` less every coinbase coin the node would not relay a spend of yet, and the sats held
+        back. The depth is the node's (getdeploymentinfo, Maturity.relay_at); when the node cannot say
+        (no deployment info, no tip, no block for the coin), the coin waits."""
+        if not any(u.get("coinbase") for u in coins):
+            return list(coins), 0
+        try:
+            rule = Maturity.from_deployments(self.rpc.call("getdeploymentinfo"))
+        except Exception:
+            rule = None
+        try:
+            tip = int(self.rpc.call("getblockcount"))
+        except Exception:
+            tip = None
+        ok, held = [], 0
+        for u in coins:
+            h = u.get("height")
+            if not u.get("coinbase") or (rule is not None and tip is not None and isinstance(h, int)
+                                         and tip + 1 >= rule.relay_at(h)):
+                ok.append(u)
+            else:
+                held += int(u["value"])
+        return ok, held
+
     def _spend(self, utxos: list[dict], outs: list[TxOut], kind: str, **audit) -> str:
         """Sign every input 0x21 with the key that owns it, broadcast, forget the spent coins."""
         prep = self._prepare(utxos, outs, kind, **audit)
@@ -476,9 +550,11 @@ class HotWallet:
         if sats <= 0:
             raise ValueError("fund amount must be positive")
         need = sats + fee
-        utxo = next((u for u in self._current_utxos() if int(u["value"]) >= need), None)
+        ok, held = self.spendable(self._current_utxos())
+        utxo = next((u for u in ok if int(u["value"]) >= need), None)
         if utxo is None:
-            raise RuntimeError(f"hot wallet has no UTXO ≥ {need} sats (have {self.balance_sats()})")
+            immature = f", {held} of it immature coinbase" if held else ""
+            raise RuntimeError(f"hot wallet has no UTXO ≥ {need} sats (have {self.balance_sats()}{immature})")
         change = int(utxo["value"]) - need
         outs = [TxOut(sats, dest_spk)]
         if change >= DUST:
@@ -502,25 +578,26 @@ class HotWallet:
         self._current = new
         self._persist()  # the new key is on disk before any coin moves to it
         out = {"old_address": old.address, "new_address": new.address, "sweep": None}
-        coins = self._retired_utxos()
+        coins = self.spendable(self._retired_utxos())[0]
         if coins:
             out["sweep"] = self._sweep(coins, new.spk, "rotation_sweep", old_key=old.spk.hex())
         return out
 
     def sweep_retired(self) -> dict | None:
         """Sweep coins that reached a retired key (a channel close or refund to an old address)."""
-        coins = self._retired_utxos()
+        coins = self.spendable(self._retired_utxos())[0]
         if not coins or sum(int(u["value"]) for u in coins) - SWEEP_FEE_BASE - SWEEP_FEE_PER_INPUT * len(coins) < DUST:
             return None
         return self._sweep(coins, self.spk, "retired_sweep")
 
     def sweep_to(self, dest_spk: bytes, amount_sats: int, fee: int = DEFAULT_FEE) -> dict:
         """Human-approved sweep of `amount_sats` out of the hot key (the signer checks the signature)."""
-        coins = list(self._utxos)
+        coins, held = self.spendable(list(self._utxos))
         total = sum(int(u["value"]) for u in coins)
         fee = max(fee, SWEEP_FEE_BASE + SWEEP_FEE_PER_INPUT * len(coins))
         if amount_sats < DUST or amount_sats + fee > total:
-            raise RuntimeError(f"cannot sweep {amount_sats} sats from {total}")
+            immature = f" (and {held} immature coinbase)" if held else ""
+            raise RuntimeError(f"cannot sweep {amount_sats} sats from {total}{immature}")
         change = total - amount_sats - fee
         outs = [TxOut(amount_sats, dest_spk)]
         if change >= DUST:

@@ -19,10 +19,11 @@ import socket
 import socketserver
 import struct
 import threading
+import time
 
 from _agp017 import PrunedChain
 
-from agentwallet.headers import merkle_branch, merkle_root, parse_header
+from agentwallet.headers import PRIOR_HEADERS, merkle_branch, merkle_root, parse_header, v1_hash
 from xbt402.tx import Tx, TxIn, TxOut
 
 REGTEST_BITS = 0x207FFFFF
@@ -48,6 +49,24 @@ def mine_header(prev_hash: str, merkle: bytes, height: int, txcount: int, t: int
         nonce += 1
 
 
+def v1_header(prev_hash: str, merkle: bytes, t: int, bits: int = REGTEST_BITS) -> bytes:
+    """An 80-byte v1 header (below the BLAKE2b switch only its link and time are checked)."""
+    return struct.pack("<I", 0x2000_0000) + bytes.fromhex(prev_hash)[::-1] + merkle + struct.pack("<III", t, bits, 0)
+
+
+def junk_header(height: int) -> bytes:
+    """A well-formed v2 header at `height` that links to nothing we have."""
+    b = bytearray(164)
+    b[0:4] = struct.pack("<I", 0x2000_0000 | 0x8000_0000)
+    b[4:36] = b"\xee" * 32
+    b[36:40] = struct.pack("<I", height)
+    b[68:72] = struct.pack("<I", (T0 + 60 * height) & 0xFFFF_FFFF)
+    b[72:76] = struct.pack("<I", REGTEST_BITS)
+    b[108:110] = struct.pack("<H", 1)
+    b[128:132] = struct.pack("<I", height)
+    return bytes(b)
+
+
 def coinbase(height: int, salt: bytes = b"") -> Tx:
     return Tx(version=2, inputs=[TxIn(bytes(32), 0xFFFF_FFFF, 0xFFFF_FFFF, struct.pack("<I", height) + salt)],
               outputs=[TxOut(312_500_000, bytes.fromhex("0014" + "11" * 20))], locktime=0)
@@ -64,7 +83,11 @@ class SimChain(PrunedChain):
         self.hdr: dict[int, bytes] = {}
         self.hash_at: dict[int, str] = {}
         self.listeners: list = []
-        self._mine_one(prev="ab" * 32, txs=[])      # block 101: the checkpoint
+        prev = "ab" * 32
+        for h in range(CHECKPOINT - PRIOR_HEADERS, CHECKPOINT):   # v1 headers below the checkpoint
+            self.hdr[h] = v1_header(prev, (salt or b"\0").ljust(32, b"\0")[:32], T0 + 60 * h)
+            prev = v1_hash(self.hdr[h])
+        self._mine_one(prev=prev, txs=[])           # block 101: the checkpoint
         self.mine(height - CHECKPOINT)
 
     # --- the chain -----------------------------------------------------------------------------------
@@ -171,6 +194,9 @@ class FakeElectrum:
         self.extra_history: dict[str, list] = {}  # scripthash -> extra entries
         self.extra_raw: dict[str, str] = {}      # txid -> hex for invented transactions
         self.headers: dict[int, bytes] | None = None   # another header chain
+        self.fake_tip: bytes | None = None       # the tip headers.subscribe claims
+        self.junk_above: int | None = None       # serve junk_header()s above this height, as many as asked
+        self.delay_headers_s = 0.0               # sleep before answering each blockchain.block.headers
         self.down = False
         self.calls: list[str] = []
         self._clients: list = []
@@ -262,12 +288,20 @@ class FakeElectrum:
             return ["fake-electrs/0.11.1", "1.8"]
         if method == "blockchain.headers.subscribe":
             client.tip_sub = True
+            if self.fake_tip is not None:
+                return {"hex": self.fake_tip.hex(), "height": parse_header(self.fake_tip).height}
             return {"hex": self._hdrs()[self._tip()].hex(), "height": self._tip()}
         if method == "blockchain.block.header":
+            if self.junk_above is not None and int(p[0]) > self.junk_above:
+                return junk_header(int(p[0])).hex()
             return self._hdrs()[int(p[0])].hex()
         if method == "blockchain.block.headers":
+            if self.delay_headers_s:
+                time.sleep(self.delay_headers_s)
             start, count = int(p[0]), min(int(p[1]), 2016)
-            hs = [self._hdrs()[h].hex() for h in range(start, start + count) if h in self._hdrs()]
+            junk = self.junk_above
+            hs = [junk_header(h).hex() if junk is not None and h > junk else self._hdrs()[h].hex()
+                  for h in range(start, start + count) if h in self._hdrs() or (junk is not None and h > junk)]
             return {"count": len(hs), "hex": "".join(hs), "max": 2016}
         if method == "blockchain.transaction.get":
             txid = p[0]

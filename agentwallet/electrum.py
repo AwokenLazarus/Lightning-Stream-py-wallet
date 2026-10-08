@@ -6,9 +6,15 @@ RPCs (getbalances, sendtoaddress, fundrawtransaction, ...) and mining are not av
 client has no node wallet and never mines.
 
 Trust (see docs/B2_CHAIN_BACKEND.md for the full threat model):
-  * Headers: our own chain from a pinned post-fork checkpoint, each header's BLAKE2b PoW and nBits
-    checked (headers.py); the most-work chain any server shows wins. A server cannot move us to a
-    chain with less work, or below the checkpoint.
+  * Headers: our own chain from a pinned post-fork checkpoint, each header's BLAKE2b PoW, nBits,
+    flags, version and median time checked as it arrives, chunk by chunk (headers.py); the most-work
+    chain any server shows wins. A server cannot move us to a chain with less work, or below the
+    checkpoint; a claimed tip beyond one block per 150 s since our tip (plus 2016) is not fetched.
+  * Mainnet: until the chain reaches Knots' pinned block 964264, carries Knots' nMinimumChainWork and
+    its tip is not implausibly far behind the clock, every chain answer is withheld (ImplausibleChain).
+    Servers must be ssl:// (certificates verified); plain tcp:// only to a loopback host.
+  * No lock is held across a network read: one sync runs at a time, servers in parallel, and a
+    caller with a verified chain answers from it rather than wait for a sync in flight.
   * Transactions: a raw tx is accepted only if it re-serializes byte for byte and hashes to the txid
     asked for. A transaction counts as confirmed only with a Merkle proof into one of our headers
     whose committed transaction count fits the proof. Confirmations, the funding's block, a close
@@ -27,12 +33,15 @@ asking) and makes the refund at expiry fail at broadcast; neither loses coins.
 
 from __future__ import annotations
 
+import ipaddress
 import itertools
 import json
 import socket
 import ssl
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -41,6 +50,8 @@ from .headers import (
     MAINNET_CHECKPOINT,
     HeaderChain,
     HeaderError,
+    check_pow,
+    mainnet_min_work_above,
     merkle_root_from_proof,
     parse_header,
     rules_for,
@@ -58,6 +69,7 @@ PROTOCOL = ["1.4", "1.8"]          # electrs refuses < 1.8 on a chain with v2 he
 HEADERS_CHUNK = 2016
 CLIENT_NAME = "b2-agentwallet"
 STALE_TIP_S = 3 * 60 * 60
+TIP_CAP_SPACING_S = 150            # a quarter of the target spacing: claimed tips beyond it are not fetched
 NODE_ONLY = {
     "getbalances", "getbalance", "sendtoaddress", "listunspent", "createrawtransaction", "fundrawtransaction",
     "signrawtransactionwithwallet", "getnewaddress", "generatetoaddress", "generatetodescriptor", "generateblock",
@@ -77,8 +89,39 @@ class LightBackendError(ElectrumError):
     """The call needs a full node (a node wallet, blocks, or mining)."""
 
 
+class ImplausibleChain(ElectrumError):
+    """The verified chain is not believable yet (Plausibility): nothing is answered from it."""
+
+
 class _OffCheckpoint(HeaderError):
     pass
+
+
+@dataclass(frozen=True)
+class Plausibility:
+    """When the verified chain is believable (HeaderChain.implausible)."""
+    min_work_above: int              # work the chain must carry above the checkpoint
+    floor_spacing_s: int = 600       # the tip may trail one block per floor_spacing_s since the newest
+    floor_slack: int = HEADERS_CHUNK  # pinned block held (or the checkpoint) by at most floor_slack
+
+    @classmethod
+    def mainnet(cls, checkpoint: tuple[int, str]) -> "Plausibility":
+        """Knots' nMinimumChainWork less the checkpoint's chainwork (0 for a checkpoint of unknown
+        chainwork, which must still reach the pinned block 964264)."""
+        return cls(min_work_above=mainnet_min_work_above(checkpoint) or 0)
+
+
+def is_loopback_host(host: str) -> bool:
+    """localhost, 127.0.0.0/8, ::1 or an IPv4-mapped loopback address."""
+    h = host.rstrip(".").strip("[]")
+    if h.lower() == "localhost":
+        return True
+    try:
+        a = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    mapped = getattr(a, "ipv4_mapped", None)
+    return a.is_loopback or bool(mapped and mapped.is_loopback)
 
 
 def scripthash(spk: bytes) -> str:
@@ -226,10 +269,22 @@ class ElectrumBackend:
 
     def __init__(self, servers: list[str], *, chain: str, checkpoint: tuple[int, str] | None = None,
                  store_path: Path | None = None, timeout: float = 15.0, min_servers: int | None = None,
-                 sync_interval: float = 1.0, connection=ElectrumConnection, clock=time.time):
+                 sync_interval: float = 1.0, connection=ElectrumConnection, clock=time.time,
+                 plausibility: Plausibility | None = None, tip_cap_spacing_s: int | None = None):
+        """`tip_cap_spacing_s`: a claimed tip is believed up to one block per this many seconds since our
+        tip's time, plus HEADERS_CHUNK. None: TIP_CAP_SPACING_S on mainnet, no cap elsewhere (regtest
+        mines blocks as fast as it is asked to)."""
         if not servers:
             raise ElectrumError("no Electrum servers configured (B2_ELECTRUM_SERVERS)")
-        rules_for(chain)
+        try:
+            rules_for(chain)
+        except HeaderError as e:
+            raise ElectrumError(str(e)) from e
+        if chain == "main":
+            for u in servers:
+                host, _, tls = parse_server(u)
+                if not tls and not is_loopback_host(host):
+                    raise ElectrumError(f"{u}: mainnet needs ssl:// (TLS); plain tcp:// only to a loopback host")
         if checkpoint is None:
             if chain != "main":
                 raise ElectrumError(f"a {chain} light backend needs a pinned checkpoint (B2_ELECTRUM_CHECKPOINT)")
@@ -238,12 +293,16 @@ class ElectrumBackend:
         self.hrp = HRP[chain]
         self.wallet = "light"
         self.allow_generate = False
+        self.clock = clock
         self.headers = HeaderChain(chain, checkpoint, store_path, clock=clock)
+        self.plausibility = plausibility or (Plausibility.mainnet(checkpoint) if chain == "main" else None)
+        self.tip_cap_spacing_s = tip_cap_spacing_s or (TIP_CAP_SPACING_S if chain == "main" else None)
         self.conns = [connection(u, timeout=timeout, on_notify=self._on_notify) for u in servers]
         self.min_servers = max(1, min(len(self.conns), int(min_servers if min_servers is not None
                                                            else (2 if chain == "main" else 1))))
         self.sync_interval = float(sync_interval)
-        self._sync_lock = threading.RLock()
+        self._sync_gate = threading.Lock()       # the one sync in flight; never held by a caller that only reads
+        self._flag_lock = threading.Lock()
         self._last_sync = 0.0
         self._tip_dirty = True
         self._changed = threading.Event()
@@ -256,24 +315,36 @@ class ElectrumBackend:
     # --- plumbing ------------------------------------------------------------------------------------
     def _flag(self, conn, reason: str) -> None:
         """A server answered something that failed verification (or failed to answer)."""
-        st = self.server_state.setdefault(conn.url, {})
-        st["last_error"] = str(reason)[:200]
-        st["errors"] = int(st.get("errors") or 0) + 1
-        self.flags = (self.flags + [{"server": conn.url, "reason": str(reason)[:200], "t": round(time.time(), 3)}])[-50:]
+        with self._flag_lock:
+            st = self.server_state.setdefault(conn.url, {})
+            st["last_error"] = str(reason)[:200]
+            st["errors"] = int(st.get("errors") or 0) + 1
+            self.flags = (self.flags + [{"server": conn.url, "reason": str(reason)[:200], "t": round(time.time(), 3)}])[-50:]
+
+    @staticmethod
+    def _each(conns: list, fn) -> list:
+        """fn(conn) for every connection, in parallel; each result or the exception it raised."""
+        def run(c):
+            try:
+                return fn(c)
+            except Exception as e:     # noqa: BLE001 - handed back to the caller, per server
+                return e
+        if len(conns) <= 1:
+            return [run(c) for c in conns]
+        with ThreadPoolExecutor(max_workers=len(conns)) as ex:
+            return list(ex.map(run, conns))
 
     def _live(self) -> list:
-        live = []
-        for c in self.conns:
-            if not c.connected:
-                try:
-                    c.connect()
-                    self.server_state[c.url].update(proto=c.proto, server=c.server_id)
-                    for sh in self._watched:
-                        c.subscribe("blockchain.scripthash.subscribe", sh)
-                except Exception as e:
-                    self._flag(c, f"unreachable: {e}")
-                    continue
-            live.append(c)
+        def up(c):
+            c.connect()
+            self.server_state[c.url].update(proto=c.proto, server=c.server_id)
+            for sh in list(self._watched):
+                c.subscribe("blockchain.scripthash.subscribe", sh)
+        down = [c for c in self.conns if not c.connected]
+        for c, r in zip(down, self._each(down, up)):
+            if isinstance(r, Exception):
+                self._flag(c, f"unreachable: {r}")
+        live = [c for c in self.conns if c.connected]
         if len(live) < self.min_servers:
             raise ElectrumError(f"{len(live)} of {len(self.conns)} Electrum servers reachable; "
                                 f"at least {self.min_servers} needed")
@@ -293,69 +364,120 @@ class ElectrumBackend:
 
     # --- headers -------------------------------------------------------------------------------------
     def sync(self, force: bool = False) -> int:
-        """Bring the header chain up to the most-work tip any live server shows."""
-        with self._sync_lock:
-            if force or self._tip_dirty or time.time() - self._last_sync >= self.sync_interval \
-                    or not self.headers.ready:
-                self._tip_dirty = False
-                off_chain = []
-                for c in self._live():
-                    try:
-                        self._sync_from(c)
-                    except _OffCheckpoint as e:
-                        off_chain.append(f"{c.url}: {e}")
-                        self._flag(c, f"headers: {e}")
-                    except (ElectrumError, HeaderError, ValueError, KeyError, TypeError) as e:
-                        self._flag(c, f"headers: {e}")
-                self._last_sync = time.time()
-                for c in self.conns:
-                    st = self.server_state.get(c.url) or {}
-                    if st.get("tip_hash") and self.headers.ready:
-                        mine = self.headers.at(int(st.get("tip") or 0))
-                        st["on_best_chain"] = bool(mine and mine.hash == st["tip_hash"])
-                if not self.headers.ready and off_chain:
-                    raise CheckpointMismatch(f"no server is on the {self.chain} checkpoint "
-                                             f"{self.headers.cp_height}:{self.headers.cp_hash[:16]}.. ({'; '.join(off_chain)[:300]})")
-            if not self.headers.ready:
-                raise ElectrumError("no Electrum server served the pinned checkpoint")
-            return self.headers.tip_height
+        """Bring the header chain up to the most-work tip any live server shows; returns our tip. With a
+        verified chain, a call that finds another sync in flight answers from the chain as it is."""
+        if force or self._tip_dirty or time.time() - self._last_sync >= self.sync_interval or not self.headers.ready:
+            if self._sync_gate.acquire(blocking=not self.headers.ready):
+                try:
+                    self._sync_now()
+                finally:
+                    self._sync_gate.release()
+        return self._believable()
+
+    def _sync_now(self) -> None:
+        self._tip_dirty = False
+        live = self._live()
+        off_chain = []
+        for c, r in zip(live, self._each(live, self._sync_from)):
+            if isinstance(r, _OffCheckpoint):
+                off_chain.append(f"{c.url}: {r}")
+                self._flag(c, f"headers: {r}")
+            elif isinstance(r, Exception):
+                self._flag(c, f"headers: {r}")
+        self._last_sync = time.time()
+        for c in self.conns:
+            st = self.server_state.get(c.url) or {}
+            if st.get("tip_hash") and self.headers.ready:
+                mine = self.headers.at(int(st.get("tip") or 0))
+                st["on_best_chain"] = bool(mine and mine.hash == st["tip_hash"])
+        if not self.headers.ready and off_chain:
+            raise CheckpointMismatch(f"no server is on the {self.chain} checkpoint "
+                                     f"{self.headers.cp_height}:{self.headers.cp_hash[:16]}.. ({'; '.join(off_chain)[:300]})")
+
+    def _implausible(self) -> str | None:
+        p = self.plausibility
+        return self.headers.implausible(p.min_work_above, (p.floor_spacing_s, p.floor_slack)) if p else None
+
+    def _believable(self) -> int:
+        """Our tip, if the chain can be answered from."""
+        if not self.headers.ready:
+            raise ElectrumError("no Electrum server served the pinned checkpoint")
+        why = self._implausible()
+        if why:
+            raise ImplausibleChain(f"the verified chain is not believable yet: {why}")
+        return self.headers.tip_height
 
     def _header(self, conn, height: int) -> bytes:
         return bytes.fromhex(self._ask(conn, "blockchain.block.header", int(height)))
 
+    def _fetch_checkpoint(self, conn) -> None:
+        """The checkpoint header and the headers below it that the median-time rule needs."""
+        cp, n = self.headers.cp_height, self.headers.prior_needed
+        try:
+            raw = self._header(conn, cp)
+            prior = []
+            if n:
+                r = self._ask(conn, "blockchain.block.headers", cp - n, n)
+                prior = split_headers(bytes.fromhex(r.get("hex") or ""))
+            self.headers.set_checkpoint(raw, prior)
+        except (HeaderError, ElectrumError, ValueError, AttributeError) as e:
+            raise _OffCheckpoint(str(e)) from e
+
     def _sync_from(self, conn) -> None:
         tip = conn.subscribe("blockchain.headers.subscribe")
         th = int(tip["height"])
-        th_hash = parse_header(bytes.fromhex(tip["hex"])).hash
-        self.server_state[conn.url].update(tip=th, tip_hash=th_hash)
+        tip_h = parse_header(bytes.fromhex(tip["hex"]))
+        self.server_state[conn.url].update(tip=th, tip_hash=tip_h.hash)
         cp = self.headers.cp_height
         if th < cp:
             raise _OffCheckpoint(f"server tip {th} is below the checkpoint {cp}")
+        if tip_h.height != th:
+            raise HeaderError(f"tip at {th} commits height {tip_h.height}")
+        try:
+            check_pow(tip_h, self.headers.rules)
+        except HeaderError as e:                     # before we hold a chain: another chain's PoW
+            raise (HeaderError if self.headers.ready else _OffCheckpoint)(f"tip at {th}: {e}") from e
         if not self.headers.ready:
-            try:
-                self.headers.set_checkpoint(self._header(conn, cp))
-            except HeaderError as e:
-                raise _OffCheckpoint(str(e)) from e
-        ours = self.headers.tip_height
+            self._fetch_checkpoint(conn)
+        ours, our_time = self.headers.tip_height, self.headers.tip().time
         mine = self.headers.at(th)
-        if mine is not None and mine.hash == th_hash:
+        if mine is not None and mine.hash == tip_h.hash:
             return                                   # its tip is on our chain already
+        cap = th
+        if self.tip_cap_spacing_s:
+            cap = ours + max(0, int(self.clock()) - our_time) // self.tip_cap_spacing_s + HEADERS_CHUNK
+        end = min(th, cap)
+        if th > cap:
+            self._flag(conn, f"headers: claims tip {th}, beyond the plausible {cap}: nothing above it is fetched")
         # the highest height where the server agrees with us (the checkpoint at worst)
-        h, step = min(th, ours), 1
+        h, step = min(end, ours), 1
         while h > cp:
-            if parse_header(self._header(conn, h)).hash == self.headers.at(h).hash:
+            theirs = parse_header(self._header(conn, h))
+            m = self.headers.at(h)
+            if m is not None and theirs.hash == m.hash:
                 break
             h, step = max(cp, h - step), step * 2
-        raws, start = [], h + 1
-        while start <= th:
-            r = self._ask(conn, "blockchain.block.headers", start, min(HEADERS_CHUNK, th - start + 1))
+        b = self.headers.branch(h)
+        start, bad = h + 1, None
+        while start <= end:
+            r = self._ask(conn, "blockchain.block.headers", start, min(HEADERS_CHUNK, end - start + 1))
             chunk = split_headers(bytes.fromhex(r.get("hex") or ""))
             if not chunk:
+                break                                # withheld: keep what we have, most work still decides
+            before = len(b)
+            try:
+                b.extend(chunk)
+            except HeaderError as e:
+                bad = e
+            start += len(b) - before
+            if bad:
                 break
-            raws += chunk
-            start += len(chunk)
-        if raws:
-            self.headers.connect(h, raws)
+        if len(b):
+            self.headers.adopt(b)
+        if bad:
+            raise HeaderError(f"block.headers: {bad} (the headers before it were kept)")
+        if start <= end:
+            raise ElectrumError(f"withheld headers: served up to {start - 1}, claims tip {th}")
 
     # --- verified transactions -----------------------------------------------------------------------
     def _fetch_tx(self, txid: str) -> Tx | None:
@@ -627,8 +749,9 @@ class ElectrumBackend:
                     continue
                 value = tx.outputs[n].value
                 total += value
+                coinbase = len(tx.inputs) == 1 and tx.inputs[0].txid == bytes(32) and tx.inputs[0].vout == 0xFFFF_FFFF
                 unspents.append({"txid": txid, "vout": n, "scriptPubKey": spk.hex(), "desc": d,
-                                 "amount": value / XBT_SATS, "height": st[0]})
+                                 "amount": value / XBT_SATS, "coinbase": coinbase, "height": st[0], "blockhash": st[1]})
         return {"success": True, "height": self.headers.tip_height, "bestblock": self.headers.tip().hash,
                 "unspents": unspents, "total_amount": total / XBT_SATS}
 
@@ -674,6 +797,8 @@ class ElectrumBackend:
                 # a tip hours old on mainnet means every server is behind, or withholding blocks
                 "tip_age_s": tip_age, "tip_stale": bool(tip_age is not None and self.chain == "main"
                                                         and tip_age > STALE_TIP_S),
+                # why every chain answer is withheld, or None
+                "implausible": self._implausible() if self.headers.ready else "no verified headers yet",
                 "min_servers": self.min_servers, "watched_scripts": len(self._watched),
                 "servers": [{"url": c.url, "connected": c.connected, **(self.server_state.get(c.url) or {})}
                             for c in self.conns],
@@ -698,5 +823,5 @@ def servers_from_env(value: str | None) -> list[str]:
     return [s.strip() for s in (value or "").split(",") if s.strip()]
 
 
-__all__ = ["ElectrumBackend", "ElectrumConnection", "ElectrumError", "CheckpointMismatch", "LightBackendError", "scripthash",
-           "checkpoint_from_env", "servers_from_env"]
+__all__ = ["ElectrumBackend", "ElectrumConnection", "ElectrumError", "CheckpointMismatch", "LightBackendError",
+           "ImplausibleChain", "Plausibility", "is_loopback_host", "scripthash", "checkpoint_from_env", "servers_from_env"]
