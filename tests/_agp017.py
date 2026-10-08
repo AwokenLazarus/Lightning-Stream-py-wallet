@@ -35,6 +35,8 @@ class PrunedChain:
         self.calls: list[str] = []
         self.reject: str | None = None
         self.mined_by_signer = 0
+        self.coinbase: set[str] = set()
+        self.deployments: dict | None = None       # getdeploymentinfo; None: the node does not answer it
 
     # --- helpers for tests ------------------------------------------------------------------------
     def bhash(self, h: int) -> str:
@@ -53,6 +55,16 @@ class PrunedChain:
             self.conf_height[txid] = self.height
         else:
             self.mempool[txid] = tx
+
+    def credit_coinbase(self, txid: str, vout: int, sats: int, spk: str) -> None:
+        """A coinbase paying `sats` to `spk`, in a block at the current height."""
+        tx = {"txid": txid, "hex": "", "vin": [{"coinbase": "03c80000", "sequence": 0xFFFF_FFFF}],
+              "vout": [{"n": n, "value": 0, "scriptPubKey": {"hex": ""}} for n in range(vout)]
+              + [{"n": vout, "value": sats / 1e8, "scriptPubKey": {"hex": spk}}]}
+        self.utxos[(txid, vout)] = {"value": sats, "spk": spk}
+        self.blocks.setdefault(self.height, []).append(tx)
+        self.conf_height[txid] = self.height
+        self.coinbase.add(txid)
 
     def mine(self, n: int = 1) -> None:
         for _ in range(n):
@@ -118,7 +130,7 @@ class PrunedChain:
             else:
                 confs = self.height - self.conf_height.get(txid, self.height) + 1
             return {"bestblock": self.bhash(self.height), "confirmations": confs, "value": u["value"] / 1e8,
-                    "scriptPubKey": {"hex": u["spk"]}, "coinbase": False}
+                    "scriptPubKey": {"hex": u["spk"]}, "coinbase": txid in self.coinbase}
         if method == "getrawtransaction":
             txid = p[0]
             if txid in self.mempool:
@@ -140,8 +152,13 @@ class PrunedChain:
         if method == "scantxoutset":
             want = {d[4:-1] for d in p[1] if d.startswith("raw(")}
             return {"success": True, "unspents": [
-                {"txid": t, "vout": v, "scriptPubKey": u["spk"], "amount": u["value"] / 1e8}
+                {"txid": t, "vout": v, "scriptPubKey": u["spk"], "amount": u["value"] / 1e8,
+                 "coinbase": t in self.coinbase, "height": self.conf_height.get(t)}
                 for (t, v), u in self.utxos.items() if u["spk"] in want and t not in self.mempool]}
+        if method == "getdeploymentinfo":
+            if self.deployments is None:
+                raise RpcError("Method not found")
+            return self.deployments
         if method == "getnewaddress":
             return "bcrt1qmine"
         if method == "generatetoaddress":

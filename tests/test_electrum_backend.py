@@ -27,6 +27,7 @@ from unittest import mock
 from agentwallet import chain as chainbackend
 from agentwallet.electrum import ElectrumBackend, ElectrumError, LightBackendError, scripthash
 from agentwallet.headers import (
+    PRIOR_HEADERS,
     RULES,
     Header,
     HeaderChain,
@@ -36,13 +37,14 @@ from agentwallet.headers import (
     parse_header,
     target_to_bits,
     bits_to_target,
+    v1_hash,
     v2_stages,
 )
 from agentwallet.rpc import KnotsRpc
 from agentwallet.signer import Signer
 
 from _agp013 import keyfile_env
-from _electrum_sim import CHECKPOINT, FakeElectrum, SimChain, T0, coinbase, mine_header
+from _electrum_sim import CHECKPOINT, FakeElectrum, SimChain, T0, coinbase, mine_header, v1_header
 from test_close_change import LaggedNode
 from test_mainnet_readiness import API, PAY_TO, Rpc1, runbook_policy
 
@@ -88,7 +90,7 @@ class HeaderVectors(unittest.TestCase):
         hs = {h["height"]: h for h in doc["headers"]}
         act = doc["activation_height"]
         c = HeaderChain("regtest", (act, hs[act]["hash"]))
-        c.set_checkpoint(bytes.fromhex(hs[act]["header"]))
+        c.set_checkpoint(bytes.fromhex(hs[act]["header"]), [bytes.fromhex(hs[h]["header"]) for h in range(act - c.prior_needed, act)])
         r = c.connect(act, [bytes.fromhex(hs[h]["header"]) for h in range(act + 1, max(hs) + 1)])
         self.assertEqual((r["adopted"], c.tip_height, c.tip().hash), (True, max(hs), hs[max(hs)]["hash"]))
 
@@ -114,13 +116,16 @@ class HeaderVectors(unittest.TestCase):
 
 class HeaderRules(unittest.TestCase):
     def chain(self, n=20):
-        prev, raws = "ab" * 32, []
+        prev, raws, self.priors = "ab" * 32, [], []
+        for h in range(CHECKPOINT - PRIOR_HEADERS, CHECKPOINT):
+            self.priors.append(v1_header(prev, bytes(32), T0 + 60 * h))
+            prev = v1_hash(self.priors[-1])
         for h in range(CHECKPOINT, CHECKPOINT + n):
             raw = mine_header(prev, bytes(32), h, 1, T0 + 60 * h)
             raws.append(raw)
             prev = parse_header(raw).hash
         c = HeaderChain("regtest", (CHECKPOINT, parse_header(raws[0]).hash))
-        c.set_checkpoint(raws[0])
+        c.set_checkpoint(raws[0], self.priors)
         return c, raws
 
     def child(self, c, **kw):
@@ -161,7 +166,7 @@ class HeaderRules(unittest.TestCase):
         c, raws = self.chain(2)
         other = HeaderChain("regtest", (CHECKPOINT, "00" * 32))
         with self.assertRaises(HeaderError):
-            other.set_checkpoint(raws[0])
+            other.set_checkpoint(raws[0], self.priors)
 
     def test_most_work_wins_and_ties_keep_ours(self):
         c, raws = self.chain(10)
@@ -182,11 +187,11 @@ class HeaderRules(unittest.TestCase):
         c, raws = self.chain(8)
         path = Path(tempfile.mkdtemp()) / "headers-regtest.bin"
         c2 = HeaderChain("regtest", (CHECKPOINT, c.cp_hash), path)
-        c2.set_checkpoint(raws[0])
+        c2.set_checkpoint(raws[0], self.priors)
         c2.connect(CHECKPOINT, raws[1:])
         self.assertEqual(HeaderChain("regtest", (CHECKPOINT, c.cp_hash), path).tip_height, CHECKPOINT + 7)
         blob = bytearray(path.read_bytes())
-        blob[164 * 3 + 76] ^= 0xFF                     # one nonce
+        blob[80 * PRIOR_HEADERS + 164 * 3 + 76] ^= 0xFF   # one nonce
         path.write_bytes(bytes(blob))
         self.assertFalse(HeaderChain("regtest", (CHECKPOINT, c.cp_hash), path).ready)
 
