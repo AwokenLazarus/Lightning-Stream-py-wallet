@@ -38,7 +38,7 @@ from xbt402.x402_channel import (  # noqa: E402
     facilitator_request,
     network_id,
     receipt_of,
-    request_digest,
+    request_digest_v2,
     safe_code,
     unb64json,
 )
@@ -54,12 +54,6 @@ def origin_of(url: str) -> str:
     if not p.scheme or not p.netloc:
         raise ValueError("xbt402_pay needs an absolute URL")
     return f"{p.scheme}://{p.netloc}"
-
-
-def request_target(url: str) -> str:
-    """Path + query as the provider sees it (B1 request_digest / ASGI raw_path)."""
-    parts = url.split("/", 3)
-    return "/" + parts[3] if len(parts) > 3 else "/"
 
 
 def pick_accept(pr: dict, network: str) -> dict:
@@ -140,7 +134,7 @@ class Xbt402Session:
         extra = acc.get("extra") or {}
         if extra.get("derivation") != DERIVATION:  # checked before funding: a mismatch strands the coins
             # no provider text in the wallet's own errors: the model reads them unlabelled (AGP-005 L12)
-            raise RuntimeError(f"provider payee-key derivation is not {DERIVATION!r}; refused before funding")
+            raise RuntimeError(f"provider channel binding (extra.derivation) is not {DERIVATION!r}; refused before funding")
         close_fee = int(extra.get("closeFeeSat") or 600)
         # the cap holds under payee-pays too: the least state is dust + closeFeeSat (xbt402 v1.2)
         if self.close_fee_max and close_fee > self.close_fee_max:
@@ -274,9 +268,10 @@ class Xbt402Session:
                            "retried by the watcher, refunded at expiry if never opened")
 
     def _with_auth(self, payload: dict, method: str, url: str, body: bytes) -> dict:
-        """H3: bind this payload to (method, path, body). The ECDH key stays in the book."""
+        """H3: bind this payload to (method, URL, body): scheme, host, port and target, length-prefixed
+        (xbt402 v1.3, AGP-068). The ECDH key stays in the book."""
         pl = dict(payload)
-        req = request_digest(method, request_target(url), body or b"")
+        req = request_digest_v2(method, url, body or b"")
         pl["auth"] = self.book.request_auth(pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
         return pl
 

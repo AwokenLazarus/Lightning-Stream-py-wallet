@@ -15,7 +15,7 @@ ensure_b1()
 from xbt402 import ecc  # noqa: E402
 from xbt402.channel import ChannelParams, channel_auth_key  # noqa: E402
 from xbt402.tx import SIGHASH_SINGLE_ACP_UNIFIED  # noqa: E402
-from xbt402.x402_channel import request_auth, request_digest  # noqa: E402
+from xbt402.x402_channel import request_auth, request_digest_v2  # noqa: E402
 
 DEST = "http://127.0.0.1:9"
 SEC = Path.home() / "xbt-rnd" / "b1" / "tests" / "security"
@@ -44,15 +44,29 @@ class RequestAuthTests(unittest.TestCase):
 
     def test_matches_b1_hmac(self):
         rec = self.book.get(DEST)
-        req = request_digest("GET", "/v1/x", b"")
+        req = request_digest_v2("GET", "/v1/x", b"")
         got = self.book.request_auth(rec.chan, 1, "3000", "sighex", req)
         key = channel_auth_key(self.secret, bytes.fromhex(rec.payee_pub))
         self.assertEqual(got, request_auth(key, rec.chan, 1, "3000", "sighex", req))
 
+    def test_the_payload_binds_scheme_host_and_port(self):
+        """AGP-068: the wallet binds the URL it calls, so a header cannot be moved to another origin."""
+        from agentwallet.xbt402 import Xbt402Session
+
+        rec = self.book.get(DEST)
+        s = Xbt402Session(self.book, hot=None, rpc=None, height=lambda: 1000)
+        pl = {"chan": rec.chan, "seq": 4, "cum": "3000"}
+        got = s._with_auth(pl, "GET", "http://127.0.0.1:9/v1/a?x=1", b"")["auth"]
+        key = channel_auth_key(self.secret, bytes.fromhex(rec.payee_pub))
+        self.assertEqual(got, request_auth(key, rec.chan, 4, "3000", None,
+                                           request_digest_v2("GET", "http://127.0.0.1:9/v1/a?x=1", b"")))
+        for other in ("https://127.0.0.1:9/v1/a?x=1", "http://127.0.0.2:9/v1/a?x=1", "http://127.0.0.1:10/v1/a?x=1"):
+            self.assertNotEqual(got, s._with_auth(pl, "GET", other, b"")["auth"], other)
+
     def test_tampered_request_does_not_match(self):
         rec = self.book.get(DEST)
-        good = request_digest("GET", "/v1/share-change?window=7d", b"")
-        bad = request_digest("GET", "/v1/report", b"")
+        good = request_digest_v2("GET", "/v1/share-change?window=7d", b"")
+        bad = request_digest_v2("GET", "/v1/report", b"")
         auth = self.book.request_auth(rec.chan, 2, "3000", "", good)
         self.assertNotEqual(auth, self.book.request_auth(rec.chan, 2, "3000", "", bad))
 
@@ -78,7 +92,7 @@ class RequestAuthTests(unittest.TestCase):
             },
         })
         rec, sig = self.book.increment(DEST, 3000)
-        req = request_digest("GET", "/v1/a", b"")
+        req = request_digest_v2("GET", "/v1/a", b"")
         payload = {
             "chan": rec.chan,
             "seq": rec.seq,
@@ -93,7 +107,7 @@ class RequestAuthTests(unittest.TestCase):
 
     def test_signer_method_returns_auth(self):
         rec = self.book.get(DEST)
-        req = request_digest("GET", "/", b"")
+        req = request_digest_v2("GET", "/", b"")
         s = Signer.__new__(Signer)
         s.channels = self.book
         out = s._xbt402_request_auth({"chan": rec.chan, "seq": 3, "cum": "0", "sig": "", "req": req})
