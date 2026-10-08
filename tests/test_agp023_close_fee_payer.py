@@ -52,11 +52,19 @@ def payee_offer(fee_payer="payee"):
 
 
 def provider(echo=True):
-    """The provider's open endpoint: records the request, echoes closeFeePayer as a v1.2 provider does."""
+    """The provider's open endpoint: records the funded open, echoes closeFeePayer as a v1.2 provider
+    does. With echo=False it is a v1.1 provider, which answers the review C2 preflight bad_request."""
     seen = []
 
     def http(method, url, body=b"", headers=None):
         req = json.loads(body)
+        if req.get("preflight") is True:
+            if not echo:
+                return 400, {}, b'{"error": "bad_request", "detail": "vout"}'
+            out = {"preflight": True, "expiry": req["channel"]["expiry"], "maxCum": "0", "minConf": 1}
+            if req["channel"].get("closeFeePayer"):
+                out["closeFeePayer"] = req["channel"]["closeFeePayer"]
+            return 200, {}, json.dumps(out).encode()
         seen.append(req)
         out = {"chan": f"{req['channel']['txid']}:{req['channel']['vout']}", "maxCum": "0", "confirmations": 1}
         if echo and req["channel"].get("closeFeePayer"):

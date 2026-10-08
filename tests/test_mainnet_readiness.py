@@ -82,18 +82,21 @@ class Rig:
             lambda m, p: 500, lambda m, p, b: (200, {"Content-Type": "application/json"}, b'{"ok":true}'),
             close_fee=600, close_margin=144,
             policy=FundingPolicy(min_capacity=10_000, max_capacity=10_000, min_expiry_blocks=1_008, close_margin=144))
-        self.posts: list[str] = []
+        self.posts: list[str] = []          # funded opens; the review C2 preflights go to self.preflights
+        self.preflights: list[str] = []
         self.refuse_open = False
         self.kill_on_open = False
         self.provider_down = False
 
     def http(self, method, url, body=b"", headers=None):
         path = "/" + url.split("/", 3)[3] if url.count("/") >= 3 else "/"
-        if path.endswith("/open"):
+        if path.endswith("/open") and json.loads(body or b"{}").get("preflight") is True:
+            self.preflights.append(path)
+        elif path.endswith("/open"):
             self.posts.append(path)
             if self.kill_on_open:
                 raise Killed()
-            if self.refuse_open:          # the provider changed its mind after the 402
+            if self.refuse_open:          # the provider changed its mind after the preflight
                 self.provider.policy.min_expiry_blocks = 5_000
         if self.provider_down:
             raise ConnectionRefusedError("provider down")

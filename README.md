@@ -40,6 +40,12 @@ Offers are bounded by `close_fee_max_sats`; `minCapacity`/`maxCapacity` bound th
 longer charged twice). Policy: `regtest_mine`, `open_wait_s`, `open_retry_s`, `close_fee_max_sats`;
 `B2_SIGNER_TIMEOUT` sets the socket client's timeout.
 
+AGP-074 (review C2, the AGP-067 follow-up): `open_from_offer` posts `/open` with `"preflight": true`
+and no outpoint before it funds, and funds only when the provider answers `preflight: true` on the
+same terms (including `closeFeePayer`). A refusal names nothing funded and records no channel. A
+provider from before the preflight answers `bad_request` (no `vout`), and only after its own terms
+checks, so on that answer the wallet funds and opens as before.
+
 AGP-021 (hub routing, `agentwallet/routing.py`): B2 signs adaptor-locked channel states for xbt402
 hub routing (B1 agp-021 `xbt402/hub.py`, `RoutePayer`): `xbt402_sign_state_adaptor(chan, cum, point,
 route)` pre-signs the next state under T1 = T + r*G (T the provider's invoice point, r fresh) after the

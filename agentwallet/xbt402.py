@@ -187,12 +187,14 @@ class Xbt402Session:
             min_conf = max(0, int(extra.get("minConf", 1)))
         except (TypeError, ValueError):
             min_conf = 1
+        open_url = dest + extra.get("openUrl", "/x402/xbt-channel/open")
+        self._preflight(open_url, acc["network"], params, funded, fee_payer)
         prep = self.hot.prepare_fund(params.spk, funded)
         params.funding_txid, params.funding_vout, params.capacity = prep["txid"], 0, funded
         # P1 write-ahead: the payer key is sealed on disk, with everything the refund needs, before
         # the funding exists anywhere but here
         self.book.add_pending(dest, secret=secret, params=params, origin=dest, cap_sats=cap,
-                              open_height=open_height, open_url=dest + extra.get("openUrl", "/x402/xbt-channel/open"),
+                              open_height=open_height, open_url=open_url,
                               network=acc["network"], min_conf=min_conf, funding_hex=prep["hex"])
         try:
             self.hot.broadcast(prep)
@@ -203,6 +205,36 @@ class Xbt402Session:
         _log("funding", dest=dest, chan=params.channel_id, txid=prep["txid"], capacity=funded, expiry=expiry,
              min_conf=min_conf)
         return self.complete_open(dest, wait_s=self.open_wait_s)
+
+    def _preflight(self, open_url: str, network: str, params: ChannelParams, funded: int, fee_payer: str) -> None:
+        """review C2: the provider says it opens a channel on exactly these terms before the funding
+        exists (a refusal after funding locks the coins until expiry). A provider from before the
+        preflight answers bad_request (no outpoint) once the terms it checks first have passed."""
+        channel = {"capacity": funded, "expiry": params.expiry, "payerPub": params.payer_pub,
+                   "payerSpk": params.payer_spk, "redeemScript": params.script.hex(),
+                   **({"closeFeePayer": fee_payer} if fee_payer != "payer" else {})}
+        body = {"x402Version": 2, "network": network, "preflight": True, "channel": channel}
+        try:
+            st, _, out = XbtChannelClient.http("POST", open_url, json.dumps(body).encode(),
+                                               {"Content-Type": "application/json"})
+        except Exception as e:
+            raise RuntimeError(f"open preflight failed: provider unreachable ({type(e).__name__}); "
+                               "nothing was funded") from None
+        try:
+            reply = json.loads(out)
+        except ValueError:
+            reply = None
+        if st != 200:
+            code = reply.get("error", "") if isinstance(reply, dict) else ""
+            code = code if safe_code(code) else ""     # no provider text in the wallet's errors (L12)
+            if code == "bad_request":
+                return
+            raise RuntimeError(f"open refused before funding: HTTP {st}{' ' + code if code else ''}; "
+                               "nothing was funded")
+        if not isinstance(reply, dict) or reply.get("preflight") is not True:
+            raise RuntimeError("the provider did not answer the open preflight; nothing was funded")
+        if reply.get("closeFeePayer", "payer") != fee_payer:
+            raise RuntimeError("the provider would open the channel with another closeFeePayer; nothing was funded")
 
     def funding_confirmations(self, rec) -> int | None:
         """Confirmations of a channel's funding output; None when the node does not have it at all."""
