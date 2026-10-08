@@ -172,7 +172,9 @@ class Xbt402Session:
             raise RuntimeError(f"channel capacity {cap + payer_fee} above provider max {max_cap}")
         min_exp = int(extra.get("minExpiryBlocks") or 1)
         max_exp = int(extra.get("maxExpiryBlocks") or 100_000)
-        blocks = min(max(expiry_blocks, min_exp + 6), max_exp - 1)
+        # the provider's policy also requires `left >= minExpiry + closeMargin` (its FundingPolicy
+        # default margin is 36), so a channel opened at exactly minExpiry is refused
+        blocks = min(max(expiry_blocks, min_exp + 6, min_exp + 36), max_exp - 1)
         check = getattr(self.hot, "check_channel_funding", None)
         if check is not None:  # AGP-013: above the hot-balance cap, a human sweeps before new channels
             check()
