@@ -24,8 +24,8 @@ from _agp013 import HUMAN_PRIV, HUMAN_PUB, FakeRpc, keyfile_env, rotate_hot_key,
 
 ensure_b1()
 from xbt402 import ecc  # noqa: E402
-from xbt402.channel import ChannelError, ChannelParams  # noqa: E402
-from xbt402.x402_channel import receipt_message, request_digest, settlement_response, SCHEME  # noqa: E402
+from xbt402.channel import DERIVATION, ChannelError, ChannelParams  # noqa: E402
+from xbt402.x402_channel import body_hash, receipt_message, request_digest_v2, settlement_response, SCHEME  # noqa: E402
 
 DEST = "http://127.0.0.1:9"
 NET = "bip122:" + "11" * 16
@@ -67,7 +67,7 @@ class ReviewWTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         s = Xbt402Session(ChannelBook(tmp / "c.json", tmp / "k.json"), hot=None, rpc=None, height=lambda: 1000)
         extra = {"minCapacity": "1000000000", "maxCapacity": "1000000000", "minExpiryBlocks": "10",
-                 "maxExpiryBlocks": "5000", "closeFeeSat": "600", "derivation": "v2"}
+                 "maxExpiryBlocks": "5000", "closeFeeSat": "600", "derivation": DERIVATION}
         acc = {"scheme": SCHEME, "network": NET, "amount": "500", "payTo": ecc.pubkey(0xB0B).hex(), "extra": extra}
         with self.assertRaises(ChannelError) as err:
             s.open_from_offer(DEST, acc, cap_sats=9_400, expiry_blocks=100)
@@ -79,22 +79,22 @@ class ReviewWTests(unittest.TestCase):
         sk = secrets.randbelow(ecc.N - 1) + 1
         pk = ecc.pubkey(sk)
         rec = type("R", (), {"chan": "aa" * 32 + ":0", "payee_pub": pk.hex(), "used_sats": 546})()
-        req = request_digest("GET", "/agp015/echo", b"")
+        req = request_digest_v2("GET", URL, b"")
 
         def resp(charged: str):
             r = {"scheme": SCHEME, "chan": rec.chan, "seq": "1", "cum": "546", "charged": charged,
-                 "spentMsat": "0", "req": req}
+                 "spentMsat": "0", "req": req, "status": 200, "bodyHash": body_hash(b"ok")}
             r["sig"] = ecc.sign(sk, receipt_message(r)).hex()
             return settlement_response(r, NET, pk.hex(), True)
 
         with self.assertRaises(ChannelError) as neg:
-            Xbt402Session.check_seller_receipt(rec, resp("-5"), "GET", URL, b"", 500)
+            Xbt402Session.check_seller_receipt(rec, resp("-5"), "GET", URL, b"", (200, b"ok"), 500)
         self.assertEqual(neg.exception.code, "bad_receipt")
         self.assertIn("negative", str(neg.exception))
         with self.assertRaises(ChannelError) as over:
-            Xbt402Session.check_seller_receipt(rec, resp("9000"), "GET", URL, b"", 500)
+            Xbt402Session.check_seller_receipt(rec, resp("9000"), "GET", URL, b"", (200, b"ok"), 500)
         self.assertIn("exceeds", str(over.exception))
-        self.assertEqual(Xbt402Session.check_seller_receipt(rec, resp("0"), "GET", URL, b"", 500), 0)
+        self.assertEqual(Xbt402Session.check_seller_receipt(rec, resp("0"), "GET", URL, b"", (200, b"ok"), 500), 0)
 
     def test_a_negative_entry_is_refused_and_a_negative_log_does_not_open(self):
         tmp = Path(tempfile.mkdtemp())

@@ -37,6 +37,7 @@ from xbt402.x402_channel import (  # noqa: E402
     b64json,
     facilitator_request,
     network_id,
+    body_hash,
     receipt_message,
     receipt_of,
     request_digest_v2,
@@ -323,12 +324,15 @@ class Xbt402Session:
         return delta
 
     @staticmethod
-    def check_seller_receipt(rec, resp, method: str, url: str, body: bytes, quote: int) -> int:
-        """The seller's receipt: signature and request binding, and a charged that is not negative
-        and not above the quote. The number itself is never what the wallet books."""
+    def check_seller_receipt(rec, resp, method: str, url: str, body: bytes, answer: tuple, quote: int) -> int:
+        """The seller's receipt: signature, request and answer binding, and a charged that is not
+        negative and not above the quote. The number itself is never what the wallet books."""
         r = receipt_of(resp)
-        if str(r.get("req")) != request_digest(method, request_target(url), body or b""):
+        if str(r.get("req")) != request_digest_v2(method, url, body or b""):
             raise ChannelError("bad_receipt", "receipt is for another request")
+        status, answer_body = answer
+        if str(r.get("status")) != str(status) or str(r.get("bodyHash")) != body_hash(answer_body or b""):
+            raise ChannelError("bad_receipt", "receipt is for another answer (status or body differs)")
         if str(r.get("chan")) != rec.chan:
             raise ChannelError("bad_receipt", "receipt is for another channel")
         try:
@@ -435,7 +439,7 @@ class Xbt402Session:
         if st2 < 400:
             if not receipt:
                 raise ChannelError("bad_receipt", "paid call returned no receipt")
-            charged = self.check_seller_receipt(self.book.get(dest), receipt, method, url, body or b"", price)
+            charged = self.check_seller_receipt(self.book.get(dest), receipt, method, url, body or b"", (st2, out2), price)
         else:
             charged = 0
         _log("call", url=url, status=st2, ms=round(1000 * (time.time() - t0), 1), chargedSat=charged,
