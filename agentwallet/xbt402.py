@@ -66,6 +66,21 @@ def pick_accept(pr: dict, network: str) -> dict:
     raise RuntimeError("no batch-settlement offer on this network")
 
 
+def open_expiry_blocks(want: int, min_expiry: int, max_expiry: int, min_conf: int, close_margin: int) -> int:
+    """Blocks to expiry for a new channel: what the wallet wants, at least `minExpiryBlocks + minConf +
+    closeMarginBlocks`, at most `maxExpiryBlocks - 1`; every term is the offer's (AGP-076; the same
+    rule as xbt-rs `xbt402::funding::open_expiry_blocks`).
+
+    The provider checks `left >= minExpiryBlocks` at its tip when the funded open reaches it, not at
+    our tip now. In between the funding has to get `minConf` confirmations, and it may wait for the
+    first one. So we add `minConf`, plus the time the provider itself allows a transaction to confirm
+    on this chain: `closeMarginBlocks`, how long before expiry it broadcasts its close. A funding
+    that takes longer would be refused bad_expiry on every retry, with the coins locked until the
+    refund. No provider check reads the margin; it is only our allowance. An offer whose window is
+    narrower than that gets the top of its window: the open preflight answers before anything is funded."""
+    return max(0, min(max(want, min_expiry + min_conf + close_margin), max_expiry - 1))
+
+
 def charged_of(resp, default: int) -> int:
     """`charged` of the channel receipt inside a PAYMENT-RESPONSE SettlementResponse (xbt402 v1.1)."""
     try:
@@ -172,9 +187,17 @@ class Xbt402Session:
             raise RuntimeError(f"channel capacity {cap + payer_fee} above provider max {max_cap}")
         min_exp = int(extra.get("minExpiryBlocks") or 1)
         max_exp = int(extra.get("maxExpiryBlocks") or 100_000)
-        # the provider's policy also requires `left >= minExpiry + closeMargin` (its FundingPolicy
-        # default margin is 36), so a channel opened at exactly minExpiry is refused
-        blocks = min(max(expiry_blocks, min_exp + 6, min_exp + 36), max_exp - 1)
+        try:
+            min_conf = max(0, int(extra.get("minConf", 1)))
+        except (TypeError, ValueError):
+            min_conf = 1
+        try:
+            margin = int(extra["closeMarginBlocks"])
+        except (KeyError, TypeError, ValueError):
+            margin = -1
+        if margin < 0:
+            raise RuntimeError("offer closeMarginBlocks is missing or not a block count; refused before funding")
+        blocks = open_expiry_blocks(expiry_blocks, min_exp, max_exp, min_conf, margin)
         check = getattr(self.hot, "check_channel_funding", None)
         if check is not None:  # AGP-013: above the hot-balance cap, a human sweeps before new channels
             check()
@@ -185,10 +208,6 @@ class Xbt402Session:
         params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex(),
                                       network=acc["network"], **fee_payer_kw(fee_payer))
         funded = cap + payer_fee
-        try:
-            min_conf = max(0, int(extra.get("minConf", 1)))
-        except (TypeError, ValueError):
-            min_conf = 1
         open_url = dest + extra.get("openUrl", "/x402/xbt-channel/open")
         self._preflight(open_url, acc["network"], params, funded, fee_payer)
         prep = self.hot.prepare_fund(params.spk, funded)

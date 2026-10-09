@@ -29,6 +29,7 @@ class Hot:
 
 def offer(derivation):
     extra = {"minCapacity": "20000", "maxCapacity": "1000000", "minExpiryBlocks": 10, "maxExpiryBlocks": 5000,
+             "closeMarginBlocks": 5,
              "closeFeeSat": "600", "openUrl": "/x402/xbt-channel/open", "closeUrl": "/x402/xbt-channel/close",
              "billing": "postpay"}
     if derivation is not None:
