@@ -48,7 +48,7 @@ from xbt402.channel import ChannelError  # noqa: E402  (B1 on sys.path through .
 from .sanitize import sanitize
 from .treasury import Treasury, TREASURY_CSV
 from .vault import PresignedVault
-from .xbt402 import Xbt402Session, origin_of, refuse_fragment
+from .xbt402 import FUNDING_KEPT, Xbt402Session, origin_of, refuse_fragment
 
 XBT_SATS = 100_000_000
 
@@ -176,6 +176,7 @@ class Signer:
         from .routing import RoutePolicy, RouteSigner
         self.routing = RouteSigner(self.channels, RoutePolicy.from_dict(self.config.routing),
                                    state_path=run / "routing.json", engine=self.engine)
+        self._settle_treasury_funding()     # AGP-085: a funding written ahead before a crash
         self._open_tried: dict[str, float] = {}
         self._watch_stop = threading.Event()
         self.watch_interval = float(os.environ.get("B2_WATCH_INTERVAL", "10"))
@@ -581,6 +582,13 @@ class Signer:
                     r = self._refund_locked(rec.dest, auto=True)
                 actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, **{k: r.get(k) for k in
                                 ("verdict", "rule", "txid", "sats", "reason")}})
+        if self.treasury.pending or self.treasury.unsettled:   # AGP-085: a treasury funding of unknown fate
+            p = dict(self.treasury.pending or {})
+            with self._spend_lock, sigaudit.context(method="watcher"):
+                done = self._settle_treasury_funding()
+            if p and done is not None:
+                actions.append({"treasury_funding": "recorded" if done else "unsettled", "txid": p["txid"],
+                                "sats": p["capacity"], "height": h})
         if self.channels.pending_close_records():          # AGP-022: a close's change not yet counted
             with self._spend_lock, sigaudit.context(method="watcher"):
                 for a in self._settle_close_changes():
@@ -854,6 +862,17 @@ class Signer:
         existing = self.channels.get(dest)
         if existing is not None and existing.state == "open":
             return {"verdict": "allow", "already": True, **existing.public()}
+        if existing is not None and existing.state == "pending":
+            # AGP-085: a funding kept from an earlier open. It is never funded a second time: the channel
+            # is open once the node has that funding (sent again here if it does not)
+            try:
+                done = self._xbt402.complete_open(dest, wait_s=0)
+            except Exception as e:
+                return {**_deny("funding_unconfirmed", str(e)[:200]), "chan": existing.chan}
+            if done.get("state") == "open":
+                return {"verdict": "allow", "already": True, **done}
+            return {**_deny("funding_unconfirmed", f"the channel to {dest} is funded by {existing.funding_txid}, which "
+                                                    "this node does not have yet"), "chan": existing.chan}
         if existing is not None and existing.close_unproven and not self._prove_close(dest):
             return _deny("close_unproven", f"the last channel to {dest} was reported closed, but this node has not "
                                            "seen its funding spent: a new one opens once it has, or after the refund")
@@ -883,9 +902,15 @@ class Signer:
                                   funding_hex=prep["hex"])
         try:
             self.hot.broadcast(prep)
-        except Exception:
+        except KnotsRpcRefused:
+            # the node's own refusal, and it has no such output: the funding exists nowhere but here
             self.channels.drop_pending(dest, p.channel_id)
             raise
+        except Exception as e:
+            # AGP-085: any other failure may have left the funding on the node: the record and its key stay
+            self.hot.commit(prep)
+            self.channels.note_pending(dest, open_error=f"funding broadcast unconfirmed: {type(e).__name__}")
+            raise KnotsRpcError(f"{FUNDING_KEPT}: {e}") from e
         self.hot.commit(prep)
         rec = self.channels.mark_open(dest)
         self._mine_safe()
@@ -1070,11 +1095,70 @@ class Signer:
         if refused:
             return {"ok": False, "reason": f"fund_treasury requires a valid human signature: {refused['reason']}",
                     "rule": refused["rule"]}
+        if self.treasury.pending and self._settle_treasury_funding() is None:
+            p = self.treasury.pending
+            return {"ok": False, "rule": "treasury_funding_pending",
+                    "reason": f"an earlier funding {p['txid']}:{p['vout']} of {p['capacity']} sat is not on this node "
+                              "yet and was not refused: it is sent again by the watcher, and nothing new is funded "
+                              "until the node shows or refuses it", **self.treasury.status()}
         sigaudit.set_rule("human:treasury_fund_signature")
-        txid, vout = self.hot.fund(self.treasury.spk, sats)
+        prep = self.hot.prepare_fund(self.treasury.spk, sats)
+        txid, vout = prep["txid"], 0
+        # AGP-085 write-ahead: the outpoint is on disk before the funding exists anywhere but here
+        self.treasury.record_pending(txid, vout, sats, prep["hex"])
+        try:
+            self.hot.broadcast(prep)
+        except KnotsRpcRefused:
+            self.treasury.drop_pending(txid)       # the node's own refusal, and it has no such output
+            raise
+        except Exception as e:
+            self.hot.commit(prep)
+            raise KnotsRpcError(f"{e}; the node may have taken this funding, so the treasury keeps {txid}:{vout} "
+                                "as pending and the watcher settles it") from e
+        self.hot.commit(prep)
         self.treasury.record_funding(txid, vout, sats)
         self._mine_safe()
         return {**self.treasury.status(), "txid": txid, "vout": vout, "sighash": "0x21"}
+
+    def _settle_treasury_funding(self) -> bool | None:
+        """AGP-085: decide a treasury funding that was written ahead and never confirmed as sent (a
+        crash, or a broadcast whose fate was unknown). True: the node has its output, and it is the
+        recorded funding now. False: the node has no such output and itself refused the transaction;
+        the outpoint moves to the treasury's unsettled list (the first send may have left the node)
+        and no longer holds up a new funding. None: still unknown (kept). The caller holds _spend_lock."""
+        for old in list(self.treasury.unsettled):       # one that confirmed after all
+            try:
+                seen = not self.treasury.funding_txid and self.rpc.call("gettxout", old["txid"], int(old["vout"]), True)
+            except Exception:
+                seen = None
+            if seen:
+                self._record_treasury_funding(old)
+        p = self.treasury.pending
+        if not p:
+            return True
+        try:
+            known = self.rpc.call("gettxout", p["txid"], int(p["vout"]), True)
+            if not known:
+                try:
+                    self.rpc.call("sendrawtransaction", p["hex"])
+                except KnotsRpcRefused:
+                    self.treasury.shelve_pending(p["txid"])
+                    self.engine.audit.append({"type": "treasury_funding_unsettled", "txid": p["txid"],
+                                              "sats": p["capacity"], "ts": self.engine.clock()})
+                    try:        # its inputs were set aside as spent when it was kept: find them again
+                        self.hot.reconcile(scan=True)
+                    except Exception:
+                        pass
+                    return False
+        except Exception:
+            return None
+        self._record_treasury_funding(p)
+        return True
+
+    def _record_treasury_funding(self, p: dict) -> None:
+        self.treasury.record_funding(p["txid"], int(p["vout"]), int(p["capacity"]))
+        self.engine.audit.append({"type": "treasury_funding_settled", "txid": p["txid"], "sats": p["capacity"],
+                                  "ts": self.engine.clock()})
 
     def _recover_treasury_locked(self, params: dict) -> dict:
         from xbt402.tx import address_to_spk
@@ -1180,12 +1264,22 @@ class Signer:
             )
             return _deny("approval_bind", "signature fields do not match the pending approval")
 
-        pay = self.engine.consume_approval(token)
+        # AGP-085: the token is held (marked used on disk) while the payment runs, not spent before it.
+        # A crash or a payment of unknown fate leaves it used for good; it is free again only when
+        # nothing was paid: the node's own refusal, or a deny
+        pay = self.engine.hold_approval(token)
         if pay is None:
             return _deny("approval", "unknown or expired approval token")
-        settled = self._pay_locked({"to": pay.dest, "amount_sats": pay.amount_sats, "memo": pay.memo}, human=True)
+        try:
+            settled = self._pay_locked({"to": pay.dest, "amount_sats": pay.amount_sats, "memo": pay.memo}, human=True)
+        except KnotsRpcRefused:
+            self.engine.release_approval(token)
+            raise
         if settled.get("verdict") == "allow":
+            self.engine.store.pop_approval(token)
             settled["approved"] = True
+        elif settled.get("verdict") == "deny":
+            self.engine.release_approval(token)
         return settled
 
     def _recover_signed(self, params: dict) -> dict:

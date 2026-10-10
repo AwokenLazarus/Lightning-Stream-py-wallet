@@ -530,6 +530,35 @@ class PolicyEngine:
             ts=now,
         )
 
+    def hold_approval(self, token: str) -> Payment | None:
+        """AGP-085: `consume_approval`, but the token stays on disk marked used while its payment
+        runs. The caller pops it when the payment is made, or calls `release_approval` when it was
+        not; a token left held is never valid again."""
+        if not token:
+            return None
+        now = self.clock()
+        payload = self.store.get_approval(token)
+        if not payload:
+            self.audit.append({"type": "approval_miss", "token": token, "ts": now})
+            return None
+        if payload.get("used"):
+            self.audit.append({"type": "approval_replay", "token": token, "ts": now})
+            return None
+        if payload.get("expires", 0) < now:
+            self.store.pop_approval(token)
+            self.audit.append({"type": "approval_expired", "token": token, "ts": now})
+            return None
+        self.store.put_approval(token, {**payload, "used": True})
+        return Payment(dest=payload["dest"], amount_sats=int(payload["amount_sats"]), memo=payload.get("memo") or "",
+                       ts=now)
+
+    def release_approval(self, token: str) -> None:
+        """Nothing was paid on a held token: it is valid again until it expires."""
+        payload = self.store.get_approval(token)
+        if payload and payload.get("used"):
+            self.store.put_approval(token, {**payload, "used": False})
+            self.audit.append({"type": "approval_released", "token": token, "ts": self.clock()})
+
     def commit_once(self, payment: Payment, txid: str = "") -> bool:
         """Commit `txid` once. A repeat (the write-ahead ran, then the process restarted) does not
         add a second row. False when this txid was already in the ledger."""

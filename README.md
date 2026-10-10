@@ -72,6 +72,33 @@ an HTTP error with no JSON-RPC error in it, an answer that is not a txid, or a c
 counted against the budgets, because the node may have sent it; the error names the row. Such a row is
 not cleared by itself: it ages out of the budget windows like any payment.
 
+AGP-085 (what is written ahead is taken back only on the node's own refusal): a channel funding, a
+treasury funding and an approved payment each leave a record before the node is asked to send. That
+record is undone only when the node itself answered with a JSON-RPC error (`KnotsRpcRefused`) and, for
+a transaction, then answered that it has no such output. A timeout, a reset, a non-JSON answer or a
+lookup that failed too is "unknown" (`BroadcastUnknown`): the node may hold the transaction.
+- **Channel funding** (`xbt402_pay`, `open_channel`, `pay` to a registered `pay_to`): on "unknown" the
+  pending record and its sealed payer key stay, the spent hot coin is set aside, and the watcher sends
+  the funding again, opens the channel or refunds it at expiry. Before, any failure forgot the key. An
+  `open_channel` to a dest with a kept funding finishes that open; it never funds a second channel.
+- **`fund_treasury`** writes `pending_funding` (outpoint, amount, the signed transaction) into
+  `treasury.json` before the broadcast. The start and every watcher tick settle it: recorded when the
+  node shows the output, sent again when it does not. While it is unsettled a new `fund_treasury` is
+  refused (`treasury_funding_pending`). If the node refuses it when it is sent again, it moves to
+  `unsettled_fundings` (shown as `treasury_unsettled_outpoints`), stops holding up new fundings, and is
+  recorded if it confirms after all.
+- **`approve`** marks its token used on disk while the payment runs. The token is free again (until
+  its expiry) when the node refused the payment or the policy denied it; it is removed when the
+  payment is made; after a crash or a payment of unknown fate it stays used and is never valid again
+  (`approval_replay`): the human signs a new approval after checking the chain.
+
+Limits: on the light (Electrum) backend nothing is "the node's own refusal", because the servers are
+not ours: a funding they refuse stays pending until it is opened or an operator removes it, and its
+dest takes no new channel meanwhile. A kept channel funding that can never confirm (its coin was spent
+elsewhere) is answered `funding_unknown` at its expiry and stays on record. A crash between holding an
+approval and the payment costs the token with no payment made. The treasury records one funding
+outpoint: a second funding replaces the first in the file, as before.
+
 **Keys in memory are not wiped, and Python cannot guarantee that they could be.** The hot key, the
 payer keys and the treasury keys are Python `int`s for as long as the signer runs, the wrapping key
 and the passphrase are `bytes`, and decrypted key files pass through `bytes`, `str` and `json`. All of

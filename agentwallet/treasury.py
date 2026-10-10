@@ -98,7 +98,24 @@ class Treasury:
         self.funding_txid = raw.get("funding_txid") or ""
         self.funding_vout = int(raw.get("funding_vout") or 0)
         self.capacity = int(raw.get("capacity") or 0)
+        # AGP-085: a funding written ahead of its broadcast, until the node shows or refuses it
+        self.pending: dict | None = self._pending_from(raw.get("pending_funding"))
+        # fundings the node refused when they were sent again: no coin is known behind them, and the
+        # record stays in case one confirms after all (it reached other nodes on its first send)
+        self.unsettled: list[dict] = [self._pending_from(p) for p in raw.get("unsettled_fundings") or []]
         self._persist()
+
+    @staticmethod
+    def _pending_from(p) -> dict | None:
+        if p is None:
+            return None
+        try:
+            out = {"txid": str(p["txid"]), "vout": int(p["vout"]), "capacity": int(p["capacity"]), "hex": str(p["hex"])}
+            bytes.fromhex(out["txid"]), bytes.fromhex(out["hex"])
+        except (KeyError, TypeError, ValueError) as e:
+            # never read as "no pending funding": that would let the next funding overwrite the record
+            raise KeyStoreError("treasury file: pending_funding is malformed") from e
+        return out
 
     @property
     def encrypted(self) -> bool:
@@ -123,6 +140,10 @@ class Treasury:
             "funding_vout": self.funding_vout,
             "capacity": self.capacity,
         }
+        if self.pending:
+            doc["pending_funding"] = self.pending
+        if self.unsettled:
+            doc["unsettled_fundings"] = self.unsettled
         keys = {r: f"{getattr(self, f'{r}_secret'):064x}" for r in ROLES}
         if self.keystore is None:
             doc.update(keys)
@@ -147,8 +168,34 @@ class Treasury:
             "csv": str(self.csv),
         }
 
+    def record_pending(self, txid: str, vout: int, capacity: int, hex_tx: str) -> None:
+        """AGP-085: write a funding ahead of its broadcast (one at a time)."""
+        if self.pending and self.pending["txid"] != txid:
+            raise RuntimeError(f"treasury funding {self.pending['txid']} is still pending")
+        self.pending = {"txid": txid, "vout": int(vout), "capacity": int(capacity), "hex": hex_tx}
+        self._persist()
+
+    def drop_pending(self, txid: str) -> None:
+        """The node refused the pending funding on its first send and has no such output: it exists
+        nowhere but here."""
+        if self.pending and self.pending["txid"] == txid:
+            self.pending = None
+            self._persist()
+
+    def shelve_pending(self, txid: str) -> None:
+        """A kept funding the node refuses to take again and has no output of. It may have left the
+        node on its first send, so its outpoint is kept under `unsettled_fundings`, where it no longer
+        holds up a new funding."""
+        if self.pending and self.pending["txid"] == txid:
+            self.unsettled.append(self.pending)
+            self.pending = None
+            self._persist()
+
     def record_funding(self, txid: str, vout: int, capacity: int) -> None:
         self.funding_txid, self.funding_vout, self.capacity = txid, int(vout), int(capacity)
+        if self.pending and self.pending["txid"] == txid:
+            self.pending = None
+        self.unsettled = [p for p in self.unsettled if p["txid"] != txid]
         self._persist()
 
     def status(self) -> dict:
@@ -157,6 +204,10 @@ class Treasury:
             "treasury_csv": self.csv,
             "treasury_funded_sats": self.capacity,
             "treasury_outpoint": f"{self.funding_txid}:{self.funding_vout}" if self.funding_txid else "",
+            **({"treasury_pending_outpoint": f"{self.pending['txid']}:{self.pending['vout']}",
+                "treasury_pending_sats": self.pending["capacity"]} if self.pending else {}),
+            **({"treasury_unsettled_outpoints": [f"{p['txid']}:{p['vout']}" for p in self.unsettled]}
+               if self.unsettled else {}),
         }
 
     def recovery_tx(self, dest_spk: bytes, fee: int = 600) -> Tx:

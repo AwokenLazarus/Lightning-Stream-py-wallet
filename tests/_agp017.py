@@ -95,8 +95,9 @@ class PrunedChain:
             h = int(p[0], 16)
             return {"height": h, "tx": self.blocks.get(h, [])}
         if method == "sendrawtransaction":
-            if self.reject:
-                raise RpcError(self.reject)
+            if self.reject:         # the node's own JSON-RPC refusal (AGP-085: only that forgets a funding)
+                from agentwallet.rpc import KnotsRpcRefused
+                raise KnotsRpcRefused(self.reject)
             raw = p[0]
             tx = Tx.parse(bytes.fromhex(raw))
             txid = tx.txid()

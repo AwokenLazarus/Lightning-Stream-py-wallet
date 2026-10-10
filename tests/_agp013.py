@@ -40,9 +40,9 @@ class FakeRpc:
         if method == "getblockhash":
             return "22" * 32
         if method == "sendrawtransaction":
-            if self.reject:
-                from agentwallet.rpc import KnotsRpcError
-                raise KnotsRpcError(self.reject)
+            if self.reject:         # the node's own JSON-RPC refusal (AGP-085: only that forgets a funding)
+                from agentwallet.rpc import KnotsRpcRefused
+                raise KnotsRpcRefused(self.reject)
             raw = params[0]
             tx = Tx.parse(bytes.fromhex(raw))
             txid = tx.txid()

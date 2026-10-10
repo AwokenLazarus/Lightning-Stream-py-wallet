@@ -19,6 +19,11 @@ class KnotsRpcRefused(KnotsRpcError):
     booking then). The Rust signer's `rpc_refused`."""
 
 
+class BroadcastUnknown(KnotsRpcError):
+    """A transaction was sent and neither the send nor the lookup after it says the node refused it:
+    it may be in the mempool. Whatever was written ahead of the send is kept (AGP-085)."""
+
+
 class KnotsRpc:
     def __init__(self, datadir: Path, conf: Path, wallet: str = "agent"):
         self.datadir = Path(datadir)

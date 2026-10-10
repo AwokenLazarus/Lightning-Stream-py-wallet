@@ -36,7 +36,7 @@ from pathlib import Path
 from .b1path import ensure_b1
 from .keystore import KeyStore, KeyStoreError, write_private
 from .maturity import Maturity
-from .rpc import KnotsRpc, KnotsRpcError
+from .rpc import BroadcastUnknown, KnotsRpc, KnotsRpcError, KnotsRpcRefused
 from .sigaudit import NullAudit
 
 ensure_b1()
@@ -62,6 +62,10 @@ UTXO_AAD = "b2/hot-utxos"
 MAX_STALE = 500
 CLOSE_MAX_OUTPUTS = 4        # a close has 1-3 outputs (payee, our change, a hash lock)
 CLOSE_SCAN_MAX = 144         # blocks one learn_close_change call reads; the next call goes on from there
+
+
+def _short(e: BaseException) -> str:
+    return (str(e) or type(e).__name__)[:160]
 
 
 def _coinbase_fields(height: int | None) -> dict:
@@ -513,17 +517,26 @@ class HotWallet:
 
     def broadcast(self, prep: dict) -> str:
         """Send a prepared transaction. A failed send whose transaction the node already has (a lost
-        RPC answer, a re-send) counts as sent; anything else raises and nothing is forgotten."""
+        RPC answer, a re-send) counts as sent. Otherwise this raises, and nothing is forgotten:
+
+        * KnotsRpcRefused when the node itself refused the send and then answered that it has no such
+          output: the transaction is not on the node, and the caller may take back what it wrote ahead;
+        * BroadcastUnknown for every other failure (no answer, a reset, a lookup that failed too): the
+          node may hold the transaction, so the caller keeps what it wrote ahead (AGP-085)."""
         try:
             return self.rpc.call("sendrawtransaction", prep["hex"])
-        except Exception:
+        except Exception as sent:
             try:
                 known = self.rpc.call("gettxout", prep["txid"], 0, True)
-            except Exception:
-                known = None
-            if not known:
+            except Exception as e:
+                raise BroadcastUnknown(f"{_short(sent)}; then gettxout failed too ({_short(e)}): the node may "
+                                       f"hold {prep['txid']}") from sent
+            if known:
+                return prep["txid"]
+            if isinstance(sent, KnotsRpcRefused):
                 raise
-            return prep["txid"]
+            raise BroadcastUnknown(f"{_short(sent)}: the node did not refuse {prep['txid']} and may still "
+                                   "take it") from sent
 
     def commit(self, prep: dict) -> None:
         """The prepared transaction is sent: forget its inputs, learn its outputs to our keys."""
@@ -609,4 +622,4 @@ class HotWallet:
                 "outputs": len(outs), "hot_sats": self.balance_sats()}
 
 
-__all__ = ["HotWallet", "HotCapError", "KnotsRpcError"]
+__all__ = ["BroadcastUnknown", "HotWallet", "HotCapError", "KnotsRpcError"]

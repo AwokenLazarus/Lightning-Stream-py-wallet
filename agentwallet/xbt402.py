@@ -23,6 +23,7 @@ from . import netparams
 from .b1path import ensure_b1
 from .channels import ChannelBook, ChannelCapError, booked_through, fee_payer_kw
 from .hot import HotWallet
+from .rpc import KnotsRpcRefused
 from .sanitize import UNTRUSTED_KEY, untrusted
 from .stream import H, StreamError, check_chunk, check_manifest, open_final
 
@@ -49,6 +50,9 @@ from xbt402.x402_channel import (  # noqa: E402
 # 500 was too small for a real analytics JSON; 12k covers the catalog answers.
 BODY_CAP = int(os.environ.get("B2_BODY_CAP", "12000"))
 PREVIEW_CAP = 2048
+# AGP-085: a funding whose broadcast failed without the node refusing it
+FUNDING_KEPT = ("the funding may have reached the node, so the channel stays pending: its funding is sent "
+                "again by the watcher, and it is opened or refunded at expiry")
 
 
 def origin_of(url: str) -> str:
@@ -250,9 +254,17 @@ class Xbt402Session:
                               network=acc["network"], min_conf=min_conf, funding_hex=prep["hex"])
         try:
             self.hot.broadcast(prep)
-        except Exception:
+        except KnotsRpcRefused:
+            # the node's own refusal, and it has no such output: the funding exists nowhere but here
             self.book.drop_pending(dest, params.channel_id)
             raise
+        except Exception as e:
+            # AGP-085: any other failure may have left the funding on the node. The record and its key
+            # stay; the watcher sends the funding again, opens the channel or refunds it at expiry
+            self.hot.commit(prep)
+            self.book.note_pending(dest, open_error=f"funding broadcast unconfirmed: {type(e).__name__}")
+            _log("funding_unconfirmed", dest=dest, chan=params.channel_id, txid=prep["txid"], capacity=funded)
+            raise RuntimeError(f"{FUNDING_KEPT}: {e}") from e
         self.hot.commit(prep)
         _log("funding", dest=dest, chan=params.channel_id, txid=prep["txid"], capacity=funded, expiry=expiry,
              min_conf=min_conf)
@@ -325,6 +337,11 @@ class Xbt402Session:
         if self.height() >= rec.expiry - self.refund_margin:
             self.book.note_pending(dest, open_error="too close to expiry to open; refunded at expiry")
             return {**self.book.get(dest).public(), "confirmations": confs, "min_conf": rec.min_conf}
+        if not rec.open_url:
+            # the signer's own rail has no provider open: the channel is open once the node has its funding
+            opened = self.book.mark_open(dest)
+            _log("opened", dest=dest, chan=opened.chan, confirmations=confs, duplicate=False)
+            return {**opened.public(), "confirmations": confs}
         body = {
             "x402Version": 2,
             "network": rec.network,
