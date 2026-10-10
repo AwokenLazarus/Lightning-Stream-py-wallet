@@ -26,6 +26,8 @@ Selection (`backend_from_env`), environment:
   B2_ELECTRUM_SERVERS   comma-separated tcp://host:port or ssl://host:port
   B2_ELECTRUM_CHECKPOINT <height>:<hash>; mainnet defaults to 961640 (the first BLAKE2b block)
   B2_ELECTRUM_MIN_SERVERS servers that must answer (default 2 on mainnet, 1 elsewhere)
+  B2_ELECTRUM_TIMEOUT   seconds per request (default 15)
+  B2_ELECTRUM_SYNC_DEADLINE seconds one server has for its part of a header sync (default 4 timeouts)
   B2_CHAIN              the chain (required for electrum: a light client does not ask a node)
 """
 
@@ -41,6 +43,7 @@ ENV_SERVERS = "B2_ELECTRUM_SERVERS"
 ENV_CHECKPOINT = "B2_ELECTRUM_CHECKPOINT"
 ENV_MIN_SERVERS = "B2_ELECTRUM_MIN_SERVERS"
 ENV_TIMEOUT = "B2_ELECTRUM_TIMEOUT"
+ENV_SYNC_DEADLINE = "B2_ELECTRUM_SYNC_DEADLINE"
 BACKENDS = ("rpc", "electrum", "auto")
 
 
@@ -75,9 +78,11 @@ def electrum_from_env(run_dir: Path):
     if not servers:
         raise BackendError(f"the Electrum backend needs {ENV_SERVERS}")
     ms = os.environ.get(ENV_MIN_SERVERS, "").strip()
+    deadline = os.environ.get(ENV_SYNC_DEADLINE, "").strip()
     return ElectrumBackend(servers, chain=chain, checkpoint=checkpoint_from_env(os.environ.get(ENV_CHECKPOINT)),
                            store_path=Path(run_dir) / f"headers-{chain}.bin",
-                           timeout=float(os.environ.get(ENV_TIMEOUT, "15")), min_servers=int(ms) if ms else None)
+                           timeout=float(os.environ.get(ENV_TIMEOUT, "15")), min_servers=int(ms) if ms else None,
+                           sync_deadline=float(deadline) if deadline else None)
 
 
 def backend_from_env(datadir: Path, conf: Path, wallet: str, run_dir: Path):

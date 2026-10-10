@@ -25,9 +25,16 @@ Trust (see docs/B2_CHAIN_BACKEND.md for the full threat model):
   * Mempool facts cannot be proven. A spend seen only in a mempool never makes an output count as
     spent (gettxout keeps it), so a lying server cannot talk the wallet out of a refund; an
     unconfirmed transaction is reported with 0 confirmations and nothing waits on it as confirmed.
+  * What one server can cost (AGP-081). Every request has an answer cap known from its method and
+    params (`answer_cap`); a line longer or denser than the pending requests allow drops the server
+    before it is parsed. A history or unspent list above MAX_HISTORY entries is not used, an entry
+    that neither pays nor spends the script is flagged, and verified transactions are cached up to
+    TX_CACHE_BYTES. A server's part of a header sync ends at its first short answer and at
+    `sync_deadline`, keeping what it proved. Transactions above MAX_TX_BYTES are not fetched.
 What a malicious server can still do: hide a transaction (a close, a funding) from us until another
-server or a block shows it, delay us (answer slowly, or not at all), lie about fee estimates, and
-learn which scripts we watch. Hiding a close delays counting the change (AGP-022's retry keeps
+server or a block shows it, delay a call that asks it by up to the request timeout per request
+(a history of N entries is N transaction requests), lie about fee estimates, and learn which
+scripts we watch. Hiding a close delays counting the change (AGP-022's retry keeps
 asking) and makes the refund at expiry fail at broadcast; neither loses coins.
 """
 
@@ -41,13 +48,14 @@ import ssl
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .b1path import ensure_b1
 from .headers import (
     MAINNET_CHECKPOINT,
+    V2_SIZE,
     HeaderChain,
     HeaderError,
     check_pow,
@@ -70,6 +78,13 @@ HEADERS_CHUNK = 2016
 CLIENT_NAME = "b2-agentwallet"
 STALE_TIP_S = 3 * 60 * 60
 TIP_CAP_SPACING_S = 150            # a quarter of the target spacing: claimed tips beyond it are not fetched
+MAX_LINE = 8 << 20                 # no line is longer than this, whatever is pending
+NOTIFY_SLACK = 16 << 10            # bytes a line may hold beyond what the pending requests allow (a notification)
+VALUE_SLACK = 64                   # the same, in JSON values
+MAX_HISTORY = 10_000               # entries of one script in one server's get_history or listunspent answer
+MAX_TX_BYTES = 1_000_000           # a transaction above this (raw) is not fetched
+TX_CACHE_BYTES = 32 << 20          # raw bytes of verified transactions kept; the oldest leave first
+SYNC_DEADLINE_TIMEOUTS = 4         # the default sync_deadline, in request timeouts
 NODE_ONLY = {
     "getbalances", "getbalance", "sendtoaddress", "listunspent", "createrawtransaction", "fundrawtransaction",
     "signrawtransactionwithwallet", "getnewaddress", "generatetoaddress", "generatetodescriptor", "generateblock",
@@ -95,6 +110,49 @@ class ImplausibleChain(ElectrumError):
 
 class _OffCheckpoint(HeaderError):
     pass
+
+
+class _Dropped(Exception):
+    """A server sent a line no pending request allows: its connection is closed."""
+
+
+@dataclass(frozen=True)
+class AnswerCap:
+    """The most one request's answer may be: bytes of its line, and JSON values in it."""
+    size: int = 16 << 10
+    values: int = 64
+
+
+def answer_cap(method: str, params) -> AnswerCap:
+    """What the answer to this request can be, at its largest (twice the hex of what was asked for,
+    plus the envelope). A method not named here answers with a hash, a header or a status."""
+    if method == "blockchain.block.headers":
+        try:
+            count = max(0, int(params[1]))
+        except (IndexError, TypeError, ValueError):
+            return AnswerCap()
+        return AnswerCap(4096 + 2 * V2_SIZE * count)
+    if method == "blockchain.transaction.get":
+        return AnswerCap(2 * MAX_TX_BYTES + 1024)
+    if method in ("blockchain.scripthash.get_history", "blockchain.scripthash.listunspent"):
+        return AnswerCap(4096 + 160 * MAX_HISTORY, 16 + 6 * MAX_HISTORY)
+    if method == "blockchain.transaction.get_merkle":
+        return AnswerCap(8192, 128)
+    return AnswerCap()
+
+
+def json_values(line: bytes) -> int:
+    """An upper bound on the JSON values in a line, from a byte count (strings are not tracked: the
+    answers are hex strings and small objects). Parsing costs memory per value, not per byte."""
+    return line.count(b",") + line.count(b"[") + line.count(b"{") + 1
+
+
+@dataclass
+class _Pending:
+    """A request waiting for its answer: the reader fills `msg` and sets `done`."""
+    cap: AnswerCap
+    done: threading.Event = field(default_factory=threading.Event)
+    msg: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -143,20 +201,23 @@ def parse_server(url: str) -> tuple[str, int, bool]:
 
 class ElectrumConnection:
     """One newline-delimited JSON-RPC connection. Notifications go to `on_notify(conn, method, params)`.
-    Subscriptions are re-sent after a reconnect."""
+    Subscriptions are re-sent after a reconnect. A line above what the pending requests can be
+    answered with (`_allowance`) closes the connection before it is parsed, and `on_drop(conn, why)`
+    is told."""
 
-    def __init__(self, url: str, *, timeout: float = 15.0, on_notify=None):
+    def __init__(self, url: str, *, timeout: float = 15.0, on_notify=None, on_drop=None):
         self.url = url
         self.host, self.port, self.tls = parse_server(url)
         self.timeout = float(timeout)
         self.on_notify = on_notify
+        self.on_drop = on_drop
         self.proto = ""
         self.server_id = ""
         self._sock: socket.socket | None = None
         self._wlock = threading.Lock()
         self._clock = threading.Lock()
         self._ids = itertools.count(1)
-        self._pending: dict[int, list] = {}
+        self._pending: dict[int, _Pending] = {}
         self._subs: dict[tuple, None] = {}
         self._reader: threading.Thread | None = None
 
@@ -186,7 +247,7 @@ class ElectrumConnection:
             self.close()
             raise
 
-    def close(self) -> None:
+    def close(self, why: str = "connection closed") -> None:
         with self._clock:
             s, self._sock = self._sock, None
         if s is not None:
@@ -196,33 +257,63 @@ class ElectrumConnection:
                 pass
             s.close()
         for slot in list(self._pending.values()):
-            slot[1] = {"error": {"message": "connection closed"}}
-            slot[0].set()
+            slot.msg = {"error": {"message": why}}
+            slot.done.set()
+
+    def _allowance(self) -> AnswerCap:
+        """What the next line may hold: the caps of the requests now pending and the slack for a
+        notification, at most MAX_LINE."""
+        caps = [slot.cap for slot in list(self._pending.values())]
+        return AnswerCap(min(MAX_LINE, NOTIFY_SLACK + sum(c.size for c in caps)),
+                         VALUE_SLACK + sum(c.values for c in caps))
+
+    def _admit(self, size: int, line: bytes | None = None) -> None:
+        """Hold a line, or with no `line` the `size` bytes of one still arriving, to the allowance."""
+        cap = self._allowance()
+        if size > cap.size:
+            raise _Dropped(f"a line of {size} bytes{'' if line is not None else ' so far'}, above the "
+                           f"{cap.size} allowed for what was asked")
+        if line is not None and json_values(line) > cap.values:
+            raise _Dropped(f"a line of {json_values(line)} JSON values, above the {cap.values} allowed "
+                           "for what was asked")
 
     def _read_loop(self, sock: socket.socket) -> None:
-        buf = b""
+        buf, seen, why = bytearray(), 0, ""
         try:
             while True:
                 chunk = sock.recv(1 << 16)
                 if not chunk:
                     break
                 buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                while (end := buf.find(b"\n", seen)) >= 0:
+                    line, seen = bytes(buf[:end]), 0
+                    del buf[:end + 1]
+                    self._admit(len(line), line)        # before it is parsed
                     if line.strip():
                         self._dispatch(json.loads(line))
-        except (OSError, ValueError):
+                seen = len(buf)
+                self._admit(seen)
+        except OSError:
             pass
+        except ValueError:
+            why = "dropped: a line that is not JSON"
+        except _Dropped as e:
+            why = f"dropped: {e}"
         finally:
             if self._sock is sock:
-                self.close()
+                if why and self.on_drop:
+                    self.on_drop(self, why)
+                self.close(why or "connection closed")
 
     def _dispatch(self, msg) -> None:
         for m in msg if isinstance(msg, list) else [msg]:
-            if m.get("id") is not None and m["id"] in self._pending:
-                slot = self._pending[m["id"]]
-                slot[1] = m
-                slot[0].set()
+            if not isinstance(m, dict):
+                raise _Dropped("a line that is not a JSON-RPC message")
+            rid = m.get("id")
+            slot = self._pending.get(rid) if type(rid) is int else None
+            if slot is not None:
+                slot.msg = m
+                slot.done.set()
             elif m.get("method") and self.on_notify:
                 try:
                     self.on_notify(self, m["method"], m.get("params") or [])
@@ -233,7 +324,7 @@ class ElectrumConnection:
         if self._sock is None:
             self.connect()
         rid = next(self._ids)
-        slot = [threading.Event(), None]
+        slot = _Pending(answer_cap(method, params))
         self._pending[rid] = slot
         try:
             line = (json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": list(params)}) + "\n").encode()
@@ -242,7 +333,7 @@ class ElectrumConnection:
                 if s is None:
                     raise ElectrumError(f"{self.url}: not connected")
                 s.sendall(line)
-            if not slot[0].wait(self.timeout if timeout is None else timeout):
+            if not slot.done.wait(self.timeout if timeout is None else timeout):
                 self.close()        # a server that stops answering is dropped; the next request reconnects
                 raise ElectrumError(f"{self.url}: {method} timed out")
         except OSError as e:
@@ -250,15 +341,15 @@ class ElectrumConnection:
             raise ElectrumError(f"{self.url}: {type(e).__name__}") from e
         finally:
             self._pending.pop(rid, None)
-        msg = slot[1] or {}
+        msg = slot.msg or {}
         if msg.get("error"):
             err = msg["error"]
             raise ElectrumError(str(err.get("message") if isinstance(err, dict) else err)[:400])
         return msg.get("result")
 
-    def subscribe(self, method: str, *params):
+    def subscribe(self, method: str, *params, timeout: float | None = None):
         self._subs[(method, tuple(params))] = None
-        return self.request(method, *params)
+        return self.request(method, *params, timeout=timeout)
 
 
 class ElectrumBackend:
@@ -270,10 +361,13 @@ class ElectrumBackend:
     def __init__(self, servers: list[str], *, chain: str, checkpoint: tuple[int, str] | None = None,
                  store_path: Path | None = None, timeout: float = 15.0, min_servers: int | None = None,
                  sync_interval: float = 1.0, connection=ElectrumConnection, clock=time.time,
-                 plausibility: Plausibility | None = None, tip_cap_spacing_s: int | None = None):
+                 plausibility: Plausibility | None = None, tip_cap_spacing_s: int | None = None,
+                 sync_deadline: float | None = None):
         """`tip_cap_spacing_s`: a claimed tip is believed up to one block per this many seconds since our
         tip's time, plus HEADERS_CHUNK. None: TIP_CAP_SPACING_S on mainnet, no cap elsewhere (regtest
-        mines blocks as fast as it is asked to)."""
+        mines blocks as fast as it is asked to).
+        `sync_deadline`: seconds one server has for its part of a sync round (None: SYNC_DEADLINE_TIMEOUTS
+        request timeouts). What it proved by then is kept."""
         if not servers:
             raise ElectrumError("no Electrum servers configured (B2_ELECTRUM_SERVERS)")
         try:
@@ -297,7 +391,8 @@ class ElectrumBackend:
         self.headers = HeaderChain(chain, checkpoint, store_path, clock=clock)
         self.plausibility = plausibility or (Plausibility.mainnet(checkpoint) if chain == "main" else None)
         self.tip_cap_spacing_s = tip_cap_spacing_s or (TIP_CAP_SPACING_S if chain == "main" else None)
-        self.conns = [connection(u, timeout=timeout, on_notify=self._on_notify) for u in servers]
+        self.sync_deadline = float(sync_deadline or SYNC_DEADLINE_TIMEOUTS * float(timeout))
+        self.conns = [connection(u, timeout=timeout, on_notify=self._on_notify, on_drop=self._flag) for u in servers]
         self.min_servers = max(1, min(len(self.conns), int(min_servers if min_servers is not None
                                                            else (2 if chain == "main" else 1))))
         self.sync_interval = float(sync_interval)
@@ -307,8 +402,11 @@ class ElectrumBackend:
         self._tip_dirty = True
         self._changed = threading.Event()
         self._watched: set[str] = set()
-        self._tx: dict[str, Tx] = {}
-        self._conf: dict[str, tuple[int, str]] = {}
+        self._cache_lock = threading.Lock()
+        self._tx: dict[str, Tx] = {}             # verified transactions, oldest first (_remember)
+        self._tx_size: dict[str, int] = {}
+        self._tx_bytes = 0
+        self._conf: dict[str, tuple[int, str]] = {}   # proven confirmations of transactions in _tx
         self.server_state: dict[str, dict] = {c.url: {} for c in self.conns}
         self.flags: list[dict] = []
 
@@ -350,9 +448,9 @@ class ElectrumBackend:
                                 f"at least {self.min_servers} needed")
         return live
 
-    def _ask(self, conn, method, *params):
+    def _ask(self, conn, method, *params, timeout: float | None = None):
         try:
-            return conn.request(method, *params)
+            return conn.request(method, *params, timeout=timeout)
         except ElectrumError as e:
             self._flag(conn, f"{method}: {e}")
             raise
@@ -407,24 +505,36 @@ class ElectrumBackend:
             raise ImplausibleChain(f"the verified chain is not believable yet: {why}")
         return self.headers.tip_height
 
-    def _header(self, conn, height: int) -> bytes:
-        return bytes.fromhex(self._ask(conn, "blockchain.block.header", int(height)))
+    def _header(self, conn, height: int, timeout: float | None = None) -> bytes:
+        return bytes.fromhex(self._ask(conn, "blockchain.block.header", int(height), timeout=timeout))
 
-    def _fetch_checkpoint(self, conn) -> None:
+    def _fetch_checkpoint(self, conn, left) -> None:
         """The checkpoint header and the headers below it that the median-time rule needs."""
         cp, n = self.headers.cp_height, self.headers.prior_needed
         try:
-            raw = self._header(conn, cp)
+            raw = self._header(conn, cp, left())
             prior = []
             if n:
-                r = self._ask(conn, "blockchain.block.headers", cp - n, n)
+                r = self._ask(conn, "blockchain.block.headers", cp - n, n, timeout=left())
                 prior = split_headers(bytes.fromhex(r.get("hex") or ""))
             self.headers.set_checkpoint(raw, prior)
         except (HeaderError, ElectrumError, ValueError, AttributeError) as e:
             raise _OffCheckpoint(str(e)) from e
 
     def _sync_from(self, conn) -> None:
-        tip = conn.subscribe("blockchain.headers.subscribe")
+        """One server's part of a sync round. It ends at `sync_deadline`, and at the first answer
+        with fewer headers than asked for below the tip the server claims; either way the headers
+        proven by then are adopted and the server is flagged (by the caller, from what is raised)."""
+        deadline = time.monotonic() + self.sync_deadline
+
+        def left() -> float:
+            """The wait for the next request: the request timeout, or less when the deadline is nearer."""
+            t = deadline - time.monotonic()
+            if t <= 0:
+                raise ElectrumError("sync deadline")
+            return min(conn.timeout, t)
+
+        tip = conn.subscribe("blockchain.headers.subscribe", timeout=left())
         th = int(tip["height"])
         tip_h = parse_header(bytes.fromhex(tip["hex"]))
         self.server_state[conn.url].update(tip=th, tip_hash=tip_h.hash)
@@ -438,7 +548,7 @@ class ElectrumBackend:
         except HeaderError as e:                     # before we hold a chain: another chain's PoW
             raise (HeaderError if self.headers.ready else _OffCheckpoint)(f"tip at {th}: {e}") from e
         if not self.headers.ready:
-            self._fetch_checkpoint(conn)
+            self._fetch_checkpoint(conn, left)
         ours, our_time = self.headers.tip_height, self.headers.tip().time
         mine = self.headers.at(th)
         if mine is not None and mine.hash == tip_h.hash:
@@ -452,38 +562,46 @@ class ElectrumBackend:
         # the highest height where the server agrees with us (the checkpoint at worst)
         h, step = min(end, ours), 1
         while h > cp:
-            theirs = parse_header(self._header(conn, h))
+            theirs = parse_header(self._header(conn, h, left()))
             m = self.headers.at(h)
             if m is not None and theirs.hash == m.hash:
                 break
             h, step = max(cp, h - step), step * 2
         b = self.headers.branch(h)
-        start, bad = h + 1, None
+        start, bad, failed = h + 1, None, None
         while start <= end:
-            r = self._ask(conn, "blockchain.block.headers", start, min(HEADERS_CHUNK, end - start + 1))
-            chunk = split_headers(bytes.fromhex(r.get("hex") or ""))
-            if not chunk:
-                break                                # withheld: keep what we have, most work still decides
+            want = min(HEADERS_CHUNK, end - start + 1)
+            try:
+                r = self._ask(conn, "blockchain.block.headers", start, want, timeout=left())
+                chunk = split_headers(bytes.fromhex(r.get("hex") or ""))[:want]
+            except (ElectrumError, ValueError, AttributeError, TypeError) as e:
+                failed = e                           # no answer, or not one: the branch so far is still adopted
+                break
             before = len(b)
             try:
                 b.extend(chunk)
             except HeaderError as e:
                 bad = e
             start += len(b) - before
-            if bad:
-                break
+            if bad or len(chunk) < want:
+                break                                # short of what was asked, below its own tip: withheld
         if len(b):
             self.headers.adopt(b)
         if bad:
             raise HeaderError(f"block.headers: {bad} (the headers before it were kept)")
+        if failed is not None:
+            if time.monotonic() >= deadline:
+                raise ElectrumError(f"sync deadline: served up to {start - 1}, claims tip {th}") from failed
+            raise failed
         if start <= end:
             raise ElectrumError(f"withheld headers: served up to {start - 1}, claims tip {th}")
 
     # --- verified transactions -----------------------------------------------------------------------
     def _fetch_tx(self, txid: str) -> Tx | None:
         txid = txid.lower()
-        if txid in self._tx:
-            return self._tx[txid]
+        cached = self._tx.get(txid)
+        if cached is not None:
+            return cached
         for c in self._live():
             try:
                 raw = c.request("blockchain.transaction.get", txid)   # "not found" is an answer, not a fault
@@ -497,25 +615,81 @@ class ElectrumBackend:
             if not ok:
                 self._flag(c, f"transaction.get {txid[:16]}: not the transaction asked for")
                 continue
-            self._tx[txid] = tx
+            self._remember(txid, tx, len(raw) // 2)
             return tx
         return None
 
+    def _remember(self, txid: str, tx: Tx, size: int) -> None:
+        """Cache a verified transaction of `size` raw bytes. Above TX_CACHE_BYTES the oldest leave,
+        each with its cached confirmation: one that is asked for again is fetched and proven again."""
+        with self._cache_lock:
+            if txid in self._tx:
+                return
+            self._tx[txid], self._tx_size[txid] = tx, size
+            self._tx_bytes += size
+            while self._tx_bytes > TX_CACHE_BYTES and self._tx:
+                old = next(iter(self._tx))
+                del self._tx[old]
+                self._tx_bytes -= self._tx_size.pop(old)
+                self._conf.pop(old, None)
+
+    def _listing(self, conn, method: str, sh: str) -> list | None:
+        """One server's get_history or listunspent answer for a script, or None when it has none we
+        can use: no answer, or more than MAX_HISTORY entries (flagged)."""
+        try:
+            rows = self._ask(conn, method, sh) or []
+        except ElectrumError:
+            return None
+        name = method.rsplit(".", 1)[-1]
+        if not isinstance(rows, list):
+            self._flag(conn, f"{name}: not a list")
+            return None
+        if len(rows) > MAX_HISTORY:
+            self._flag(conn, f"{name}: {len(rows)} entries, above the {MAX_HISTORY} allowed: the answer is not used")
+            return None
+        return rows
+
     def _history(self, spk: bytes) -> dict[str, list]:
-        """txid -> [(conn, claimed height)], the union over every live server."""
+        """txid -> [(conn, claimed height)], the union over every live server whose answer can be
+        used. With no such answer it raises: an empty history means the servers say there is none."""
         sh = scripthash(spk)
         out: dict[str, list] = {}
+        answered = 0
         for c in self._live():
-            try:
-                hist = self._ask(c, "blockchain.scripthash.get_history", sh) or []
-            except ElectrumError:
+            hist = self._listing(c, "blockchain.scripthash.get_history", sh)
+            if hist is None:
                 continue
+            answered += 1
             for e in hist:
                 try:
                     out.setdefault(str(e["tx_hash"]).lower(), []).append((c, int(e["height"])))
                 except (KeyError, TypeError, ValueError):
                     self._flag(c, "get_history: malformed entry")
+        if not answered:
+            raise ElectrumError("no server answered get_history for the script")
         return out
+
+    def _history_txs(self, spk: bytes, hist: dict[str, list]):
+        """Yield (txid, Tx) for each transaction of a script's history that a server supplies, one
+        at a time. Once all are seen, an entry that neither pays `spk` nor spends an output of this
+        history that pays it was invented: every server that listed it is flagged. An entry whose
+        prevout transaction is in the history but was not supplied is left alone (unknown)."""
+        pays: dict[str, frozenset[int]] = {}             # txid -> its outputs that pay spk
+        spends: dict[str, list[tuple[str, int]]] = {}    # txid -> its prevouts in this history, if it pays nothing
+        for txid in hist:
+            tx = self._fetch_tx(txid)
+            if tx is None:
+                continue
+            pays[txid] = frozenset(n for n, o in enumerate(tx.outputs) if o.script_pubkey == spk)
+            if not pays[txid]:
+                spends[txid] = [(prev, i.vout) for i in tx.inputs if (prev := i.txid[::-1].hex()) in hist]
+            yield txid, tx
+        liars = set()
+        for txid, prevouts in spends.items():
+            if not any(prev not in pays or vout in pays[prev] for prev, vout in prevouts):
+                liars.update(c for c, _ in hist[txid])
+        for c in liars:
+            self._flag(c, "get_history lists a transaction that neither pays nor spends the script")
 
     def _confirmed(self, txid: str, claims: list) -> tuple[int, str] | int | None:
         """(height, blockhash) once a Merkle proof ties txid to our header at a claimed height; 0 if
@@ -550,8 +724,10 @@ class ElectrumBackend:
             if root != hdr.merkle_root or int(m.get("block_height", height)) != height:
                 self._flag(c, f"get_merkle {txid[:16]}@{height}: proof does not reach our header")
                 continue
-            self._conf[txid] = (height, hdr.hash)
-            return self._conf[txid]
+            with self._cache_lock:
+                if txid in self._tx:                    # evicted meanwhile: proven, but not kept
+                    self._conf[txid] = (height, hdr.hash)
+            return height, hdr.hash
         return 0 if mempool else None
 
     def _locate(self, txid: str) -> tuple[Tx | None, tuple[int, str] | int | None]:
@@ -575,21 +751,21 @@ class ElectrumBackend:
         return spks[:2]
 
     def _spender(self, txid: str, vout: int, spk: bytes, *, mempool: bool) -> tuple[str, int] | None:
-        """(spending txid, height or 0) from the union of the script's histories. A mempool spend is
-        returned only with `mempool`."""
-        found = None
-        for t, claims in self._history(spk).items():
-            if t == txid:
+        """(spending txid, height or 0) from the union of the script's histories. A confirmed spend
+        comes before a mempool one, which is returned only with `mempool`."""
+        hist = self._history(spk)
+        confirmed = unconfirmed = None
+        for t, stx in self._history_txs(spk, hist):      # run to the end: it flags invented entries
+            if t == txid or confirmed:
                 continue
-            stx = self._fetch_tx(t)
-            if stx is None or not any(i.txid[::-1].hex() == txid and i.vout == int(vout) for i in stx.inputs):
+            if not any(i.txid[::-1].hex() == txid and i.vout == int(vout) for i in stx.inputs):
                 continue
-            st = self._confirmed(t, claims)
+            st = self._confirmed(t, hist[t])
             if isinstance(st, tuple):
-                return t, st[0]
-            if st == 0 and mempool:
-                found = (t, 0)
-        return found
+                confirmed = (t, st[0])
+            elif st == 0 and mempool:
+                unconfirmed = (t, 0)
+        return confirmed or unconfirmed
 
     def _address(self, spk: bytes) -> str | None:
         if len(spk) in (22, 34) and spk[0] in (0x00, 0x51) and spk[1] == len(spk) - 2:
@@ -718,7 +894,7 @@ class ElectrumBackend:
             accepted = True
         if not accepted:            # every server refused it: the node's reason, as sendrawtransaction gives it
             raise ElectrumError(errors[0] if errors else "no server accepted the transaction")
-        self._tx.setdefault(txid, tx)
+        self._remember(txid, tx, len(hex_tx) // 2)
         return txid
 
     def _rpc_scantxoutset(self, action, descriptors=()):
@@ -732,15 +908,26 @@ class ElectrumBackend:
                 raise ElectrumError(f"scantxoutset: the light backend takes raw(<script>) descriptors, not {d!r}")
             spk = bytes.fromhex(d[4:-1])
             claims: dict[tuple, list] = {}
+            answered = 0
             for c in self._live():
-                try:
-                    for u in self._ask(c, "blockchain.scripthash.listunspent", scripthash(spk)) or []:
-                        claims.setdefault((str(u["tx_hash"]).lower(), int(u["tx_pos"])), []).append((c, int(u["height"])))
-                except (ElectrumError, KeyError, TypeError, ValueError):
+                rows = self._listing(c, "blockchain.scripthash.listunspent", scripthash(spk))
+                if rows is None:
                     continue
+                answered += 1
+                for u in rows:
+                    try:
+                        claims.setdefault((str(u["tx_hash"]).lower(), int(u["tx_pos"])), []).append((c, int(u["height"])))
+                    except (KeyError, TypeError, ValueError):
+                        self._flag(c, "listunspent: malformed entry")
+            if not answered:                    # as _history: no answer is not "nothing unspent"
+                raise ElectrumError("no server answered listunspent for the script")
             for (txid, n), cl in claims.items():
                 tx = self._fetch_tx(txid)
-                if tx is None or n >= len(tx.outputs) or tx.outputs[n].script_pubkey != spk:
+                if tx is None:
+                    continue
+                if not 0 <= n < len(tx.outputs) or tx.outputs[n].script_pubkey != spk:
+                    for c in {c for c, _ in cl}:
+                        self._flag(c, "listunspent lists an output that does not pay the script")
                     continue
                 st = self._confirmed(txid, cl)
                 if not isinstance(st, tuple):   # the UTXO set holds confirmed coins only
@@ -824,4 +1011,5 @@ def servers_from_env(value: str | None) -> list[str]:
 
 
 __all__ = ["ElectrumBackend", "ElectrumConnection", "ElectrumError", "CheckpointMismatch", "LightBackendError",
-           "ImplausibleChain", "Plausibility", "is_loopback_host", "scripthash", "checkpoint_from_env", "servers_from_env"]
+           "ImplausibleChain", "Plausibility", "AnswerCap", "answer_cap", "is_loopback_host", "scripthash",
+           "checkpoint_from_env", "servers_from_env"]

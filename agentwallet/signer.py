@@ -48,7 +48,7 @@ from xbt402.channel import ChannelError  # noqa: E402  (B1 on sys.path through .
 from .sanitize import sanitize
 from .treasury import Treasury, TREASURY_CSV
 from .vault import PresignedVault
-from .xbt402 import Xbt402Session, origin_of
+from .xbt402 import Xbt402Session, origin_of, refuse_fragment
 
 XBT_SATS = 100_000_000
 
@@ -903,6 +903,10 @@ class Signer:
             max_sats = int(params["max_sats"]) if params.get("max_sats") is not None else 0
         except (TypeError, ValueError):
             return _deny("amount", "max_sats must be an integer")
+        try:
+            refuse_fragment(url)               # review T2: before the policy is asked, or anything sent
+        except ChannelError as e:
+            return _deny("dest", str(e))          # the rule the Rust wallet reports
         try:
             dest = origin_of(url)
         except ValueError as e:
