@@ -31,7 +31,7 @@ terms (`fund` with `origin`, `params`), and B2 issues no such keys, so B2 refuse
 | `anchor_status` | — | AGP-016. Anchored line count and head, lines not yet anchored, the last error. Not an MCP tool |
 | `hot_reconcile` | `scan?` (default true), `last?` | AGP-016. With `last`, report the last reconcile (the one at start) without running one. Otherwise re-check the hot UTXO set against the node (gettxout; with `scan`, scantxoutset over every hot key). Not an MCP tool |
 
-Existing methods (`balance`, `quote_payment`, `pay`, `history`, `approve`, `recover_vault`) are unchanged. `pay` to a dest with a channel (or a registered `pay_to`) is an off-chain increment.
+Existing methods (`balance`, `quote_payment`, `pay`, `history`, `approve`, `recover_vault`) are unchanged. `pay` to a dest with a channel (or a registered `pay_to`) is an off-chain increment. An on-chain `pay` is booked before `sendtoaddress` (AGP-084): only the node's JSON-RPC error takes the row back; any other failure raises with the payment still in the ledger as `onchain:unconfirmed:<token>`, because the node may have sent it.
 
 MCP tools are exactly: `balance`, `quote_payment`, `pay`, `history`, `channels`, `xbt402_pay`, `close_channel`, and since AGP-013 `xbt402_refund`, `forward_status`, `forward_recover`.
 

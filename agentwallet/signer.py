@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import socket
 import threading
 import time
@@ -41,7 +42,7 @@ from .forward import ForwardPolicy, ForwardSession
 from .hot import HotCapError, HotWallet
 from .keystore import KeyStore, KeyStoreError
 from .policy import Payment, PolicyConfig, PolicyEngine, PolicyStore, AuditLog, Verdict, normalize_dest
-from .rpc import KnotsRpc, KnotsRpcError
+from .rpc import KnotsRpc, KnotsRpcError, KnotsRpcRefused
 
 from xbt402.channel import ChannelError  # noqa: E402  (B1 on sys.path through .channels)
 from .sanitize import sanitize
@@ -686,8 +687,22 @@ class Signer:
         if self.light:
             return _deny("light_backend", "on-chain pay spends the node wallet, and a light client has none: "
                                           "pay through a channel")
-        txid = self._send(pay)
+        # AGP-084 K1 (as the Rust rail, AGP-080): booked before the node is asked to send. A crash, or
+        # a node that never answers, leaves the payment counted; only the node's own refusal takes it back
+        ahead = f"onchain:unconfirmed:{secrets.token_urlsafe(16)}"
+        self.engine.commit(pay, txid=ahead)
+        try:
+            txid = self._send(pay)
+            if not isinstance(txid, str) or not txid:
+                raise KnotsRpcError(f"sendtoaddress answered {txid!r}, not a txid")
+        except KnotsRpcRefused:
+            self.engine.store.amend(ahead, None)
+            raise
+        except Exception as e:
+            raise KnotsRpcError(f"{e}; the node may have sent this payment, so it stays in the ledger as {ahead}") from e
+        # the row under the txid first: a crash here counts the payment twice, never not at all
         self.engine.commit(pay, txid=txid)
+        self.engine.store.amend(ahead, None)
         try:
             self.vault.refresh()
         except KnotsRpcError:
