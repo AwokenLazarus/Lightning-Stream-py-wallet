@@ -21,6 +21,7 @@ unchanged on either.
 | `B2_ELECTRUM_CHECKPOINT` | `<height>:<hash>`. Mainnet defaults to `961640:0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb`, the first BLAKE2b block. Other chains must set it (regtest: block 101 of the rig) |
 | `B2_ELECTRUM_MIN_SERVERS` | servers that must answer (default 2 on mainnet, 1 elsewhere). Configure at least one more than this, so one server down does not stop the wallet |
 | `B2_ELECTRUM_TIMEOUT` | seconds per request (default 15) |
+| `B2_ELECTRUM_SYNC_DEADLINE` | seconds one server has for its part of a header sync (default 4 timeouts); what it proved by then is kept (AGP-081) |
 | `B2_CHAIN` | required with Electrum: a light client does not ask a node which chain it is on |
 
 The verified headers persist in `.run/headers-<chain>.bin` and are verified again at load.
@@ -96,7 +97,24 @@ Cannot:
 - get a short cheap fork believed on mainnet: it is below the pins or the minimum work (AGP-069);
 - stall other callers: no lock is held across a network read, servers sync in parallel, and once a
   chain is held a caller that finds a sync running answers from it. Each chunk of headers is checked
-  as it arrives, and on mainnet nothing above ours + (time since our tip / 150 s) + 2016 is fetched.
+  as it arrives, and on mainnet nothing above ours + (time since our tip / 150 s) + 2016 is fetched;
+- hold a sync round open by trickling headers (AGP-081): an answer with fewer headers than asked
+  for, below the tip the server itself claims, ends that server's part of the round ("withheld
+  headers"), and so does `sync_deadline` ("sync deadline"). The headers it proved are kept, and it
+  is flagged;
+- exhaust memory with one line (AGP-081): every request has an answer cap from its method and
+  params (`electrum.answer_cap`: headers 4096 + 328 bytes per header asked for, a transaction
+  2,001,024, a history or unspent list 1,604,096 bytes and 60,016 JSON values, a Merkle proof 8192
+  and 128, anything else 16 KiB and 64). A line, whole or still arriving, above 16 KiB plus the caps
+  of the requests pending on that connection (8 MiB at most), or with more commas and opening
+  brackets than their value caps plus 64, closes the connection before it is parsed, and the server
+  is flagged. Transactions above 1 MB are therefore not fetched;
+- grow the wallet's memory with invented histories (AGP-081): a history or unspent list of more
+  than 10,000 entries is not used, an entry that neither pays the script nor spends an output of
+  the same history that pays it is flagged (as is an unspent output that does not pay it), and the
+  cache of verified transactions holds 32 MiB of raw bytes, the oldest leaving first with their
+  cached confirmations. With no usable history answer from any server the call fails; it does not
+  report an empty history.
 
 Can (and how it is bounded):
 - **Hide a transaction** from us until another server or a block shows it. A hidden close delays
@@ -112,7 +130,10 @@ Can (and how it is bounded):
   fail or a pending change look counted until reconcile; it moves no coins.
 - **Lie about fee estimates** (reported as unverified; B2's fundings use its own fixed fees).
 - **Be slow or disconnect** (a timeout drops the connection; the next request reconnects). A call
-  that asks every server waits for the slowest, up to the timeout.
+  that asks every server waits for the slowest, up to the timeout per request. Only the header sync
+  has a deadline for the whole of a server's part: a history of N entries is still N transaction
+  requests (N at most 10,000 per server and script), each of which may take up to the timeout, and
+  a reconnect is a handshake plus one request per watched script.
 - **Build a fork above the newest pin**, where blocks are cheap (difficulty `1a00f0b5`): the
   minimum work and the height floor only raise the bar. Releases should bump the pins.
 - **Learn which scripts we watch** (privacy): every hot key and every unsettled channel's funding script.

@@ -81,6 +81,15 @@ def open_expiry_blocks(want: int, min_expiry: int, max_expiry: int, min_conf: in
     return max(0, min(max(want, min_expiry + min_conf + close_margin), max_expiry - 1))
 
 
+def refuse_fragment(url) -> None:
+    """review T2 (AGP-081): the request digest drops everything from `#`, and a server routes on the
+    target as it arrives, so a payment for `/a` would also authenticate `/a#b`. The digest stays as
+    published; the payer refuses a URL with a `#` before anything is signed, funded or sent."""
+    if "#" in str(url):
+        raise ChannelError("bad_request", "the URL has a '#' fragment, which a payment cannot be bound to; "
+                                           "refused before any request")
+
+
 def charged_of(resp, default: int) -> int:
     """`charged` of the channel receipt inside a PAYMENT-RESPONSE SettlementResponse (xbt402 v1.1)."""
     try:
@@ -341,6 +350,7 @@ class Xbt402Session:
     def _with_auth(self, payload: dict, method: str, url: str, body: bytes) -> dict:
         """H3: bind this payload to (method, URL, body): scheme, host, port and target, length-prefixed
         (xbt402 v1.3, AGP-068). The ECDH key stays in the book."""
+        refuse_fragment(url)                   # every paid request passes here; the callers refuse it earlier
         pl = dict(payload)
         req = request_digest_v2(method, url, body or b"")
         pl["auth"] = self.book.request_auth(pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
@@ -419,6 +429,7 @@ class Xbt402Session:
         return res
 
     def _pay_once(self, url: str, method: str, body: bytes, max_sats: int, expiry_blocks: int, cap_sats: int) -> dict:
+        refuse_fragment(url)
         dest = origin_of(url)
         t0 = time.time()
         st, hdrs, out = XbtChannelClient.http(method, url, body or b"")
@@ -531,7 +542,8 @@ class Xbt402Session:
         out = {"stream_charged": 0}
         try:
             check_manifest(m, acc["payTo"])
-        except StreamError as e:
+            refuse_fragment(doc.get("chunkUrl"))    # the seller's URL for every chunk, the hash-locked last one too
+        except (StreamError, ChannelError) as e:
             return {**out, "stream": {"ok": False, "refused": str(e)}}
         if m["n"] * m["price"] > budget:
             return {
