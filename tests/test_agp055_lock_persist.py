@@ -343,9 +343,10 @@ class CrashAtEveryStep(unittest.TestCase):
         spent, paid = b.rs.spend.since(0) - spent0, len(b.rs.engine.store.payments()) - paid0
         if resolved:
             self.assertEqual((rec.used_sats, lk), (self.CUM, {}), tag)
-        # a resolve that reached disk is booked exactly once in both budgets, whether the rows were
-        # written before the crash or by the restart (b.rs.recovered_bookings); nothing else is booked
-        want = (1000, 1) if rec.used_sats == self.CUM else (0, 0)
+        # AGP-080: a lock is booked when it is pre-signed. One that reached disk (pending, or resolved)
+        # is in both budgets exactly once, whether its rows were written before the crash or by the
+        # restart (b.rs.recovered_bookings); nothing else is booked
+        want = (1000, 1) if lk or rec.used_sats == self.CUM else (0, 0)
         self.assertEqual((spent, paid), want, tag)
         again = rig("keyfile", d=r.d, ks=r.ks, chan=r.chan)   # a second restart books nothing more
         self.assertEqual((again.rs.recovered_bookings, again.rs.spend.since(0) - spent0), (0, want[0]), tag)

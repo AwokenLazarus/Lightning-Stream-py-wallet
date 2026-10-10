@@ -113,6 +113,8 @@ class ForwardRail(unittest.TestCase):
         write_policy(self.tmp, forward=fwd, per_counterparty_cap_sats=20_000_000, max_per_tx_sats=5_000_000,
                      daily_budget_sats=50_000_000)
         self.rpc = FakeRpc(height=7000)
+        self.rpc.deployments = {"deployments": {"long_coinbase_maturity": {      # AGP-080 M1: the node's rule
+            "coinbase_start_height": 0, "height": 0, "height_end": 4_000_000, "maturity": MATURITY_419}}}
         self.s = Signer(self.tmp, rpc=self.rpc)
         self.s._xbt402.network = lambda: NETWORK
         self.p = fund_channel(self.s.channels, self.rpc, MARKET, expiry=8000, capacity=10_000_600,

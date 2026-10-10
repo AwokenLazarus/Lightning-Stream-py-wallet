@@ -7,7 +7,9 @@ exactly `balance`, `quote_payment`, `pay`, `history`, `channels`, `xbt402_pay`,
 Over-threshold pays need a human ed25519 signature via `agentwallet-approve`
 (private key on `~/xbt-rnd/b2-human-device/`, never under this workspace).
 Allowlisted counterparties spend through Spillman channels (cap = policy budget);
-fundings are 0x21. The treasury has a CSV `older(4320)` recovery path.
+fundings are 0x21. The treasury has a CSV `older(4320)` recovery path;
+`fund_treasury` and `recover_treasury` need the human's signature, over the amount and over the
+destination (AGP-080).
 
 ```
 verify: cd ~/xbt-rnd/b2 && bash demo.sh && python3 ~/xbt-rnd/tools/miners_left.py 30300-30399
@@ -56,7 +58,9 @@ plain state below it is refused, one at or above it dominates it. The lock (cum,
 is on disk before the pre-signature leaves; `xbt402_resolve_lock` takes t + r (hub) or t (the
 provider's signed receipt); `xbt402_recover_lock` reads t + r off the hub's ch1 close after a restart;
 `xbt402_void_lock` gives a lock up and `xbt402_adopt_lock` accepts only the cum of a lock this wallet
-gave up (the hub completed it later from chain). `RouteSigner` is the same over an in-process
+gave up (the hub completed it later from chain). A lock is booked in the policy ledger and the routed
+budget when it is pre-signed, and a void releases nothing (AGP-080): the hub may still hold the
+pre-signature, so a later lock or state on that channel up to the voided amount rides on the booking. `RouteSigner` is the same over an in-process
 ChannelBook with B1's signer API, for `RoutePayer(signer=...)`. Uses B1's `xbt402.adaptor` when the
 pinned B1 has it (libsecp256k1 secret multiplications), else `fwd/adaptor.py`.
 

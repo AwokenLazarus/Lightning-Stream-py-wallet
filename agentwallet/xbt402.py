@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from . import netparams
 from .b1path import ensure_b1
-from .channels import ChannelBook, fee_payer_kw
+from .channels import ChannelBook, ChannelCapError, booked_through, fee_payer_kw
 from .hot import HotWallet
 from .sanitize import UNTRUSTED_KEY, untrusted
 from .stream import H, StreamError, check_chunk, check_manifest, open_final
@@ -56,6 +56,28 @@ def origin_of(url: str) -> str:
     if not p.scheme or not p.netloc:
         raise ValueError("xbt402_pay needs an absolute URL")
     return f"{p.scheme}://{p.netloc}"
+
+
+def same_origin_url(dest: str, value) -> str:
+    """AGP-080 X1: where the seller says its open or its chunks are, held to the origin the policy
+    allowed. `dest + value` let `@evil.example/open` name another host. Accepted: a path starting with
+    exactly one `/`, or an absolute URL on `dest`'s own origin; no backslash, whitespace or control
+    character either way. Anything else is refused before a request is made."""
+    def refuse():
+        return ChannelError("seller_url", "the seller's URL is not on its own origin; refused before any request")
+    if not isinstance(value, str) or not value:
+        raise refuse()
+    if any(c == "\\" or c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise refuse()
+    if value.startswith("/") and not value.startswith("//"):
+        return dest + value
+    try:
+        same = "://" in value and origin_of(value) == dest
+    except ValueError:
+        same = False
+    if not same:
+        raise refuse()
+    return value
 
 
 def pick_accept(pr: dict, network: str) -> dict:
@@ -217,7 +239,7 @@ class Xbt402Session:
         params = ChannelParams.derive(acc["payTo"], payer_pub, expiry, close_fee, self.hot.spk.hex(),
                                       network=acc["network"], **fee_payer_kw(fee_payer))
         funded = cap + payer_fee
-        open_url = dest + extra.get("openUrl", "/x402/xbt-channel/open")
+        open_url = same_origin_url(dest, extra.get("openUrl", "/x402/xbt-channel/open"))
         self._preflight(open_url, acc["network"], params, funded, fee_payer)
         prep = self.hot.prepare_fund(params.spk, funded)
         params.funding_txid, params.funding_vout, params.capacity = prep["txid"], 0, funded
@@ -278,6 +300,8 @@ class Xbt402Session:
         rec = self.book.get(dest)
         if rec is None or rec.state != "pending":
             return rec.public() if rec else {}
+        if rec.open_url:                               # a record from before AGP-080 may hold one off the origin
+            same_origin_url(rec.origin or dest, rec.open_url)
         confs = self.funding_confirmations(rec)
         if confs is None and rec.funding_hex:          # never reached the node, or was evicted: send it again
             try:
@@ -366,11 +390,23 @@ class Xbt402Session:
     @staticmethod
     def _booked_through(rec) -> int:
         """Sats of this channel already in the policy ledger. -1 means a pre-AGP-063 record."""
+        return booked_through(rec)
+
+    def _book_through(self, dest: str, cum: int) -> int:
+        """AGP-080: commit what a state worth `cum` adds to the channel's booked high-water mark, before
+        that state is signed (a hash lock, a forward lot's pre-signature: states that do not move
+        used_sats until they settle). Idempotent on xbt402:{chan}:{cum}. Returns the sats committed."""
+        rec = self.book.get(dest)
         if rec is None:
+            raise ChannelError("unknown_channel", dest)
+        delta = int(cum) - self._booked_through(rec)
+        if delta <= 0:
             return 0
-        if rec.ledger_booked_sats < 0:
-            return rec.used_sats
-        return rec.ledger_booked_sats
+        if self._spend_book is None:
+            raise ChannelError("xbt402", "signed increase has no ledger booking")
+        self._spend_book(dest, delta, rec.chan, int(cum))
+        self.book.mark_ledger_booked(dest, int(cum))
+        return delta
 
     def _book_unbooked(self, dest: str) -> int:
         """Commit any signed amount the ledger does not yet hold. Idempotent on xbt402:{chan}:{cum}."""
@@ -554,9 +590,13 @@ class Xbt402Session:
                 },
                 "body": "",
             }
+        try:
+            chunk_url = same_origin_url(dest, doc.get("chunkUrl"))
+        except ChannelError as e:
+            return {**out, "stream": {"ok": False, "refused": f"chunkUrl: {e}"}, "body": ""}
         parts, spent = [], 0
         for i in range(m["n"] - 1):
-            url = dest + doc["chunkUrl"].replace("{i}", str(i))
+            url = chunk_url.replace("{i}", str(i))
             rec = self.book.fresh_seq(dest)
             t = time.time()
             st, _, raw, receipt = self._paid("GET", url, b"", acc, {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats)})
@@ -655,7 +695,10 @@ class Xbt402Session:
 
     def _final_chunk(self, dest, doc, m):
         t = time.time()
-        url = dest + doc["chunkUrl"].replace("{i}", str(m["n"] - 1))
+        try:
+            url = same_origin_url(dest, doc.get("chunkUrl")).replace("{i}", str(m["n"] - 1))
+        except ChannelError as e:
+            raise StreamError(f"chunkUrl: {e}") from None
         st, hdrs, _ = XbtChannelClient.http("GET", url, b"")
         if st != 402 or "PAYMENT-REQUIRED" not in {k.upper() for k in hdrs}:
             raise StreamError("last chunk is not offered under the manifest's hash lock")
@@ -672,6 +715,16 @@ class Xbt402Session:
             raise StreamError("last chunk offer carries no ciphertext; refused before signing")
         if H(cipher).hex() != m["finalCt"]:
             raise StreamError("last chunk offer's ciphertext does not match the committed finalCt; refused before signing")
+        # AGP-080 W1: the hash-locked state pays used_sats + price to a provider that knows k, and it
+        # does not move used_sats: book it before it is signed. The plain state that folds it in then
+        # books nothing more, and a last chunk that fails keeps the booking (the provider holds the lock).
+        try:
+            self.book.check_signable(dest, int(m["price"]))
+            self._book_through(dest, self.book.get(dest).used_sats + int(m["price"]))
+        except ChannelCapError as e:
+            raise StreamError(f"last chunk: {e}") from None
+        except ChannelError as e:
+            raise StreamError(f"last chunk: {e.code}") from None
         with self.book._lock:
             rec = self.book._records[dest]
             payer = self.book._payer_locked(rec)
@@ -756,6 +809,29 @@ class Xbt402Session:
             return {"status": "pending", "txid": txid or rec.closed_txid, "scan_from": start, "added": 0,
                     "error": str(e)[:160]}
 
+    def funding_spent(self, rec, *, scan: bool = False) -> str | None:
+        """AGP-080: has our own node seen this channel's funding output spent? The spender's txid; ""
+        when the output is gone and the funding is known to this node (seen confirmed, or its
+        transaction is still found) but the spender is not named; None when the node still shows it
+        unspent, has never seen it, or cannot be asked. None is "not proven", never "closed".
+        `scan` also reads the blocks since the channel opened (the close and the refund do; a watcher
+        tick does not, so an unproven close costs two calls a tick)."""
+        try:
+            utxo = self.rpc.call("gettxout", rec.funding_txid, int(rec.funding_vout), True)
+        except Exception:
+            return None
+        if utxo:
+            return None
+        spender = netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, 0)   # the mempool
+        if spender:
+            return spender
+        if rec.funding_height or netparams.get_tx(self.rpc, rec.funding_txid):
+            return ""
+        if scan:
+            return netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout,
+                                          rec.funding_height or rec.open_height)
+        return None
+
     def close_channel(self, dest: str) -> dict:
         """Cooperative close through the signer: payer signs tagged_hash(xbt402/close, chan)."""
         rec = self.book.get(dest)
@@ -793,7 +869,11 @@ class Xbt402Session:
         # only in a block. Learn the change now if we can, then mark the channel closed with the answer:
         # a "pending" change is retried by the watcher (and before a balance read) until it is final.
         change = self.learn_close_change(rec, doc.get("txid") or "", scan_from=h0, close_hex=close_hex)
-        self.book.mark_closed(dest, doc.get("txid") or "", change=change, close_hex=close_hex)
+        # AGP-080 W3: the provider's 200 is its word. Closed for good only once our own node shows the
+        # funding output spent; until then the watcher keeps the record and refunds it at expiry.
+        spent = self.funding_spent(rec, scan=True)
+        self.book.mark_closed(dest, spent or doc.get("txid") or "", change=change,
+                              close_hex=close_hex, unproven=spent is None)
         _log("close", dest=dest, chan=rec.chan, txid=doc.get("txid"), cum=rec.used_sats,
              change_spk=rec.payer_spk, hot_spk=self.hot.spk.hex(), close_change=change["status"],
              close_report=report["status"], unpaid_msat=report["unpaid_msat"])
@@ -808,6 +888,7 @@ class Xbt402Session:
             "hot_spk": self.hot.spk.hex(),
             "change_to_hot": rec.payer_spk == self.hot.spk.hex(),
             "close_change": change["status"],
+            "close_proven": spent is not None,
             "close_report": report,
             UNTRUSTED_KEY: untrusted(out.decode("utf-8", "replace")[:BODY_CAP]),
         }

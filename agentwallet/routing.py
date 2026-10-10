@@ -6,6 +6,14 @@ T1 = T + r*G, where T is the provider's per-window invoice point. The hub can co
 t + r, which it gets only when the provider reveals t (after completing the hub's own lock on its
 channel to the provider). So B2 signs something the hub can use only if the provider was paid.
 
+AGP-080: a lock is booked when it is pre-signed, not when it resolves: the hub may complete any
+pre-signature it holds, so the lock is written ("booked", "booked_sats") and then the policy ledger
+(txid `lock:<chan>:<cum>`) and the routing budget get its row, all before the pre-signature leaves; a
+restart books a lock whose rows a crash lost. What is booked is what the lock adds to the channel's high-water
+signed amount (one close can claim only one state), so a lock at or below a voided one rides on that
+booking. `void_lock` releases nothing. A lock pre-signed by an older wallet carries no "booked" flag
+and is booked when it resolves, as before.
+
 `sign_state_adaptor(chan, cum, point, route)` is the one new signing operation. Before it signs:
   * routing policy (policy.json "routing"): the hub is allowed, its fee is within that hub's caps
     (`max_fee_ppm`, `max_fee_base_msat`, carried: at most 1 sat above the exact fee), the lock
@@ -37,6 +45,7 @@ from pathlib import Path
 
 from .applog import AppendLog, LogError, replace_log
 from .b1path import ensure_b1
+from .channels import booked_through
 from .policy import normalize_dest
 
 ensure_b1()
@@ -198,7 +207,9 @@ class RouteSigner:
         self.denials: list = []
         # AGP-055: a crash between a resolve reaching disk and its rows left the budgets short. Book it now
         in_ledger = {e.txid for e in engine.store.payments()} if engine is not None else set()
-        self.recovered_bookings = sum(self._book(chan, b, in_ledger=in_ledger) for chan, b in book.resolved_bookings()
+        # AGP-080: and a lock booked at pre-signing whose rows a crash lost (the lock is on disk first)
+        self.recovered_bookings = sum(self._book(chan, b, in_ledger=in_ledger)
+                                      for chan, b in book.resolved_bookings() + book.booked_locks()
                                       if b["at"] >= time.time() - RETAIN_S)
 
     # --- channel lifecycle (B1 XbtChannelClient with a signer) --------------------------------------
@@ -247,18 +258,32 @@ class RouteSigner:
         rec = self.book.get(dest)
         hub = route.get("hub") or rec.origin or dest
         increase = int(cum) - rec.used_sats
+        # what this lock adds to the channel's booked high-water mark; the rest rides on a voided lock
+        delta = max(0, int(cum) - max(rec.used_sats, booked_through(rec)))
         denied = check_route(self.policy, self.spend, hub, int(route.get("amount", 0)), int(route.get("fee", 0)),
-                             increase, pending=self.pending_sats())
+                             increase, pending=self.pending_sats() - (increase - delta))
+        pay = None
         if denied is None and self.engine is not None:
             from .policy import Payment, Verdict
-            d = self.engine.evaluate(Payment(dest=normalize_dest(hub), amount_sats=increase,
-                                             memo=f"routed lock {route.get('lockId', '')}"), human=False)
+            pay = Payment(dest=normalize_dest(hub), amount_sats=increase, memo=f"routed lock {route.get('lockId', '')}")
+            d = self.engine.evaluate_booking(pay, delta, human=False)
             if d.verdict is not Verdict.ALLOW:
+                if d.approval_token:                 # a routed lock has no approval flow: a refusal
+                    self.engine.store.pop_approval(d.approval_token)
                 denied = d.as_dict()
         if denied:
             self.denials.append(denied)
             raise ChannelError(denied["rule"], denied["reason"])
-        return self.book.sign_state_adaptor(dest, int(cum), point, {**route, "hub": hub})
+
+        out = self.book.sign_state_adaptor(dest, int(cum), point, {**route, "hub": hub}, booked=True)
+        # the lock is on disk (booked, booked_sats): now both rows, before the pre-signature is handed on
+        lk = self.book.get(dest).pending_lock
+        if int(lk.get("booked_sats") or 0) > 0:
+            self._book(rec.chan, {"key": f"lock:{rec.chan}:{int(cum)}", "amount": int(lk["booked_sats"]),
+                                  "hub": hub, "lockId": route.get("lockId", ""), "at": lk["at"]},
+                       in_ledger={e.txid for e in self.engine.store.payments()} if self.engine is not None else (),
+                       presigned=True)
+        return out
 
     def pending_lock(self, chan: str) -> dict:
         rec = self.book.get(self._dest(chan))
@@ -280,27 +305,32 @@ class RouteSigner:
 
     def resolve_lock(self, chan: str, secret: str) -> str:
         res = self.book.resolve_lock(self._dest(chan), secret)
-        self._book(chan, res["booking"])
+        if res["booking"]:                      # None: booked when it was pre-signed (AGP-080)
+            self._book(chan, res["booking"])
         return res["t"]
 
     def void_lock(self, chan: str) -> dict:
+        """Give the pending lock up. Its booking stays (AGP-080): the hub may still hold the
+        pre-signature, and nothing here proves it cannot complete it."""
         return self.book.void_lock(self._dest(chan))
 
     def adopt_lock(self, chan: str, cum: int) -> None:
         res = self.book.adopt_lock(self._dest(chan), int(cum))
-        if res["amount"]:
+        if res["amount"] and res["booking"]:
             self._book(chan, res["booking"], adopted=True)
 
     def recover_lock(self, chan: str, close_tx) -> str:
         wit = close_tx.inputs[0].witness if hasattr(close_tx, "inputs") else close_tx
         res = self.book.recover_lock(self._dest(chan), wit)
-        self._book(chan, res["booking"], recovered=True)
+        if res["booking"]:
+            self._book(chan, res["booking"], recovered=True)
         return res["t"]
 
     def pending_sats(self) -> int:
-        """The routed amount out in pending locks, on every channel of the book."""
+        """The routed amount out in pending locks that are not yet spend rows: the ones an older
+        wallet pre-signed (a lock booked at pre-signing is already in `spend`)."""
         return sum(int(r.pending_lock["cum"]) - int(r.pending_lock.get("prev_used", 0))
-                   for r in self.book.unsettled_records() if r.pending_lock)
+                   for r in self.book.unsettled_records() if r.pending_lock and not r.pending_lock.get("booked"))
 
     def status(self) -> dict:
         return {"policy": self.policy.public(), "spent_24h_sats": self.spend.since(time.time() - DAY_S),

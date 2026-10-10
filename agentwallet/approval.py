@@ -69,6 +69,23 @@ def rotate_message(hot_address: str, expiry: int) -> bytes:
     return b"\n".join([ROTATE_DOMAIN, (hot_address or "").encode("utf-8"), str(int(expiry)).encode("ascii")])
 
 
+TREASURY_FUND_DOMAIN = b"xbt-agentwallet-treasury-fund-v1"
+TREASURY_RECOVER_DOMAIN = b"xbt-agentwallet-treasury-recover-v1"
+
+
+def treasury_fund_message(hot_address: str, treasury_address: str, amount_sats: int, expiry: int) -> bytes:
+    """AGP-080 W3: a human moves `amount_sats` from the hot key into the CSV treasury."""
+    return b"\n".join([TREASURY_FUND_DOMAIN, (hot_address or "").encode("utf-8"), (treasury_address or "").encode("utf-8"),
+                       str(int(amount_sats)).encode("ascii"), str(int(expiry)).encode("ascii")])
+
+
+def treasury_recover_message(treasury_address: str, dest: str, expiry: int) -> bytes:
+    """AGP-080 W3: a human recovers the treasury to `dest`. `recover_message` named only the treasury,
+    so one signature paid whatever address the caller passed."""
+    return b"\n".join([TREASURY_RECOVER_DOMAIN, (treasury_address or "").encode("utf-8"), (dest or "").encode("utf-8"),
+                       str(int(expiry)).encode("ascii")])
+
+
 def generate_keypair() -> tuple[bytes, bytes]:
     """Return (private_raw_32, public_raw_32)."""
     sk = Ed25519PrivateKey.generate()

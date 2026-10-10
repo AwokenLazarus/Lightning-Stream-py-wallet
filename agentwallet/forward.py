@@ -9,9 +9,12 @@ A rail beside `stream`, inside `xbt402_pay`. When a 402's channel offer carries 
   2. checks the lot on the wallet's own node and rebuilds the transfer to its own hot key
      (fwd.buyer.verify_offer), and recomputes the adaptor point S from R.x;
   3. opens the channel from the offer if needed (v1.3, derivation v3);
-  4. pre-signs the next channel state, cum + price, under S (never a plain signature for it),
-     writes the pending purchase to disk, and sends it as the x402 payload's `adaptor`;
-  5. on 200 checks the transfer's key-path signature and only then counts the price as spent.
+  4. books the price in the policy ledger (AGP-080: the market can complete the pre-signature from
+     here on), pre-signs the next channel state, cum + price, under S (never a plain signature for
+     it), writes the pending purchase to disk, and sends it as the x402 payload's `adaptor`;
+  5. on 200 checks the transfer's key-path signature and only then counts the price as spent on the
+     channel. The booking is released only on proof the pre-signature is void: a close of the
+     channel that does not carry it, or our own refund of the funding.
 
 If the answer is lost, `forward_recover(close_txid)` reads the completed state signature from the
 market's channel close and extracts s (the market cannot close with that state without it).
@@ -35,10 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import sigaudit
-from .channels import ChannelCapError
 from .fwd import adaptor
 from .fwd.buyer import check_transfer, lot_from_offer, receipt_digest, transfer_with, verify_offer
 from .fwd.escrow import ForwardError
+from .maturity import Maturity
 from .policy import normalize_dest
 from .xbt402 import Xbt402Session, _log, origin_of
 
@@ -144,7 +147,7 @@ class ForwardSession(Xbt402Session):
                 return {"verdict": "deny", "rule": "forward_pending",
                         "reason": "a forward purchase on this channel is unsettled; forward_recover first"}
         try:
-            lot = verify_offer(offer, self._gettxout, self.hot.spk, price)
+            lot = verify_offer(offer, self._gettxout, self.hot.spk, price, maturity=self._maturity(offer))
         except ForwardError as e:     # our own check's code, never provider text (L12)
             return {"verdict": "deny", "rule": "forward_offer", "reason": e.code}
         opened = None
@@ -152,14 +155,18 @@ class ForwardSession(Xbt402Session):
         if rec is None or rec.state != "open":
             opened = self.open_from_offer(dest, acc, cap_sats=cap_sats, expiry_blocks=expiry_blocks)
             _log("open", url=url, chan=opened["chan"], cap=opened["cap_sats"])
+        # AGP-080 W1: the market completes this pre-signature with s alone, so the price is in the
+        # ledger before it exists (it used to be booked on delivery)
+        self.book.check_signable(dest, price)
+        cum = self.book.get(dest).used_sats + price
+        if cum < getattr(self.book.get(dest).params(), "min_amount", 546):
+            raise ChannelError("bad_amount", "state below the channel's least state")
+        self._book_through(dest, cum)
         with self.book._lock:
             rec = self.book._records[dest]
             payer = self.book._payer_locked(rec)
-            cum = rec.used_sats + price
-            if cum > rec.cap_sats or cum > payer.params.max_amount:
-                raise ChannelCapError(rec.used_sats, price, min(rec.cap_sats, payer.params.max_amount))
-            if cum < getattr(payer.params, "min_amount", 546):
-                raise ChannelError("bad_amount", "state below the channel's least state")
+            if cum != rec.used_sats + price:
+                raise ChannelError("xbt402", "the channel moved while a forward lot was being signed")
             z = payer.params.sighash(payer.params.state_tx(cum))
             pre = adaptor.presign(payer.secret, z, lot.S)
             self.book.audit.record("adaptor_presig", sig=pre.R + pre.s1.to_bytes(32, "big"), chan=rec.chan, dest=dest,
@@ -199,6 +206,19 @@ class ForwardSession(Xbt402Session):
              ms=round(1000 * (time.time() - t0), 1))
         return {**res, "charged_sats": price, "delivered": True, "cum": cum, "transfer_txid": tx.txid(),
                 "transfer_hex": tx.hex(), "receipt": receipt}
+
+    def _maturity(self, offer: dict) -> int:
+        """AGP-080 M1: the depth at which the node relays a spend of this lot's coinbase, read from the
+        node (getdeploymentinfo), never a constant. A node that cannot say refuses the lot."""
+        try:
+            height = int(offer["coinbaseHeight"])
+        except (KeyError, TypeError, ValueError):
+            raise ForwardError("bad_offer") from None
+        try:
+            rule = Maturity.from_deployments(self.rpc.call("getdeploymentinfo"))
+        except Exception:                      # noqa: BLE001  the node's answer, or none: fail closed
+            raise ForwardError("maturity_unknown") from None
+        return rule.relay_at(height) - height
 
     def _delivered(self, dest: str, tx, via: str = "http"):
         with self.book._lock, self.fwd.lock:
@@ -244,7 +264,7 @@ class ForwardSession(Xbt402Session):
                 self.fwd.data["pending"].pop(dest, None)
                 self.fwd.data["void"][p["offer"]["outpoint"]] = {"close": close_txid, "cum": p["cum"]}
                 self.fwd.save()
-            return {"recovered": False, "dest": dest, "void": True,
+            return {"recovered": False, "dest": dest, "void": True, "chan": p["chan"], "cum": p["cum"],
                     "reason": "the close does not carry the adaptor state: the lot was not paid for"}
         return {"recovered": False, "reason": "the transaction closes no channel with a pending forward purchase"}
 
