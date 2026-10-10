@@ -32,6 +32,7 @@ class FakeRpc:
         self.txs: dict[str, dict] = {}      # txid -> getrawtransaction verbose
         self.spenders: dict[tuple, str] = {}
         self.reject: str | None = None
+        self.deployments: dict | None = None  # getdeploymentinfo; None: the node does not answer it
 
     def call(self, method, *params):
         if method == "getblockcount":
@@ -80,6 +81,11 @@ class FakeRpc:
         if method == "generatetoaddress":
             self.height += int(params[0])
             return []
+        if method == "getdeploymentinfo":
+            if self.deployments is None:
+                from agentwallet.rpc import KnotsRpcError
+                raise KnotsRpcError("Method not found")
+            return self.deployments
         if method == "estimatesmartfee":
             return {"feerate": 0.00001}
         if method == "getbalances":

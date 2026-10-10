@@ -12,7 +12,9 @@ from . import musig2, schnorr
 from .tx import OP_CHECKSIG, OP_DROP, Tx, TxIn, TxOut, push, script_num
 
 OP_CHECKSEQUENCEVERIFY = 0xB2
-MATURITY_419 = 6480          # Knots #419 coinbase maturity
+# Knots #419 coinbase maturity as of 2026: for tests and simulated markets only. The wallet reads the
+# depth from its node (forward.py ForwardSession._maturity, AGP-080 M1) and passes it in.
+MATURITY_419 = 6480
 CSV_MAX = 0xFFFF
 SALE_VSIZE_P2TR = 99         # 1-in/1-out key-path sale, measured on regtest (b5)
 DUST = 546

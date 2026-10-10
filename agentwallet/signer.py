@@ -343,9 +343,11 @@ class Signer:
         if method == "forward_recover":
             with self._spend_lock:
                 res = self._xbt402.forward_recover(params.get("txid") or "", params.get("blockhash") or "")
-                if res.get("recovered"):     # the policy ledger learns the spend it could not see live
+                if res.get("recovered"):     # booked when it was pre-signed (AGP-080); a no-op unless that was lost
                     self._book_forward(res["dest"], res["chan"], int(res["cum"]), int(res["price"]),
                                        f"forward {res['outpoint']} (recovered)")
+                elif res.get("void"):        # the close does not carry the pre-signature: proven void
+                    self._release_forward(res["chan"], int(res["cum"]))
                 return sanitize(res)
         if method == "forward_status":
             return sanitize(self._xbt402.status())
@@ -432,6 +434,15 @@ class Signer:
         if rec.state == "refunded":  # idempotent: report the refund already made, never a second one
             return {"verdict": "allow", "rule": "already_refunded", "already": True, **base,
                     "txid": rec.refund_txid, "sats": rec.funding_sats - rec.close_fee}
+        if rec.state == "closed" and rec.close_unproven:
+            # AGP-080 W3: closed on the provider's word. Our node decides: spent means closed; still
+            # unspent at expiry means it never closed, and the refund below takes it
+            if not self._prove_close(dest):
+                if self._height() < rec.expiry:
+                    return {**_deny("refund_early", "the provider reported a close this node has not seen; the "
+                                                    f"refund is valid from the block after {rec.expiry}"), **base}
+                self.channels.reopen_unproven(dest)
+            rec = self.channels.get(dest)
         if rec.state == "closed":
             self._notice_close_change(dest)
             return {**_deny("channel_closed", "the channel was closed; there is nothing to refund"), **base,
@@ -472,11 +483,32 @@ class Signer:
             if pend:
                 self._xbt402.fwd.data["void"][pend["offer"]["outpoint"]] = {"refund": txid, "cum": pend["cum"]}
                 self._xbt402.fwd.save()
+        if pend:
+            self._release_forward(pend["chan"], int(pend["cum"]))
         self.engine.audit.append({"type": "refund", "dest": dest, "chan": rec.chan, "txid": txid, "sats": sats,
                                   "auto": auto, "ts": self.engine.clock()})
         self._anchor("refund")
         return {"verdict": "allow", "rule": "refund", **base, "txid": txid, "sats": sats,
                 "to": self.hot.address, "auto": auto}
+
+    def _prove_close(self, dest: str, *, scan: bool = True) -> bool:
+        """AGP-080 W3: True once our own node shows the funding output of an unproven close spent (the
+        record then names the real spender and its change is learned as usual)."""
+        rec = self.channels.get(dest)
+        if rec is None or rec.state != "closed" or not rec.close_unproven:
+            return rec is not None and rec.state == "closed"
+        spender = self._xbt402.funding_spent(rec, scan=scan)
+        if spender is None:
+            return False
+        self.channels.prove_close(dest, spender)
+        self._notice_close_change(dest)
+        return True
+
+    def _release_forward(self, chan: str, cum: int) -> None:
+        """AGP-080 W1: a forward lot's pre-signature was booked when it was made; it is released only
+        here, on proof it is void (the channel's funding was spent by a transaction that does not carry
+        it: our refund, or a close with a lower state)."""
+        self.engine.store.amend(f"xbt402:{chan}:{cum}", None)
 
     def _notice_close_change(self, dest: str) -> str:
         """AGP-016/022: a close pays our change to the hot key. If the provider built it (or its tx had not
@@ -533,6 +565,15 @@ class Signer:
                     act = {"state": "pending", "error": str(e)[:160]}
             if act["state"] == "open" or act.get("error"):
                 actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, "open_retry": act})
+        for rec in self.channels.unproven_close_records():   # AGP-080 W3: closed on the provider's word
+            with self._spend_lock, sigaudit.context(method="watcher"):
+                if self._prove_close(rec.dest, scan=h >= rec.expiry):
+                    now = self.channels.get(rec.dest)
+                    actions.append({"dest": rec.dest, "chan": rec.chan, "close_proven": now.closed_txid,
+                                    "close_change": now.close_change or "pending", "closed_txid": now.closed_txid,
+                                    "height": h})
+                elif h >= rec.expiry:
+                    self.channels.reopen_unproven(rec.dest)   # never closed: the refund loop below takes it
         for rec in self.channels.unsettled_records():
             if h >= rec.expiry:
                 with self._spend_lock, sigaudit.context(method="watcher"):
@@ -798,6 +839,9 @@ class Signer:
         existing = self.channels.get(dest)
         if existing is not None and existing.state == "open":
             return {"verdict": "allow", "already": True, **existing.public()}
+        if existing is not None and existing.close_unproven and not self._prove_close(dest):
+            return _deny("close_unproven", f"the last channel to {dest} was reported closed, but this node has not "
+                                           "seen its funding spent: a new one opens once it has, or after the refund")
         pay_to = (self.config.pay_to_for(dest) or "").strip()
         if not pay_to:
             return _deny("pay_to", f"no payTo pubkey registered for {dest}")
@@ -884,6 +928,8 @@ class Signer:
         if d.verdict is not Verdict.ALLOW:
             return d.as_dict()
         sigaudit.set_rule(f"policy:{d.rule}")
+        if rec is not None and rec.close_unproven:
+            self._prove_close(dest)      # AGP-080: an honest close our node has seen by now; else add_pending refuses
         try:
             result = self._xbt402.pay_once(
                 url,
@@ -937,21 +983,16 @@ class Signer:
     def _xbt402_sign_state_a3(self, params: dict) -> dict:
         chan = params.get("chan") or ""
         dest = self.channels.find_dest(chan) or chan
-        amount = int(params.get("amount") or 0)
-        rec = self.channels.get(dest)
-        origin = rec.origin or dest if rec else dest
-        pay = Payment(dest=origin, amount_sats=max(0, amount - (rec.used_sats if rec else 0)))
-        if pay.amount_sats:
-            d = self.engine.evaluate(pay, human=False)
-            if d.verdict is not Verdict.ALLOW:
-                return d.as_dict()
-            sigaudit.set_rule(f"policy:{d.rule}")
-        else:
-            sigaudit.set_rule("policy:no_increase")
+        amount = self._int(params.get("amount"))
+        # AGP-080 W1: evaluated and committed before the state is signed, as every other state
+        # (this path evaluated each step against a ledger it never wrote to)
         try:
-            sig = self.channels.sign_state_a3(dest, amount)
+            sig, denied = self._booked_increase(dest, amount, "xbt402 0xA3 state",
+                                                lambda: self.channels.sign_state_a3(dest, amount))
         except Exception as e:
             return _deny("xbt402_sign_state_a3", str(e))
+        if denied:
+            return denied
         return {"sig": sig.hex() if isinstance(sig, bytes) else sig}
 
     def _xbt402_sign_state_adaptor(self, params: dict) -> dict:
@@ -997,7 +1038,20 @@ class Signer:
             self._anchor("close")
 
     def _fund_treasury_locked(self, params: dict) -> dict:
-        sats = int(params.get("sats") or params.get("amount_sats") or 0)
+        """AGP-080 W3: hot funds go to the CSV treasury only on the human's signature over the hot
+        address, the treasury address, the amount and an expiry (any socket caller could move any
+        amount there, where only the treasury's keys or a 4320-block wait get it back)."""
+        from .approval import treasury_fund_message
+
+        sats = self._int(params.get("sats") or params.get("amount_sats"))
+        if sats <= 0:
+            return {"ok": False, "reason": "fund_treasury needs a positive amount"}
+        refused = self._human_signed(
+            treasury_fund_message(self.hot.address, self.treasury.address, sats, self._int(params.get("expiry"))), params)
+        if refused:
+            return {"ok": False, "reason": f"fund_treasury requires a valid human signature: {refused['reason']}",
+                    "rule": refused["rule"]}
+        sigaudit.set_rule("human:treasury_fund_signature")
         txid, vout = self.hot.fund(self.treasury.spk, sats)
         self.treasury.record_funding(txid, vout, sats)
         self._mine_safe()
@@ -1016,13 +1070,15 @@ class Signer:
             signature = x2b(sig_hex) if sig_hex else b""
         except ValueError:
             return {"ok": False, "reason": "signature is not valid hex"}
-        from .approval import recover_message
+        from .approval import treasury_recover_message
 
         now = self.engine.clock()
+        # AGP-080 W3: the signature names the destination it pays
         if not self.human_pubkey or not signature or not verify(
-            self.human_pubkey, recover_message(self.treasury.address, expiry), signature
+            self.human_pubkey, treasury_recover_message(self.treasury.address, dest, expiry), signature
         ):
-            return {"ok": False, "reason": "recover_treasury requires a valid human signature"}
+            return {"ok": False, "reason": "recover_treasury requires a valid human signature over "
+                                           "(treasury address, destination, expiry)"}
         if expiry < now:
             return {"ok": False, "reason": "recover signature expired"}
         try:

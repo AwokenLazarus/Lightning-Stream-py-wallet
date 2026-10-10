@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from . import adaptor, schnorr
-from .escrow import MATURITY_419, Escrow, ForwardError
+from .escrow import Escrow, ForwardError
 from .tx import Tx, tagged_hash
 
 MIN_BUYER_GRACE = 144          # blocks between delivery and the seller's escape
@@ -54,11 +54,12 @@ def _escrow(fwd: dict) -> Escrow:
         raise ForwardError("bad_offer")
 
 
-def verify_offer(fwd: dict, gettxout: Callable, buyer_spk: bytes, price: int,
-                 maturity: int = MATURITY_419, min_grace: int = MIN_BUYER_GRACE) -> Lot:
+def verify_offer(fwd: dict, gettxout: Callable, buyer_spk: bytes, price: int, *,
+                 maturity: int, min_grace: int = MIN_BUYER_GRACE) -> Lot:
     """The outpoint is an unspent coinbase on the wallet's own node, its script is MuSig2(miner,
     market) + an escape at least `min_grace` blocks after delivery, the transfer is the deterministic
-    one paying *our* spk, and the adaptor point is the one the transfer signature must hit."""
+    one paying *our* spk, and the adaptor point is the one the transfer signature must hit.
+    `maturity` is the coinbase depth the caller read from its node (no default: AGP-080 M1)."""
     if not isinstance(fwd, dict) or fwd.get("kind") != "p2tr":
         raise ForwardError("unsupported_escrow")
     txid, vout = outpoint(fwd.get("outpoint"))

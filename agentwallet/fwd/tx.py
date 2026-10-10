@@ -224,15 +224,33 @@ def address_to_spk(addr: str) -> bytes:
 
 
 # --- XBT unified signature hash ------------------------------------------------------------
+NO_CODESEP = 0xFFFFFFFF   # tapscript default: no OP_CODESEPARATOR executed
+ANNEX_TAG = 0x50          # the first byte of a taproot annex (BIP341)
+
+
 def unified_sighash(tx: Tx, prevouts: List[TxOut], index: int, script_type: int,
-                    script_code: bytes, hash_type: int, leaf_hash: Optional[bytes] = None) -> bytes:
+                    script_code: bytes, hash_type: int, leaf_hash: Optional[bytes] = None, *,
+                    annex: Optional[bytes] = None, codesep_pos: int = NO_CODESEP) -> bytes:
     """Port of Knots hf-sighash-opt-in `UnifiedSighash` (see bitkey-xbt xbt_unified.rs).
 
     Commits to every input's amount and scriptPubKey (like BIP341) for every script type.
     SHA-256d Bitcoin verifies a different message, so these signatures never replay there.
+
+    AGP-080 (review S1, as B1 xbt402/tx.py since AGP-069): `annex` (taproot and tapscript: the whole
+    annex, its 0x50 tag included) and `codesep_pos` (tapscript) are committed as Knots does; a value
+    the script type does not commit to is refused. Checked against B1's vectors
+    (tests/test_agp080_closure.py). Nothing in the forward rail calls this today.
     """
     if len(prevouts) != len(tx.inputs) or index >= len(tx.inputs):
         raise ValueError("prevouts/inputs mismatch")
+    if annex is not None and script_type not in (ST_TAPROOT, ST_TAPSCRIPT):
+        raise ValueError("only a taproot spend has an annex")
+    if annex is not None and annex[:1] != bytes([ANNEX_TAG]):
+        raise ValueError("an annex starts with 0x50")
+    if codesep_pos != NO_CODESEP and script_type != ST_TAPSCRIPT:
+        raise ValueError("only tapscript commits to a codeseparator position")
+    if not 0 <= codesep_pos <= 0xFFFFFFFF:
+        raise ValueError("codeseparator position out of range")
     if not hash_type & UNIFIED_FLAG:
         raise ValueError("hash type lacks the 0x20 opt-in bit")
     is_tr = script_type in (ST_TAPROOT, ST_TAPSCRIPT)
@@ -257,7 +275,10 @@ def unified_sighash(tx: Tx, prevouts: List[TxOut], index: int, script_type: int,
         m += varbytes(prevouts[index].script_pubkey) + struct.pack("<I", i.sequence)
     else:
         m += struct.pack("<I", index)
-    m += varbytes(script_code) if not is_tr else b"\x00"
+    if not is_tr:
+        m += varbytes(script_code)
+    else:
+        m += b"\x01" + sha256(varbytes(annex)) if annex is not None else b"\x00"
     if out_type == 3:
         if index >= len(tx.outputs):
             raise ValueError("SIGHASH_SINGLE without output")
@@ -265,7 +286,7 @@ def unified_sighash(tx: Tx, prevouts: List[TxOut], index: int, script_type: int,
     if script_type == ST_TAPSCRIPT:
         if leaf_hash is None:
             raise ValueError("tapscript needs leaf hash")
-        m += leaf_hash + b"\x00" + b"\xff\xff\xff\xff"
+        m += leaf_hash + b"\x00" + struct.pack("<I", codesep_pos)
     return tagged_hash("UnifiedSighash", bytes(m))
 
 

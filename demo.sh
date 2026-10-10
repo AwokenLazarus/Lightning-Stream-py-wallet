@@ -218,10 +218,16 @@ PY
 echo "== fund treasury (CSV 4320) =="
 "$B2_PYTHON" - <<'PY'
 from pathlib import Path
-import os
+import os, time
+from agentwallet.approval import load_private_key, treasury_fund_message, sign, b2x
 from agentwallet.signer import SignerClient
 c = SignerClient(Path(os.environ["B2_SIGNER_SOCK"]))
-r = c.call("fund_treasury", sats=1_000_000)
+# AGP-080: hot funds move to the treasury only on the human's signature
+bal = c.call("balance")
+expiry = int(time.time()) + 900
+priv = load_private_key(Path(os.environ["B2_HUMAN_DEVICE"]) / "ed25519.sk")
+msg = treasury_fund_message(bal["hot"]["hot_address"], bal["treasury"]["treasury_address"], 1_000_000, expiry)
+r = c.call("fund_treasury", sats=1_000_000, expiry=expiry, signature=b2x(sign(priv, msg)))
 assert r.get("txid"), r
 print("TREASURY_FUNDED", r)
 PY
@@ -280,15 +286,16 @@ cli generatetoaddress 4320 "$FUND_ADDR" >/dev/null
 "$B2_PYTHON" - <<'PY'
 import os, time
 from pathlib import Path
-from agentwallet.approval import load_private_key, recover_message, sign, b2x
+from agentwallet.approval import load_private_key, treasury_recover_message, sign, b2x
 from agentwallet.signer import SignerClient
 c = SignerClient(Path(os.environ["B2_SIGNER_SOCK"]))
 st = c.call("balance")["treasury"]
 addr = st["treasury_address"]
 expiry = int(time.time()) + 900
 priv = load_private_key(Path(os.environ["B2_HUMAN_DEVICE"]) / "ed25519.sk")
-sig = b2x(sign(priv, recover_message(addr, expiry)))
-r = c.call("recover_treasury", signature=sig, expiry=expiry, to=os.environ.get("B2_RECOVERY") or addr)
+to = os.environ.get("B2_RECOVERY") or addr
+sig = b2x(sign(priv, treasury_recover_message(addr, to, expiry)))   # AGP-080: the signature names the destination
+r = c.call("recover_treasury", signature=sig, expiry=expiry, to=to)
 print("TREASURY_RECOVER", r)
 assert r.get("ok") or "non-final" not in str(r).lower(), r
 if r.get("ok"):

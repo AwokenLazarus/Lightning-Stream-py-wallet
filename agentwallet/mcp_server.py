@@ -23,7 +23,8 @@ MCP_TOOL_NAMES = frozenset(
     {"balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "close_channel",
      "xbt402_refund", "forward_status", "forward_recover"}
 )
-FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault", "recover_treasury", "sweep_hot", "rotate_hot_key"})
+FORBIDDEN_MCP_TOOLS = frozenset({"approve", "recover_vault", "recover_treasury", "fund_treasury", "sweep_hot",
+                                 "rotate_hot_key"})
 
 
 def _client() -> SignerClient:
