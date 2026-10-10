@@ -64,6 +64,26 @@ pre-signature, so a later lock or state on that channel up to the voided amount 
 ChannelBook with B1's signer API, for `RoutePayer(signer=...)`. Uses B1's `xbt402.adaptor` when the
 pinned B1 has it (libsecp256k1 secret multiplications), else `fwd/adaptor.py`.
 
+AGP-084 (on-chain `pay` is write-ahead; key wiping): an on-chain `pay` is in the policy ledger before
+the node is asked to send, under `onchain:unconfirmed:<token>`, and moves to a row under the txid when
+the node answers. Only the node's own JSON-RPC error (`KnotsRpcRefused`, the Rust signer's
+`rpc_refused`: insufficient funds, a bad address) takes the row back. A timeout, a dropped connection,
+an HTTP error with no JSON-RPC error in it, an answer that is not a txid, or a crash leaves the payment
+counted against the budgets, because the node may have sent it; the error names the row. Such a row is
+not cleared by itself: it ages out of the budget windows like any payment.
+
+**Keys in memory are not wiped, and Python cannot guarantee that they could be.** The hot key, the
+payer keys and the treasury keys are Python `int`s for as long as the signer runs, the wrapping key
+and the passphrase are `bytes`, and decrypted key files pass through `bytes`, `str` and `json`. All of
+these are immutable: they cannot be overwritten, copies are made freely (every `to_bytes`, every
+big-number step of a signature), and the memory is freed, not zeroed, when the garbage collector gets
+to it. libsecp256k1 (coincurve) and OpenSSL (cryptography) keep their own copies. Zeroing the few
+`bytearray`s that could be introduced would cover a short-lived copy of a secret whose `int` stays in
+the same process, so B2 does not pretend to. What protects a B2 key is the sealed file at rest, the
+0600 modes and the process boundary (the MCP side never holds a key). A deployment that needs keys
+wiped from memory should run the Rust signer (xbt-rs `crates/xbt-signer`), which wipes its hot key,
+payer keys and decrypted plaintext, with the limits stated in its README.
+
 AGP-024 (light client, `agentwallet/chain.py`, `electrum.py`, `headers.py`; `docs/B2_CHAIN_BACKEND.md`):
 the signer reads the chain through a backend. RPC (`KnotsRpc`) is the default and unchanged;
 `B2_CHAIN_BACKEND=electrum` (or `auto` with `B2_ELECTRUM_SERVERS` and no local node) uses Electrum servers

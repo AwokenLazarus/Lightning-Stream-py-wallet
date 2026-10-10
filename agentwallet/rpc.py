@@ -13,6 +13,12 @@ class KnotsRpcError(RuntimeError):
     pass
 
 
+class KnotsRpcRefused(KnotsRpcError):
+    """The node answered the call with a JSON-RPC error: it did not do what was asked. Every other
+    failure is a plain KnotsRpcError: the call may or may not have run (AGP-084: `pay` keeps its
+    booking then). The Rust signer's `rpc_refused`."""
+
+
 class KnotsRpc:
     def __init__(self, datadir: Path, conf: Path, wallet: str = "agent"):
         self.datadir = Path(datadir)
@@ -71,10 +77,31 @@ class KnotsRpc:
         req.add_header("Authorization", f"Basic {token}")
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read().decode())
+                raw = resp.read()
         except urllib.error.HTTPError as e:
-            raw = e.read().decode() if e.fp else str(e)
-            raise KnotsRpcError(f"RPC HTTP {e.code}: {raw[:400]}") from e
-        if body.get("error"):
-            raise KnotsRpcError(str(body["error"]))
-        return body.get("result")
+            # a JSON-RPC error comes back with HTTP 500 (404 for an unknown method) and a body
+            raw = e.read() if e.fp else b""
+            refusal = _rpc_error(raw)
+            if refusal is not None:
+                raise KnotsRpcRefused(refusal) from e
+            raise KnotsRpcError(f"RPC HTTP {e.code}: {raw.decode(errors='replace')[:400] or e}") from e
+        except OSError as e:                # no connection, a reset, a timeout: the call may have run
+            raise KnotsRpcError(f"RPC transport: {e}") from e
+        refusal = _rpc_error(raw)
+        if refusal is not None:
+            raise KnotsRpcRefused(refusal)
+        try:
+            body = json.loads(raw.decode())
+            return body.get("result")
+        except (ValueError, AttributeError) as e:
+            raise KnotsRpcError(f"RPC answer is not JSON-RPC: {raw[:200]!r}") from e
+
+
+def _rpc_error(raw: bytes) -> str | None:
+    """The node's JSON-RPC error in `raw`, or None when `raw` is not a JSON-RPC answer carrying one."""
+    try:
+        body = json.loads(raw.decode())
+    except ValueError:
+        return None
+    err = body.get("error") if isinstance(body, dict) else None
+    return str(err) if err else None
