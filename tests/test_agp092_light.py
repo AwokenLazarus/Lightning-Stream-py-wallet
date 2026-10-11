@@ -174,6 +174,23 @@ class EveryConfiguredServerMustAnswer(unittest.TestCase):
         with self.assertRaisesRegex(ElectrumError, "not known"):
             b2.call("gettxout", "cd" * 32, 0, True)      # nor is an unknown txid "not there"
 
+    def test_a_scan_with_a_server_missing_is_marked(self):
+        """The unspent list is the union over the servers that answer. With one missing it is still
+        returned (its coins are proven), and marked: a coin not in it may only be hidden."""
+        sim = SimChain(height=200)
+        a, b_ = Knobs(sim), Knobs(sim)
+        self.addCleanup(a.close)
+        self.addCleanup(b_.close)
+        spk_ = spk()
+        sim.credit("", 0, 70_000, spk_)
+        light = ElectrumBackend([a.url, b_.url], chain="regtest", checkpoint=(CHECKPOINT, sim.bhash(CHECKPOINT)), timeout=2)
+        self.addCleanup(light.close)
+        r = light.call("scantxoutset", "start", [f"raw({spk_})"])
+        self.assertEqual((len(r["unspents"]), r["complete"]), (1, True))
+        b_.busy.add("blockchain.scripthash.listunspent")
+        r = light.call("scantxoutset", "start", [f"raw({spk_})"])
+        self.assertEqual((len(r["unspents"]), r["complete"]), (1, False))
+
     def test_a_dead_server_is_tried_once_per_call(self):
         sim = SimChain(height=200)
         honest = FakeElectrum(sim)

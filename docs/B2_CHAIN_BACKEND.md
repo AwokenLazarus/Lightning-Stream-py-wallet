@@ -104,7 +104,9 @@ Cannot:
     answered; if one did not, or is down, the call fails and the caller keeps what it had
     (`B2_ELECTRUM_MIN_SERVERS` is the floor for what is proven, not for this);
 - hide anything that another configured server shows: histories and unspent lists are the union over
-  every server that answers;
+  every server that answers. A `scantxoutset` answer says whether that was all of them
+  (`complete`): every coin in it is proven either way, and with a server missing a coin not in it
+  may be one only that server shows;
 - get a short cheap fork believed on mainnet: it is below the pins or the minimum work (AGP-069);
 - stall other callers: no lock is held across a network read, servers sync in parallel, and once a
   chain is held a caller that finds a sync running answers from it. Each chunk of headers is checked

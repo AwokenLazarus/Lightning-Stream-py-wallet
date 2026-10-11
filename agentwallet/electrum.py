@@ -1167,13 +1167,14 @@ class ElectrumBackend:
         if action != "start":
             raise ElectrumError(f"scantxoutset {action}: only 'start'")
         self.sync()
-        unspents, total = [], 0
+        unspents, total, complete = [], 0, True
         for desc in descriptors:
             d = desc if isinstance(desc, str) else desc.get("desc", "")
             if not (d.startswith("raw(") and d.endswith(")")):
                 raise ElectrumError(f"scantxoutset: the light backend takes raw(<script>) descriptors, not {d!r}")
             spk = bytes.fromhex(d[4:-1])
-            got, _ = self._listings("blockchain.scripthash.listunspent", scripthash(spk))
+            got, every = self._listings("blockchain.scripthash.listunspent", scripthash(spk))
+            complete = complete and every
             claims: dict[tuple, list] = {}
             for c, rows in got:
                 for u in rows:
@@ -1215,8 +1216,12 @@ class ElectrumBackend:
                 coinbase = len(tx.inputs) == 1 and tx.inputs[0].txid == bytes(32) and tx.inputs[0].vout == 0xFFFF_FFFF
                 unspents.append({"txid": txid, "vout": n, "scriptPubKey": spk.hex(), "desc": d,
                                  "amount": value / XBT_SATS, "coinbase": coinbase, "height": st[0], "blockhash": st[1]})
+        # `complete`: every configured server answered the listing. Every coin listed is proven either
+        # way; without it a coin that is not listed may be one only the missing server shows (AGP-092:
+        # the shorter list is marked, since a scan that failed whenever one server was down would
+        # leave the wallet without its coins).
         return {"success": True, "height": self.headers.tip_height, "bestblock": self.headers.tip().hash,
-                "unspents": unspents, "total_amount": total / XBT_SATS}
+                "unspents": unspents, "total_amount": total / XBT_SATS, "complete": complete}
 
     def _rpc_estimatesmartfee(self, blocks=1, *_):
         call = self._call()
