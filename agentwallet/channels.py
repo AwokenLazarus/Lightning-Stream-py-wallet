@@ -56,6 +56,8 @@ def _omit_legacy_booking(rec: dict) -> dict:
         rec.pop("ledger_booked_sats", None)
     if not rec.get("close_unproven"):      # AGP-080: written only while set, as the Rust signer writes it
         rec.pop("close_unproven", None)
+    if not rec.get("rolled_next"):         # AGP-089: the Rust signer's field, kept as it is, written only when set
+        rec.pop("rolled_next", None)
     return rec
 
 
@@ -129,6 +131,9 @@ class ChannelRecord:
     # spent. The watcher proves the close, or refunds the channel at expiry as if it were still open;
     # until then the record is never replaced. False (and not written) on every other record.
     close_unproven: bool = False
+    # AGP-089: the Rust signer's record of the next channels a rollover signature may fund. B2 signs no
+    # rollover; the field is here so a file the Rust signer wrote loads and is written back unchanged.
+    rolled_next: list = field(default_factory=list)
 
     def params(self) -> ChannelParams:
         """The channel's ChannelParams, rebuilt byte for byte from this record."""

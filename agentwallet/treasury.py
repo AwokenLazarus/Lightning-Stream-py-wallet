@@ -103,7 +103,25 @@ class Treasury:
         # fundings the node refused when they were sent again: no coin is known behind them, and the
         # record stays in case one confirms after all (it reached other nodes on its first send)
         self.unsettled: list[dict] = [self._pending_from(p) for p in raw.get("unsettled_fundings") or []]
+        # AGP-089: fundings recorded before the current one. A second funding used to overwrite the one
+        # recorded outpoint; its coins stayed at the treasury address with no record of where
+        self.earlier: list[dict] = [self._outpoint_from(p) for p in raw.get("earlier_fundings") or []]
         self._persist()
+
+    @staticmethod
+    def _outpoint_from(p) -> dict:
+        try:
+            out = {"txid": str(p["txid"]), "vout": int(p["vout"]), "capacity": int(p["capacity"])}
+            bytes.fromhex(out["txid"])
+        except (KeyError, TypeError, ValueError) as e:
+            # never read as "no earlier funding": the record is the only pointer to those coins
+            raise KeyStoreError("treasury file: earlier_fundings is malformed") from e
+        return out
+
+    def outpoints(self) -> list[dict]:
+        """Every funding this treasury recorded: the current one first, then the earlier ones."""
+        cur = [{"txid": self.funding_txid, "vout": self.funding_vout, "capacity": self.capacity}] if self.funding_txid else []
+        return cur + list(self.earlier)
 
     @staticmethod
     def _pending_from(p) -> dict | None:
@@ -144,6 +162,8 @@ class Treasury:
             doc["pending_funding"] = self.pending
         if self.unsettled:
             doc["unsettled_fundings"] = self.unsettled
+        if self.earlier:
+            doc["earlier_fundings"] = self.earlier
         keys = {r: f"{getattr(self, f'{r}_secret'):064x}" for r in ROLES}
         if self.keystore is None:
             doc.update(keys)
@@ -192,6 +212,11 @@ class Treasury:
             self._persist()
 
     def record_funding(self, txid: str, vout: int, capacity: int) -> None:
+        """Record a funding. AGP-089: the one recorded before it is kept under `earlier_fundings`,
+        never overwritten (recover_treasury spends every recorded outpoint)."""
+        if self.funding_txid and (self.funding_txid, self.funding_vout) != (txid, int(vout)):
+            self.earlier.append({"txid": self.funding_txid, "vout": self.funding_vout, "capacity": self.capacity})
+        self.earlier = [e for e in self.earlier if (e["txid"], e["vout"]) != (txid, int(vout))]
         self.funding_txid, self.funding_vout, self.capacity = txid, int(vout), int(capacity)
         if self.pending and self.pending["txid"] == txid:
             self.pending = None
@@ -208,19 +233,23 @@ class Treasury:
                 "treasury_pending_sats": self.pending["capacity"]} if self.pending else {}),
             **({"treasury_unsettled_outpoints": [f"{p['txid']}:{p['vout']}" for p in self.unsettled]}
                if self.unsettled else {}),
+            **({"treasury_earlier_outpoints": [f"{p['txid']}:{p['vout']}" for p in self.earlier],
+                "treasury_earlier_sats": sum(p["capacity"] for p in self.earlier)} if self.earlier else {}),
         }
 
-    def recovery_tx(self, dest_spk: bytes, fee: int = 600) -> Tx:
-        """CSV recovery: valid once the funding UTXO is older(csv). Signed 0x21."""
-        if not self.funding_txid or self.capacity <= fee:
+    def recovery_tx(self, dest_spk: bytes, fee: int = 600, outpoint: dict | None = None) -> Tx:
+        """CSV recovery of one recorded funding (the current one unless `outpoint` names another, from
+        `outpoints()`): valid once that UTXO is older(csv). Signed 0x21."""
+        op = outpoint or {"txid": self.funding_txid, "vout": self.funding_vout, "capacity": self.capacity}
+        if not op["txid"] or op["capacity"] <= fee:
             raise RuntimeError("treasury is not funded")
         tx = Tx(
             version=2,
-            inputs=[TxIn(bytes.fromhex(self.funding_txid)[::-1], self.funding_vout, sequence=self.csv)],
-            outputs=[TxOut(self.capacity - fee, dest_spk)],
+            inputs=[TxIn(bytes.fromhex(op["txid"])[::-1], op["vout"], sequence=self.csv)],
+            outputs=[TxOut(op["capacity"] - fee, dest_spk)],
             locktime=0,
         )
-        prev = TxOut(self.capacity, self.spk)
+        prev = TxOut(op["capacity"], self.spk)
         digest = unified_sighash(tx, [prev], 0, ST_WITNESS_V0, self.script, SIGHASH_ALL_UNIFIED)
         sig = ecc.sign(self.recovery_secret, digest) + bytes([SIGHASH_ALL_UNIFIED])
         tx.inputs[0].witness = [sig, b"", self.script]

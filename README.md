@@ -92,6 +92,25 @@ lookup that failed too is "unknown" (`BroadcastUnknown`): the node may hold the 
   payment is made; after a crash or a payment of unknown fate it stays used and is never valid again
   (`approval_replay`): the human signs a new approval after checking the chain.
 
+AGP-089 (fix wave 4):
+
+- **One human signature, one operation.** `sweep_hot`, `fund_treasury` and `rotate_hot_key` write the
+  hash of the signed message to `.run/human_sigs.json` before they act and refuse a message found
+  there (`human_sig_replay`); an unreadable file refuses every such operation. `recover_treasury` and
+  `recover_vault` are left repeatable: they rebuild the same transactions to the address signed.
+- **The treasury forgets no outpoint.** A second funding keeps the first under `earlier_fundings`
+  (`treasury_earlier_outpoints`), and `recover_treasury` spends every recorded one.
+- **`approve`** runs under the spend lock from the token's read to its payment: two calls pay once.
+- **`xbt402_pay`**: a stream is held to `max_sats` from the ledger, chunk by chunk, never from the
+  seller's `charged`; an offer whose `minExpiryBlocks + minConf + closeMarginBlocks` is above
+  `max(channel_expiry_blocks, 4032)` is refused before funding (`deny/expiry`); a receipt must carry
+  this request's `seq`, and only such a receipt acks the state.
+- **Forward rail**: a lot is void only when our node shows, in a block, a spend of the funding that
+  does not carry its pre-signature (a close, or our refund); the release lowers the lot's ledger row
+  to what the plain states signed meanwhile still reach, and removes it only when they reach nothing.
+- **A kept funding that can never confirm** (the node names another transaction that spent one of
+  its inputs) is closed at expiry and its destination is free; never on the light backend.
+
 Limits: on the light (Electrum) backend nothing is "the node's own refusal", because the servers are
 not ours: a funding they refuse stays pending until it is opened or an operator removes it, and its
 dest takes no new channel meanwhile. A kept channel funding that can never confirm (its coin was spent

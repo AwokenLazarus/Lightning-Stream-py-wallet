@@ -36,7 +36,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from . import anchor as anchoring, chain as chainbackend, netparams, sigaudit
-from .approval import rotate_message, verify, verify_approval, x2b
+from .approval import UsedSigs, rotate_message, verify, verify_approval, x2b
 from .channels import ChannelBook, ChannelCapError
 from .forward import ForwardPolicy, ForwardSession
 from .hot import HotCapError, HotWallet
@@ -48,7 +48,7 @@ from xbt402.channel import ChannelError  # noqa: E402  (B1 on sys.path through .
 from .sanitize import sanitize
 from .treasury import Treasury, TREASURY_CSV
 from .vault import PresignedVault
-from .xbt402 import FUNDING_KEPT, Xbt402Session, origin_of, refuse_fragment
+from .xbt402 import FUNDING_KEPT, Xbt402Session, max_expiry_blocks, origin_of, refuse_fragment
 
 XBT_SATS = 100_000_000
 
@@ -149,6 +149,8 @@ class Signer:
         pub_hex = (raw.get("human_pubkey") or "").strip()
         self.human_pubkey = x2b(pub_hex) if pub_hex else b""
         self._spend_lock = threading.RLock()
+        # AGP-089: the human-signed messages already used (one signature, one operation)
+        self.used_sigs = UsedSigs(run / "human_sigs.json")
         self.keystore = KeyStore.from_env(run)
         if self.keystore is None and not KeyStore.plaintext_allowed():
             raise KeyStoreError("the signer's hot key must be encrypted at rest: set B2_HOT_KEYFILE (a 32-byte key "
@@ -253,7 +255,11 @@ class Signer:
             with self._spend_lock:
                 return sanitize(self._pay_locked(params, human=False))
         if method == "approve":
-            return sanitize(self._approve_signed(params))
+            # AGP-089: one approval pays once. The token is read, held and paid under the spend lock,
+            # the one lock every payment takes: a second approve of the same token (a double click, a
+            # retry) waits here and then finds the token held or gone.
+            with self._spend_lock:
+                return sanitize(self._approve_signed(params))
         if method == "history":
             limit = int(params.get("limit") or 50)
             return sanitize({"events": self.engine.audit.read(limit=limit)})
@@ -470,6 +476,22 @@ class Signer:
                 spender = spender or change.get("txid") or None
                 return {**_deny("channel_closed", "the funding output is already spent (the provider closed)"),
                         **base, "closed_txid": spender}
+            # AGP-089: a funding of unknown fate that can never confirm must not hold its destination for
+            # good. It is dead when our node shows one of its inputs spent in a block by another
+            # transaction. The record is then closed (its key stays in the keys file, as every
+            # archived channel's does) and a new channel may be opened.
+            dead = self._funding_dead(rec, start)
+            if dead:
+                self.channels.note_pending(dest, open_error=f"the funding can never confirm: input {dead}"[:200])
+                self.channels.mark_closed(dest, "", change={"status": "none"})
+                self.engine.audit.append({"type": "funding_dead", "dest": dest, "chan": rec.chan,
+                                          "funding_txid": rec.funding_txid, "input": dead, "ts": self.engine.clock()})
+                try:        # the hot wallet counted this funding's change, which will never exist
+                    self.hot.reconcile(scan=True)
+                except Exception:
+                    pass
+                return {**_deny("funding_dead", f"the funding can never confirm (input {dead}): nothing is locked, "
+                                                "and the destination is free for a new channel"), **base}
             return {**_deny("funding_unknown", "the funding output is not on this node"), **base}
         sigaudit.set_rule("watcher:auto_refund" if auto else "policy:refund_enabled")
         tx, _ = self.channels.refund_tx(dest, self.hot.spk, fee=rec.close_fee)
@@ -480,18 +502,40 @@ class Signer:
         self.channels.mark_refunded(dest, txid)
         sats = tx.outputs[0].value
         self.hot.notice_utxo(txid, 0, sats)
-        with self._xbt402.fwd.lock:  # a forward pre-signature on this channel can never be completed now
-            pend = self._xbt402.fwd.data["pending"].pop(dest, None)
-            if pend:
-                self._xbt402.fwd.data["void"][pend["offer"]["outpoint"]] = {"refund": txid, "cum": pend["cum"]}
-                self._xbt402.fwd.save()
-        if pend:
-            self._release_forward(pend["chan"], int(pend["cum"]))
+        # AGP-089: a forward pre-signature on this channel is void once this refund is in a block, not
+        # now: until then the market's close carrying the completed pre-signature can still be the one
+        # mined. The lot stays pending and booked; the watcher voids it (`_settle_forward_refunds`).
+        self._settle_forward_refunds()
         self.engine.audit.append({"type": "refund", "dest": dest, "chan": rec.chan, "txid": txid, "sats": sats,
                                   "auto": auto, "ts": self.engine.clock()})
         self._anchor("refund")
         return {"verdict": "allow", "rule": "refund", **base, "txid": txid, "sats": sats,
                 "to": self.hot.address, "auto": auto}
+
+    def _funding_dead(self, rec, start: int) -> str | None:
+        """AGP-089: `rec`'s funding (not in the UTXO set, not known to the node, no spender found) can
+        never confirm: our node shows one of its inputs gone from the confirmed UTXO set and names the
+        transaction that spent it, which is not the funding. An input is spent once, so the funding is
+        in no block and never will be. Returns that input and its spender. Anything less proves
+        nothing and the record stays pending. Never on the light backend: there "no server showed it"
+        and "spent" are one answer, and a single server could name a spender that does not exist."""
+        if self.light or not rec.funding_hex:
+            return None
+        try:
+            from xbt402.tx import Tx as BTx
+            tx = BTx.parse(bytes.fromhex(rec.funding_hex))
+            if tx.txid() != rec.funding_txid:
+                return None
+            for i in tx.inputs:
+                txid, vout = i.txid[::-1].hex(), int(i.vout)
+                if self.rpc.call("gettxout", txid, vout, False):
+                    continue
+                by = netparams.find_spender(self.rpc, txid, vout, max(1, int(start)))
+                if by and by != rec.funding_txid:
+                    return f"{txid}:{vout} (spent by {by})"
+        except Exception:
+            return None
+        return None
 
     def _prove_close(self, dest: str, *, scan: bool = True) -> bool:
         """AGP-080 W3: True once our own node shows the funding output of an unproven close spent (the
@@ -508,9 +552,50 @@ class Signer:
 
     def _release_forward(self, chan: str, cum: int) -> None:
         """AGP-080 W1: a forward lot's pre-signature was booked when it was made; it is released only
-        here, on proof it is void (the channel's funding was spent by a transaction that does not carry
-        it: our refund, or a close with a lower state)."""
-        self.engine.store.amend(f"xbt402:{chan}:{cum}", None)
+        here, on proof it is void (the channel's funding was spent, in a block, by a transaction that
+        does not carry it: our refund, or a close with a lower state).
+
+        AGP-089, the rule: **a release takes back only what no other signed state of the channel can
+        claim.** The lot's row covers the channel from where the ledger stood before it up to `cum`.
+        Plain states signed while the lot was pending rode on that row and booked nothing of their
+        own, so the row is lowered to what they reach (`used_sats`), and removed only when they reach
+        nothing of it."""
+        txid = f"xbt402:{chan}:{cum}"
+        row = next((e for e in self.engine.store.payments() if e.txid == txid), None)
+        if row is None:
+            return
+        dest = self.channels.find_dest(chan)
+        rec = self.channels.get(dest) if dest else None
+        before = int(cum) - int(row.amount_sats)
+        keep = int(row.amount_sats) if rec is None else max(0, min(int(cum), int(rec.used_sats)) - before)
+        if keep < int(row.amount_sats):
+            self.engine.store.amend(txid, keep or None)
+
+    def _settle_forward_refunds(self) -> list[dict]:
+        """AGP-089: void the forward lots of refunded channels whose refund our node shows in a block.
+        The caller holds _spend_lock."""
+        out = []
+        with self._xbt402.fwd.lock:
+            pending = dict(self._xbt402.fwd.data["pending"])
+        for dest, pend in pending.items():
+            rec = self.channels.get(dest)
+            if rec is None or rec.state != "refunded" or not rec.refund_txid:
+                continue
+            try:
+                confirmed = bool(self.rpc.call("gettxout", rec.refund_txid, 0, False)) or \
+                    int((netparams.get_tx(self.rpc, rec.refund_txid) or {}).get("confirmations") or 0) >= 1
+            except Exception:
+                confirmed = False
+            if not confirmed:
+                continue
+            with self._xbt402.fwd.lock:
+                self._xbt402.fwd.data["pending"].pop(dest, None)
+                self._xbt402.fwd.data["void"][pend["offer"]["outpoint"]] = {"refund": rec.refund_txid, "cum": pend["cum"],
+                                                                           "lot": pend}
+                self._xbt402.fwd.save()
+            self._release_forward(pend["chan"], int(pend["cum"]))
+            out.append({"dest": dest, "chan": pend["chan"], "forward_void": pend["offer"]["outpoint"], "refund": rec.refund_txid})
+        return out
 
     def _notice_close_change(self, dest: str) -> str:
         """AGP-016/022: a close pays our change to the hot key. If the provider built it (or its tx had not
@@ -582,6 +667,10 @@ class Signer:
                     r = self._refund_locked(rec.dest, auto=True)
                 actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, **{k: r.get(k) for k in
                                 ("verdict", "rule", "txid", "sats", "reason")}})
+        if self._xbt402.fwd.data["pending"]:       # AGP-089: a refunded channel's forward lot, once the refund confirmed
+            with self._spend_lock, sigaudit.context(method="watcher"):
+                for a in self._settle_forward_refunds():
+                    actions.append({**a, "height": h})
         if self.treasury.pending or self.treasury.unsettled:   # AGP-085: a treasury funding of unknown fate
             p = dict(self.treasury.pending or {})
             with self._spend_lock, sigaudit.context(method="watcher"):
@@ -661,10 +750,19 @@ class Signer:
             return {"ok": False, "reason": "sweep_hot requires a valid human signature"}
         if expiry < self.engine.clock():
             return {"ok": False, "reason": "sweep signature expired"}
+        try:
+            spk = address_to_spk(to, self.hrp)                              # P5: this chain's hrp only
+        except ValueError as e:
+            return {"ok": False, "reason": str(e)[:200]}
+        # AGP-089: one signature sweeps once (it carried an expiry and no nonce: until its expiry any
+        # holder could sweep again, whatever had arrived at the hot key since)
+        used = self._use_signature(sweep_message(self.hot.address, to, amount, expiry), expiry)
+        if used:
+            return {"ok": False, "reason": used["reason"], "rule": used["rule"]}
         sigaudit.set_rule("human:sweep_signature")
         self._settle_close_changes()      # AGP-022: a pending close change is counted before the sweep
         try:
-            out = self.hot.sweep_to(address_to_spk(to, self.hrp), amount)   # P5: this chain's hrp only
+            out = self.hot.sweep_to(spk, amount)
         except (RuntimeError, ValueError, KnotsRpcError) as e:
             return {"ok": False, "reason": str(e)[:200]}
         self.engine.audit.append({"type": "hot_sweep", "to": to, "sats": amount, "txid": out["txid"],
@@ -737,6 +835,18 @@ class Signer:
             return _deny("human_sig", "missing or invalid human signature")
         if self._int(params.get("expiry")) < self.engine.clock():
             return _deny("expired", "the signature has expired")
+        return self._use_signature(message, self._int(params.get("expiry")))
+
+    def _use_signature(self, message: bytes, expiry: int) -> dict | None:
+        """AGP-089: None, and `message` is now used; a message used before is refused (UsedSigs). Call it
+        last, after every check of the request that needs no signature, so a refusal for another
+        reason does not cost the signature."""
+        try:
+            fresh = self.used_sigs.spend(message, expiry, self.engine.clock())
+        except RuntimeError as e:
+            return _deny("human_sig", str(e))
+        if not fresh:
+            return _deny("human_sig_replay", "this signature was already used: one signature authorises one operation")
         return None
 
     def _booked_increase(self, dest: str, cum: int, memo: str, sign):
@@ -832,7 +942,9 @@ class Signer:
         }
 
     def _max_expiry_blocks(self) -> int:
-        return max(self.config.channel_expiry_blocks, 4032)
+        """The owner's bound on how long any channel's coins are locked: one function for the socket's
+        open_channel and for a seller's offer (AGP-089)."""
+        return max_expiry_blocks(self.config.channel_expiry_blocks)
 
     def _open_channel_checked(self, params: dict) -> dict:
         """AGP-063 W3: a caller on the agent socket opens a channel only to an allowlisted dest, to the
@@ -1090,17 +1202,19 @@ class Signer:
         sats = self._int(params.get("sats") or params.get("amount_sats"))
         if sats <= 0:
             return {"ok": False, "reason": "fund_treasury needs a positive amount"}
-        refused = self._human_signed(
-            treasury_fund_message(self.hot.address, self.treasury.address, sats, self._int(params.get("expiry"))), params)
-        if refused:
-            return {"ok": False, "reason": f"fund_treasury requires a valid human signature: {refused['reason']}",
-                    "rule": refused["rule"]}
         if self.treasury.pending and self._settle_treasury_funding() is None:
             p = self.treasury.pending
             return {"ok": False, "rule": "treasury_funding_pending",
                     "reason": f"an earlier funding {p['txid']}:{p['vout']} of {p['capacity']} sat is not on this node "
                               "yet and was not refused: it is sent again by the watcher, and nothing new is funded "
                               "until the node shows or refuses it", **self.treasury.status()}
+        # one signature funds once (AGP-089, `_human_signed`): asked after the refusal above, which
+        # needs no signature, so that refusal does not cost it
+        refused = self._human_signed(
+            treasury_fund_message(self.hot.address, self.treasury.address, sats, self._int(params.get("expiry"))), params)
+        if refused:
+            return {"ok": False, "reason": f"fund_treasury requires a valid human signature: {refused['reason']}",
+                    "rule": refused["rule"], **self.treasury.status()}
         sigaudit.set_rule("human:treasury_fund_signature")
         prep = self.hot.prepare_fund(self.treasury.spk, sats)
         txid, vout = prep["txid"], 0
@@ -1128,7 +1242,8 @@ class Signer:
         and no longer holds up a new funding. None: still unknown (kept). The caller holds _spend_lock."""
         for old in list(self.treasury.unsettled):       # one that confirmed after all
             try:
-                seen = not self.treasury.funding_txid and self.rpc.call("gettxout", old["txid"], int(old["vout"]), True)
+                # AGP-089: recorded beside whatever is recorded already (record_funding forgets nothing)
+                seen = self.rpc.call("gettxout", old["txid"], int(old["vout"]), True)
             except Exception:
                 seen = None
             if seen:
@@ -1188,16 +1303,26 @@ class Signer:
             dest_spk = address_to_spk(dest, self.hrp)
         except ValueError as e:
             return {"ok": False, "reason": str(e)}
-        tx = self.treasury.recovery_tx(dest_spk)
-        self.sigaudit.record("treasury_recovery", sig=tx.inputs[0].witness[0], dest=dest, txid=tx.txid(),
-                             rule="human:recover_signature", sighash="0x21")
+        # AGP-089: every funding the treasury recorded is recovered, each by its own transaction (one
+        # that is spent or not yet mature does not hold up the others). This signature is not used up:
+        # asking again builds the same transactions to the address the human signed, and a recovery
+        # refused today for its CSV age has to be asked again later.
+        txids, errors = [], []
         try:
-            txid = self.rpc.call("sendrawtransaction", tx.hex())
-        except KnotsRpcError as e:
-            return {"ok": False, "reason": str(e), "need_csv": self.treasury.csv}
+            for op in self.treasury.outpoints() or [None]:
+                tx = self.treasury.recovery_tx(dest_spk, outpoint=op)
+                self.sigaudit.record("treasury_recovery", sig=tx.inputs[0].witness[0], dest=dest, txid=tx.txid(),
+                                     rule="human:recover_signature", sighash="0x21")
+                try:
+                    txids.append(self.rpc.call("sendrawtransaction", tx.hex()))
+                except KnotsRpcError as e:
+                    errors.append(str(e))
         finally:
             self._anchor("treasury_recovery")
-        return {"ok": True, "txid": txid, "csv": self.treasury.csv, "to": dest}
+        if not txids:
+            return {"ok": False, "reason": errors[0] if errors else "treasury is not funded", "need_csv": self.treasury.csv}
+        return {"ok": True, "txid": txids[0], "csv": self.treasury.csv, "to": dest,
+                **({"txids": txids} if len(txids) > 1 else {}), **({"not_recovered": errors} if errors else {})}
 
     def _approve_signed(self, params: dict) -> dict:
         token = params.get("token") or ""

@@ -237,7 +237,12 @@ class ForwardSession(Xbt402Session):
         """Read a channel close; if it carries our completed adaptor state, extract s and finish the
         transfer. If it closes with a lower state, the pending purchase is void: nothing was paid."""
         from .netparams import get_tx
-        raw = (get_tx(self.rpc, close_txid, blockhash) or {}).get("hex")   # AGP-017 P6: no txindex needed
+        found = get_tx(self.rpc, close_txid, blockhash) or {}       # AGP-017 P6: no txindex needed
+        raw = found.get("hex")
+        try:
+            confirmed = int(found.get("confirmations") or 0) >= 1
+        except (TypeError, ValueError):
+            confirmed = False
         if not raw:
             raise RuntimeError("close transaction not found in the mempool (pass its block hash on a pruned node)")
         close = FTx.parse(bytes.fromhex(raw))
@@ -249,20 +254,29 @@ class ForwardSession(Xbt402Session):
             inp = spent.get((rec.funding_txid, rec.funding_vout)) if rec else None
             if inp is None:
                 continue
-            self.book.mark_closed(dest, close_txid)
             lot, pre = lot_from_offer(p["offer"]), adaptor.PreSig.from_json(p["presig"])
             for item in inp.witness:
                 y = adaptor.extract(pre, item, lot.S)
                 if y is not None:
                     tx = transfer_with(lot, y)
                     if tx is not None:
+                        self.book.mark_closed(dest, close_txid)
                         self._delivered(dest, tx, via=f"close {close_txid}")
                         return {"recovered": True, "dest": dest, "outpoint": p["offer"]["outpoint"], "price": p["price"],
                                 "chan": p["chan"], "cum": p["cum"],
                                 "transfer_txid": tx.txid(), "transfer_hex": tx.hex(), "via": "channel close witness"}
+            # AGP-089: a close that does not carry the pre-signature voids the lot only once it is in a
+            # block. While it is only in our node's mempool the market can still get another close
+            # mined, the one with the completed pre-signature; voiding now would drop the record that
+            # recovers the transfer from it, and release a booking the market can still collect.
+            if not confirmed:
+                return {"recovered": False, "void": False, "unconfirmed": True, "dest": dest, "chan": p["chan"], "cum": p["cum"],
+                        "reason": "this close is not in a block yet: the lot stays pending and booked; ask again "
+                                  "once a close has confirmed"}
+            self.book.mark_closed(dest, close_txid)
             with self.fwd.lock:
                 self.fwd.data["pending"].pop(dest, None)
-                self.fwd.data["void"][p["offer"]["outpoint"]] = {"close": close_txid, "cum": p["cum"]}
+                self.fwd.data["void"][p["offer"]["outpoint"]] = {"close": close_txid, "cum": p["cum"], "lot": p}
                 self.fwd.save()
             return {"recovered": False, "dest": dest, "void": True, "chan": p["chan"], "cum": p["cum"],
                     "reason": "the close does not carry the adaptor state: the lot was not paid for"}
