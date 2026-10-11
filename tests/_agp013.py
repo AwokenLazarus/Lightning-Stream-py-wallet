@@ -20,7 +20,16 @@ PAY_TO = 0xB0B
 
 
 class FakeRpc:
-    """getblockcount / sendrawtransaction / gettxout / getrawtransaction, enough for the signer."""
+    """getblockcount / sendrawtransaction / gettxout / getrawtransaction, enough for the signer.
+
+    AGP-095: it answers as a node does about what is in a block and what is only in its mempool (the
+    third audit found the wallet took a mempool spend for a close, and this double could not show
+    it). A transaction broadcast here is in the mempool at the height it was sent and in a block
+    once the chain is higher (unless its txid is in `unmined`); one a test put into `txs` by hand is
+    confirmed when its entry says `confirmations` >= 1, and a spender named in `spenders` with no
+    entry at all counts as confirmed. So `gettxout(.., False)` still shows an output only a mempool
+    transaction spends, `gettxspendingprevout` names mempool spenders only, and `getblock` (every
+    height is the one block here) lists the confirmed transactions for a spender scan."""
 
     wallet = "agent"
 
@@ -31,14 +40,46 @@ class FakeRpc:
         self.utxos: dict[tuple, dict] = {}  # (txid, vout) -> gettxout result
         self.txs: dict[str, dict] = {}      # txid -> getrawtransaction verbose
         self.spenders: dict[tuple, str] = {}
+        self.spent: dict[tuple, dict] = {}  # outpoint -> the gettxout answer it had before it was spent
+        self.sent_at: dict[str, int] = {}   # txid -> the height it was broadcast at
+        self.unmined: set[str] = set()      # broadcast transactions no block ever takes
         self.reject: str | None = None
         self.deployments: dict | None = None  # getdeploymentinfo; None: the node does not answer it
+
+    def in_block(self, txid: str) -> bool:
+        t = self.txs.get(txid)
+        try:
+            if t is not None and int(t.get("confirmations") or 0) >= 1:
+                return True
+        except (TypeError, ValueError):
+            pass
+        if txid in self.sent_at:
+            return txid not in self.unmined and self.height > self.sent_at[txid]
+        return t is None
 
     def call(self, method, *params):
         if method == "getblockcount":
             return self.height
         if method == "getblockhash":
             return "22" * 32
+        if method == "getblock":
+            txs = []
+            for txid, t in self.txs.items():
+                if not t.get("hex") or not self.in_block(txid):
+                    continue
+                try:
+                    tx = Tx.parse(bytes.fromhex(t["hex"]))
+                except Exception:
+                    continue
+                txs.append({"txid": txid, "hex": t["hex"],
+                            "vin": [{"txid": i.txid[::-1].hex(), "vout": i.vout} for i in tx.inputs]})
+            have = {t["txid"] for t in txs}
+            by: dict[str, list] = {}       # a spender a test named without its transaction, once confirmed
+            for (t, v), sp in self.spenders.items():
+                if sp not in have and self.in_block(sp):
+                    by.setdefault(sp, []).append({"txid": t, "vout": v})
+            txs += [{"txid": sp, "vin": vin} for sp, vin in by.items()]
+            return {"hash": params[0], "height": self.height, "tx": txs}
         if method == "sendrawtransaction":
             if self.reject:         # the node's own JSON-RPC refusal (AGP-085: only that forgets a funding)
                 from agentwallet.rpc import KnotsRpcRefused
@@ -48,8 +89,11 @@ class FakeRpc:
             txid = tx.txid()
             for i in tx.inputs:
                 op = (i.txid[::-1].hex(), i.vout)
-                self.utxos.pop(op, None)
+                was = self.utxos.pop(op, None)
+                if was is not None:
+                    self.spent[op] = was
                 self.spenders[op] = txid
+            self.sent_at[txid] = self.height
             if self.track_outputs:
                 for n, o in enumerate(tx.outputs):
                     self.utxos[(txid, n)] = {"value": o.value / 1e8, "scriptPubKey": {"hex": o.script_pubkey.hex()}}
@@ -59,7 +103,12 @@ class FakeRpc:
                 for n, o in enumerate(tx.outputs)]}
             return txid
         if method == "gettxout":
-            return self.utxos.get((params[0], int(params[1])))
+            op = (params[0], int(params[1]))
+            u = self.utxos.get(op)
+            if u is None and len(params) > 2 and not params[2] and op in self.spent \
+                    and not self.in_block(self.spenders.get(op, "")):
+                return self.spent[op]          # without the mempool: its only spender is in no block
+            return u
         if method == "getrawtransaction":
             t = self.txs.get(params[0])
             if t is None:
@@ -68,7 +117,8 @@ class FakeRpc:
             return t if (len(params) > 1 and params[1]) else t["hex"]
         if method == "gettxspendingprevout":
             return [{"txid": o["txid"], "vout": o["vout"], **({"spendingtxid": self.spenders[(o["txid"], o["vout"])]}
-                     if (o["txid"], o["vout"]) in self.spenders else {})} for o in params[0]]
+                     if (o["txid"], o["vout"]) in self.spenders
+                     and not self.in_block(self.spenders[(o["txid"], o["vout"])]) else {})} for o in params[0]]
         if method == "getblockchaininfo":
             return {"blocks": self.height, "initialblockdownload": False}
         if method == "scantxoutset":

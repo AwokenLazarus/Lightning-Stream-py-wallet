@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from . import netparams
 from .b1path import ensure_b1
-from .chain import spend_is_evidence
+from .chain import is_light, spend_is_evidence
 from .channels import ChannelBook, ChannelCapError, booked_through, fee_payer_kw
 from .hot import HotWallet
 from .rpc import KnotsRpcRefused
@@ -155,6 +155,10 @@ def max_expiry_blocks(channel_expiry_blocks: int) -> int:
 
 # AGP-089: the longest a stream's last chunk may stay hash-locked on the seller's word (four weeks)
 MAX_COND_CSV_BLOCKS = 4032
+# AGP-095: the shortest a channel funded on a seller's offer may last (a day of blocks), unless the
+# owner's channel_expiry_blocks asks for less. Each funded channel costs a funding fee and a close or
+# refund fee that no budget counts, so a seller's window does not get one per call.
+MIN_OFFER_EXPIRY_BLOCKS = 144
 
 
 def _count(v, what: str, least: int = 0) -> int:
@@ -283,6 +287,18 @@ class Xbt402Session:
         blocks = open_expiry_blocks(expiry_blocks, min_exp, max_exp, min_conf, margin)
         if not 0 < blocks <= most:
             raise ChannelError("expiry", "offer expiry window is not a block count this wallet accepts")
+        # AGP-095 (audit item 4), the lower side of the same rule: **how long a channel lasts is the
+        # owner's number too.** The offer's maxExpiryBlocks caps the window from above, so a seller
+        # that offers a window of a block or two and answers the preflight yes got a channel funded
+        # that could never be opened and was refunded, on every call, for two fees no budget sees. A
+        # channel is funded only if it lasts at least the offer's own floor (below it the seller's own
+        # check refuses the open), longer than the refund margin (inside it this wallet never opens),
+        # and at least MIN_OFFER_EXPIRY_BLOCKS or what the owner asked for.
+        least = max(floor, self.refund_margin + 1, min(int(expiry_blocks), MIN_OFFER_EXPIRY_BLOCKS))
+        if blocks < least:
+            raise ChannelError("expiry", f"the offer's window lets the channel last {blocks} blocks; this wallet funds one "
+                                         f"only for {least} or more (the offer's own floor, the refund margin, and a day "
+                                         "or the policy's channel_expiry_blocks); refused before funding")
         check = getattr(self.hot, "check_channel_funding", None)
         if check is not None:  # AGP-013: above the hot-balance cap, a human sweeps before new channels
             check()
@@ -518,6 +534,23 @@ class Xbt402Session:
         return r, cum
 
     @staticmethod
+    def held_and_short(rec, status: int, headers) -> bool:
+        """The seller's 402 to a state sent again says, in its own (unsigned) words, that it holds
+        exactly that state, for exactly that request, and that the state does not pay for this call
+        (`insufficient_payment`). `rec` is the record as the request left with it. Any other refusal
+        (closing, unconfirmed, exhausted, a state it does not have) is no reason to sign more."""
+        if status != 402:
+            return False
+        try:
+            hdr = next((v for k, v in (headers or {}).items() if str(k).upper() == "PAYMENT-REQUIRED"), None)
+            pr = unb64json(hdr)
+            ch = pr.get("channel") or {}
+            return (pr.get("error") == "insufficient_payment" and ch.get("chan") == rec.chan
+                    and int(ch.get("cum")) == int(rec.used_sats) and int(ch.get("seq")) == int(rec.seq))
+        except Exception:      # noqa: BLE001  the seller's document: unreadable is "no"
+            return False
+
+    @staticmethod
     def check_seller_receipt(rec, resp, method: str, url: str, body: bytes, answer: tuple, quote: int) -> int:
         """The seller's receipt: signature, seq, request and answer binding, and a charged that is not
         negative and not above the quote. The number itself is never what the wallet books."""
@@ -566,6 +599,10 @@ class Xbt402Session:
         if routed is not None:  # another rail (forward) took the offer; the 402 above is its only unpaid call
             return routed
         price = int(acc["amount"])
+        if price < 0:
+            # the seller's number: a negative one is neither above max_sats nor zero, so a free-only
+            # call (max_sats 0) went on to fund a channel (AGP-095, audit item 4)
+            raise RuntimeError("offer amount is negative; nothing was opened or signed")
         if price > max_sats:
             return {"verdict": "deny", "rule": "max_sats", "reason": f"quoted {price} > max_sats {max_sats}"}
         if price == 0:
@@ -599,21 +636,46 @@ class Xbt402Session:
                  cap=rec.cap_sats, ms=round(1000 * (time.time() - t1), 1))
         rec = self.book.get(dest)
         ledger_before = self._booked_through(rec)
-        if rec is not None and rec.last_sig and rec.used_sats > rec.acked_sats:
-            rec, sig = self.book.resend_state(dest)   # same (cum, sig); do not sign a higher one (M3)
-        else:
+
+        def sign_next():
+            """Sign the state that pays `price` for this call, inside what the policy approved for
+            it: (record, signature, None), or (None, None, the refusal) with nothing signed."""
             nxt = self.book.next_cum(dest, price)
             if nxt - ledger_before > max_sats and self._spend_check is not None:
                 refused = self._spend_check(dest, max_sats, nxt - ledger_before)
                 if refused:
-                    return refused
-            rec, sig = self.book.increment(dest, price)
+                    return None, None, refused
+            return (*self.book.increment(dest, price), None)
+
+        def send(rec, sig):
+            payload = {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats)}
+            if sig:
+                payload["sig"] = sig.hex() if isinstance(sig, bytes) else sig
+            return self._paid(method, url, body, acc, payload)
+
+        resend = rec is not None and bool(rec.last_sig) and rec.used_sats > rec.acked_sats
+        if resend:
+            rec, sig = self.book.resend_state(dest)   # same (cum, sig); do not sign a higher one (M3)
+        else:
+            rec, sig, refused = sign_next()
+            if refused:
+                return refused
         # AGP-063 W1: book the signed increase before the signature leaves. Never the seller's charged.
         booked = self._book_unbooked(dest)
-        payload = {"chan": rec.chan, "seq": rec.seq, "cum": str(rec.used_sats)}
-        if sig:
-            payload["sig"] = sig.hex() if isinstance(sig, bytes) else sig
-        st2, _, out2, receipt = self._paid(method, url, body, acc, payload)
+        st2, hdrs2, out2, receipt = send(rec, sig)
+        # AGP-095 (audit item 3). The rule: **one call signs at most one new state, and signs it only
+        # when the seller holds the last one**: because a receipt acked it, or because the seller,
+        # sent that state again, answers that it has it and that it does not pay for this call. That
+        # is what a seller answers once it has served a call whose answer was lost: it charged the
+        # call, the wallet has no receipt, and a state that is only ever sent again never covers the
+        # next call, so the channel stopped for good. The call is paid once, by the one new state;
+        # the 402 is not a receipt and acks nothing.
+        if resend and self.held_and_short(rec, st2, hdrs2):
+            rec, sig, refused = sign_next()
+            if refused:
+                return refused
+            booked += self._book_unbooked(dest)
+            st2, hdrs2, out2, receipt = send(rec, sig)
         # AGP-089 (review T4): the state counts as arrived only on the payee's signature over this
         # request's seq. Any other PAYMENT-RESPONSE (none, one for an earlier request, one someone on
         # the path made up) leaves it unacked, so the next call sends the same state again and signs
@@ -944,14 +1006,25 @@ class Xbt402Session:
             return None
         if not evidence:
             return None
-        spender = proven or netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, 0)   # the mempool
-        if spender:
-            return spender
+        if proven:
+            return proven
+        # AGP-095 (audit item 17), the rule: **a channel leaves the refund watch only when our node
+        # shows its funding spent in a block.** A close that is only in the mempool may never be
+        # mined (a fee too low, a conflict, an eviction): taken for "closed, proven" it ended the
+        # watch, and the funding then sat unspent past its expiry with no refund. (On the light
+        # backend `proven` above is already a confirmed spend, and nothing else is evidence.)
+        if is_light(self.rpc) or netparams.spent_in_mempool_only(self.rpc, rec.funding_txid, rec.funding_vout):
+            return None
         if rec.funding_height or netparams.get_tx(self.rpc, rec.funding_txid):
-            return ""
+            # gone from the confirmed set: the spender is in a block, and it is named from there (the
+            # mempool lookup that used to name it answers for mempool spends only). Read once: the
+            # close is proven by this answer and not asked about again. The blocks the close-change
+            # scan already read held no spender of this funding (AGP-022), so they are not read again.
+            return netparams.block_spender(self.rpc, rec.funding_txid, rec.funding_vout,
+                                           rec.close_scan_from or rec.funding_height or rec.open_height) or ""
         if scan:
-            return netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout,
-                                          rec.funding_height or rec.open_height)
+            return netparams.block_spender(self.rpc, rec.funding_txid, rec.funding_vout,
+                                           rec.funding_height or rec.open_height)
         return None
 
     def close_channel(self, dest: str) -> dict:

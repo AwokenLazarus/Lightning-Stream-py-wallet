@@ -83,7 +83,7 @@ class Refund(unittest.TestCase):
         close = "ee" * 32
         self.rpc.utxos.pop((self.p.funding_txid, 0))
         self.rpc.spenders[(self.p.funding_txid, 0)] = close
-        self.rpc.txs[close] = {"txid": close, "vout": [
+        self.rpc.txs[close] = {"txid": close, "confirmations": 1, "vout": [      # AGP-095: the close is in a block
             {"n": 0, "value": 0.00002400, "scriptPubKey": {"hex": "0014" + "22" * 20}},
             {"n": 1, "value": 0.00097600, "scriptPubKey": {"hex": self.s.hot.spk.hex()}}]}
         self.rpc.utxos[(close, 1)] = {"value": 0.00097600, "scriptPubKey": {"hex": self.s.hot.spk.hex()}}

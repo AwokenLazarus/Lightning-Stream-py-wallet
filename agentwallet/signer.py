@@ -36,7 +36,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from . import anchor as anchoring, chain as chainbackend, netparams, sigaudit
-from .approval import UsedSigs, rotate_message, verify, verify_approval, x2b
+from .approval import SigExpired, UsedSigs, rotate_message, verify, verify_approval, x2b
 from .channels import ChannelBook, ChannelCapError
 from .forward import ForwardPolicy, ForwardSession
 from .hot import HotCapError, HotWallet
@@ -355,7 +355,7 @@ class Signer:
                     self._book_forward(res["dest"], res["chan"], int(res["cum"]), int(res["price"]),
                                        f"forward {res['outpoint']} (recovered)")
                 elif res.get("void"):        # the close does not carry the pre-signature: proven void
-                    self._release_forward(res["chan"], int(res["cum"]))
+                    self._release_forward(res["chan"], int(res["cum"]), paid=int(res.get("paid") or 0))
                 return sanitize(res)
         if method == "forward_status":
             return sanitize(self._xbt402.status())
@@ -449,7 +449,7 @@ class Signer:
                 if self._height() < rec.expiry:
                     return {**_deny("refund_early", "the provider reported a close this node has not seen; the "
                                                     f"refund is valid from the block after {rec.expiry}"), **base}
-                self.channels.reopen_unproven(dest)
+                self._reopen_unproven(dest)
             rec = self.channels.get(dest)
         if rec.state == "closed":
             self._notice_close_change(dest)
@@ -475,10 +475,17 @@ class Signer:
             if not evidence:
                 return {**_deny("funding_unknown", "no Electrum server shows the funding output, and none proves "
                                                    "it spent; nothing is booked, the refund is tried again"), **base}
-            # P6: no txindex. The spend is found in the mempool or by scanning blocks from the funding's
-            # block; the funding counts as known once seen confirmed (funding_height) or in the mempool.
+            # AGP-095: a spend that is only in the mempool closes nothing. The record stays open and
+            # with the watcher, which asks again every tick: closed once the spend is in a block,
+            # refunded if that transaction leaves the mempool unmined.
+            if not proven and not self.light and netparams.spent_in_mempool_only(self.rpc, rec.funding_txid, rec.funding_vout):
+                return {**_deny("close_unconfirmed", "the funding output is spent by a transaction that is not in a "
+                                                     "block yet: the channel stays with the refund watcher until it is"),
+                        **base, "spender": netparams.mempool_spender(self.rpc, rec.funding_txid, rec.funding_vout)}
+            # P6: no txindex. The spend is found by scanning blocks from the funding's block; the
+            # funding counts as known once seen confirmed (funding_height) or in the mempool.
             start = rec.funding_height or rec.open_height
-            spender = proven or netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, start)
+            spender = proven or netparams.block_spender(self.rpc, rec.funding_txid, rec.funding_vout, start)
             known = bool(spender or rec.funding_height or netparams.get_tx(self.rpc, rec.funding_txid))
             if known:
                 # AGP-022: the change first, then the state: a reader that sees "closed" sees the change
@@ -541,12 +548,24 @@ class Signer:
                 txid, vout = i.txid[::-1].hex(), int(i.vout)
                 if self.rpc.call("gettxout", txid, vout, False):
                     continue
-                by = netparams.find_spender(self.rpc, txid, vout, max(1, int(start)))
+                # in a block: a mempool spender of an input that never confirmed proves nothing (AGP-095)
+                by = netparams.block_spender(self.rpc, txid, vout, max(1, int(start)))
                 if by and by != rec.funding_txid:
                     return f"{txid}:{vout} (spent by {by})"
         except Exception:
             return None
         return None
+
+    def _reopen_unproven(self, dest: str) -> None:
+        """A close our node never showed in a block, with the funding unspent at expiry: open again,
+        for the refund. AGP-095: such a close may have been in the mempool and left it unmined, with
+        its change counted meanwhile; that coin never existed, so the stored coins are checked
+        against the node again."""
+        self.channels.reopen_unproven(dest)
+        try:
+            self.hot.reconcile(scan=False)
+        except Exception:
+            pass
 
     def _prove_close(self, dest: str, *, scan: bool = True) -> bool:
         """AGP-080 W3: True once our own node shows the funding output of an unproven close spent (the
@@ -561,24 +580,29 @@ class Signer:
         self._notice_close_change(dest)
         return True
 
-    def _release_forward(self, chan: str, cum: int) -> None:
+    def _release_forward(self, chan: str, cum: int, *, paid: int = 0) -> None:
         """AGP-080 W1: a forward lot's pre-signature was booked when it was made; it is released only
         here, on proof it is void (the channel's funding was spent, in a block, by a transaction that
-        does not carry it: our refund, or a close with a lower state).
+        does not carry it: our refund, or a close with another state).
 
         AGP-089, the rule: **a release takes back only what no other signed state of the channel can
         claim.** The lot's row covers the channel from where the ledger stood before it up to `cum`.
         Plain states signed while the lot was pending rode on that row and booked nothing of their
         own, so the row is lowered to what they reach (`used_sats`), and removed only when they reach
-        nothing of it."""
+        nothing of it.
+
+        AGP-095 (audit item 17): and never below what the close that voided the lot paid (`paid`,
+        cumulative). A stream's hash-locked last chunk and a routed lock also ride on the row and do
+        not move `used_sats` while they are pending; when the market closed with one of them it was
+        paid 3,000 sat and the ledger kept 2,000. The record is looked up by the lot's own channel,
+        live or archived."""
         txid = f"xbt402:{chan}:{cum}"
         row = next((e for e in self.engine.store.payments() if e.txid == txid), None)
         if row is None:
             return
-        dest = self.channels.find_dest(chan)
-        rec = self.channels.get(dest) if dest else None
+        rec, _ = self.channels.record_of_chan(chan)
         before = int(cum) - int(row.amount_sats)
-        keep = int(row.amount_sats) if rec is None else max(0, min(int(cum), int(rec.used_sats)) - before)
+        keep = int(row.amount_sats) if rec is None else max(0, min(int(cum), max(int(rec.used_sats), int(paid))) - before)
         if keep < int(row.amount_sats):
             self.engine.store.amend(txid, keep or None)
 
@@ -589,15 +613,13 @@ class Signer:
         with self._xbt402.fwd.lock:
             pending = dict(self._xbt402.fwd.data["pending"])
         for dest, pend in pending.items():
-            rec = self.channels.get(dest)
+            # AGP-095 (audit item 9): the lot's own channel, not the dest's current one. After a
+            # replacement the current channel's refund said nothing about the earlier lot, and filed
+            # it void.
+            rec, _ = self.channels.record_of_chan(pend["chan"])
             if rec is None or rec.state != "refunded" or not rec.refund_txid:
                 continue
-            try:
-                confirmed = bool(self.rpc.call("gettxout", rec.refund_txid, 0, False)) or \
-                    int((netparams.get_tx(self.rpc, rec.refund_txid) or {}).get("confirmations") or 0) >= 1
-            except Exception:
-                confirmed = False
-            if not confirmed:
+            if not self._refund_in_block(rec):
                 continue
             with self._xbt402.fwd.lock:
                 self._xbt402.fwd.data["pending"].pop(dest, None)
@@ -607,6 +629,27 @@ class Signer:
             self._release_forward(pend["chan"], int(pend["cum"]))
             out.append({"dest": dest, "chan": pend["chan"], "forward_void": pend["offer"]["outpoint"], "refund": rec.refund_txid})
         return out
+
+    def _refund_in_block(self, rec) -> bool:
+        """AGP-095 (audit item 17): is `rec`'s refund in a block, by our node? Asked three ways,
+        because a node without txindex answers only some of them: the refund's output is in the
+        confirmed UTXO set; the node shows the transaction with a confirmation (mempool, txindex);
+        or, once that output is spent and the node keeps no index, the block itself: the transaction
+        that spent the channel's funding in a block is the refund. The refund is valid from the block
+        after the expiry, so the blocks are read from there. Without the third way a refund whose
+        output the hot wallet had spent again never counted as confirmed, and its lot stayed pending
+        for good."""
+        try:
+            if self.rpc.call("gettxout", rec.refund_txid, 0, False):
+                return True
+            if int((netparams.get_tx(self.rpc, rec.refund_txid) or {}).get("confirmations") or 0) >= 1:
+                return True
+            if self.light:
+                return False
+            start = max(int(rec.expiry), int(rec.funding_height or rec.open_height or 0), 1)
+            return netparams.block_spender(self.rpc, rec.funding_txid, rec.funding_vout, start) == rec.refund_txid
+        except Exception:
+            return False
 
     def _notice_close_change(self, dest: str) -> str:
         """AGP-016/022: a close pays our change to the hot key. If the provider built it (or its tx had not
@@ -671,7 +714,7 @@ class Signer:
                                     "close_change": now.close_change or "pending", "closed_txid": now.closed_txid,
                                     "height": h})
                 elif h >= rec.expiry:
-                    self.channels.reopen_unproven(rec.dest)   # never closed: the refund loop below takes it
+                    self._reopen_unproven(rec.dest)           # never closed: the refund loop below takes it
         for rec in self.channels.unsettled_records():
             if h >= rec.expiry:
                 with self._spend_lock, sigaudit.context(method="watcher"):
@@ -854,6 +897,8 @@ class Signer:
         reason does not cost the signature."""
         try:
             fresh = self.used_sigs.spend(message, expiry, self.engine.clock())
+        except SigExpired as e:
+            return _deny("expired", str(e))
         except RuntimeError as e:
             return _deny("human_sig", str(e))
         if not fresh:
@@ -1321,7 +1366,13 @@ class Signer:
         txids, errors = [], []
         try:
             for op in self.treasury.outpoints() or [None]:
-                tx = self.treasury.recovery_tx(dest_spk, outpoint=op)
+                try:
+                    tx = self.treasury.recovery_tx(dest_spk, outpoint=op)
+                except RuntimeError as e:
+                    # AGP-095 (audit item 17): one funding that cannot pay its own fee is reported
+                    # and the next one is tried; it used to end the loop before any was recovered
+                    errors.append(f"{op['txid']}:{op['vout']}: {e}" if op else str(e))
+                    continue
                 self.sigaudit.record("treasury_recovery", sig=tx.inputs[0].witness[0], dest=dest, txid=tx.txid(),
                                      rule="human:recover_signature", sighash="0x21")
                 try:

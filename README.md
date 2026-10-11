@@ -111,6 +111,33 @@ AGP-089 (fix wave 4):
 - **A kept funding that can never confirm** (the node names another transaction that spent one of
   its inputs) is closed at expiry and its destination is free; never on the light backend.
 
+AGP-095 (fix wave 5; tests `tests/test_agp093_wallet_b2.py`, `tests/test_agp095_wallet_b2.py`):
+
+- **`xbt402_pay` signs at most one new state a call, and only when the seller holds the last one.** A
+  state without a receipt is sent again. When the seller answers it with a 402 that names it
+  (`insufficient_payment`, this channel, this `cum`, this `seq`), which is what it answers after it
+  served a call whose answer was lost, the call signs one new state of the quoted price and sends
+  the request once more. The 402 is unsigned: what a forged one buys is one state of one price per
+  call the agent makes, inside `max_sats` and the budgets.
+- **An offer's expiry window has a floor**: the channel must last at least the offer's own floor,
+  longer than `refund_margin_blocks`, and at least 144 blocks (or `channel_expiry_blocks` when that
+  is lower), or it is refused before funding (`deny/expiry`). A negative price is refused.
+- **A channel leaves the refund watch only when the node shows its funding spent in a block.** A
+  close that is only in the mempool is closed but unproven (`close_proven: false`), not replaced by
+  a new channel, proven by its block, and refunded at expiry if it leaves the mempool unmined; the
+  refund answers `close_unconfirmed` meanwhile. (Not on the light backend, where only a proven,
+  confirmed spend was evidence already.)
+- **Forward rail: a lot belongs to the channel its pre-signature was made on.** `forward_recover`
+  and the watcher look that channel up by its id, live or archived, so a lot is recovered from the
+  close that paid for it after a plain call opened the next channel, and the next channel's refund
+  does not void it. A void lot's ledger row is never lowered below what the close that voided it
+  paid (a stream's hash-locked last chunk or a routed lock may have closed the channel). A refunded
+  channel's lot is void once the refund is in a block, found there on a node without txindex too.
+- **`recover_treasury`** reports a recorded funding at or below the fee and goes on to the others.
+- **A used human signature stays used by the highest clock `human_sigs.json` has seen** (`clock`):
+  an entry leaves only when its expiry is behind it, and a message whose expiry is behind it is
+  refused (`expired`). A missing file is still an empty one: whoever can delete it can write one.
+
 Limits: on the light (Electrum) backend nothing is "the node's own refusal", because the servers are
 not ours: a funding they refuse stays pending until it is opened or an operator removes it, and its
 dest takes no new channel meanwhile. A kept channel funding that can never confirm (its coin was spent
