@@ -205,7 +205,24 @@ class ACallHasADeadline(unittest.TestCase):
         self.addCleanup(b.close)
         self.assertEqual(b.call("gettxout", self.txid, 0, False)["confirmations"], 1)
         self.assertLessEqual(self.liar.calls.count("blockchain.transaction.get_merkle"), 2)
-        self.assertTrue(any("more than once" in r for r in reasons(b, self.liar)), b.flags)
+        self.assertTrue(any("at two heights" in r for r in reasons(b, self.liar)), b.flags)
+
+    def test_evidence_a_mempool_and_a_block_entry_for_one_transaction_are_one_honest_claim(self):
+        """Found by the regtest interop run: electrs lists a transaction twice while a block arrives.
+        No flag, and the block height is the claim, whichever entry comes first."""
+        height = self.sim.height
+        for rows in ([{"tx_hash": self.txid, "height": 0}, {"tx_hash": self.txid, "height": height}],
+                     [{"tx_hash": self.txid, "height": height}, {"tx_hash": self.txid, "height": 0}]):
+            srv = Knobs(self.sim)
+            self.addCleanup(srv.close)
+            srv.hide.add(self.txid)                       # its own entry goes; the two below stand for it
+            srv.extra_history[self.sh] = rows
+            srv.extra_raw[self.txid] = self.sim.raw[self.txid]
+            b = ElectrumBackend([srv.url, self.honest.url], chain="regtest",
+                                checkpoint=(CHECKPOINT, self.sim.bhash(CHECKPOINT)), timeout=3)
+            self.addCleanup(b.close)
+            self.assertEqual(b.call("gettxout", self.txid, 0, False)["confirmations"], 1)
+            self.assertEqual(reasons(b, srv), [], b.flags)
 
     def test_claims_above_the_tip_force_one_sync_round(self):
         self.liar.claim_height[self.txid] = 999_999

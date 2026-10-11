@@ -112,8 +112,9 @@ Cannot:
   `call_deadline` (4 request timeouts unless set), counted from the end of its header sync, and a
   call forces one header sync at most. A server is asked only for the transactions it listed
   itself, in parallel with the other servers. The first it does not supply, or that neither pays
-  the script nor can spend an output that does, ends its list and flags it; a transaction listed
-  twice counts once. Connecting costs one request timeout for TCP, TLS, `server.version` and the
+  the script nor can spend an output that does, ends its list and flags it. A server has one
+  claim per transaction: a block height replaces a mempool entry for it, and a second block height
+  is flagged and not used. Connecting costs one request timeout for TCP, TLS, `server.version` and the
   subscriptions together;
 - hold a sync round open by trickling headers (AGP-081): an answer with fewer headers than asked
   for, below the tip the server itself claims, ends that server's part of the round ("withheld

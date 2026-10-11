@@ -618,7 +618,14 @@ class ElectrumBackend:
                 raise ElectrumError("sync deadline")
             return min(conn.timeout, t)
 
-        tip = conn.subscribe("blockchain.headers.subscribe", timeout=left())
+        try:
+            tip = conn.subscribe("blockchain.headers.subscribe", timeout=left())
+        except ServerError:
+            # A server that refuses its tip is of no use on this connection, and the refusal can be the
+            # connection's: electrs negotiates protocol 1.4 until it has indexed a v2 header and then
+            # refuses headers to that client for good. Hang up; the next round negotiates again.
+            conn.close()
+            raise
         th = int(tip["height"])
         tip_h = parse_header(bytes.fromhex(tip["hex"]))
         self.server_state[conn.url].update(tip=th, tip_hash=tip_h.hash)
@@ -777,7 +784,7 @@ class ElectrumBackend:
         out = _Hist()
         out.complete = complete
         for c, hist in got:
-            twice = False
+            two_heights = False
             for e in hist:
                 try:
                     txid, height = str(e["tx_hash"]).lower(), int(e["height"])
@@ -785,14 +792,19 @@ class ElectrumBackend:
                     self._flag(c, "get_history: malformed entry")
                     continue
                 claims = out.setdefault(txid, [])
-                # a history names a transaction once: a second height for it is not a claim (each one
-                # used to cost a proof request, and a header sync when above our tip)
-                if any(k is c for k, _ in claims):
-                    twice = True
-                else:
+                # One claim per server and transaction. An honest server can list one twice (in its
+                # mempool and in a block, as a block arrives: electrs does), so a block height replaces
+                # a mempool entry and a repeat is dropped. A second block height is not a claim: each
+                # one used to cost a proof request, and a header sync when above our tip.
+                at = next((n for n, (k, _) in enumerate(claims) if k is c), None)
+                if at is None:
                     claims.append((c, height))
-            if twice:
-                self._flag(c, "get_history lists a transaction more than once: only its first entry is used")
+                elif claims[at][1] <= 0 < height:
+                    claims[at] = (c, height)
+                elif height > 0 and claims[at][1] != height:
+                    two_heights = True
+            if two_heights:
+                self._flag(c, "get_history lists a transaction at two heights: only the first is used")
         return out
 
     def _invented(self, tx: Tx, spk: bytes, listed: dict) -> bool | None:
