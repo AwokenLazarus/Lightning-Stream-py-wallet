@@ -164,6 +164,17 @@ Can (and how it is bounded):
   that asks every server waits for the slowest, up to the timeout per request, and the whole call
   ends at `call_deadline` after its header sync, which has `sync_deadline` (AGP-092; before it a
   history of N entries was N requests to every server with no bound on the call).
+  Since AGP-097 the deadline holds for every entry that makes requests (`proven_spend`, which the
+  refund's evidence calls on its own, had none); a scan asks each server for the script's history
+  once and for the coins' proofs in one write, where it asked for the history once per coin and
+  proved the coins one request at a time (a scan of 20 coins failed beside one server a third of a
+  timeout late); and a request is written by one deadline (a server that stopped reading held a
+  large broadcast for good). A request that the call's deadline cuts short, or leaves no time
+  for, drops and flags nobody: the deadline is shared by every server, so only a request that goes
+  a whole timeout unanswered is the server's own. What stays: a cold scan of N coins asks each
+  server that lists them for N proofs, 16 to a write, and a server that takes longer than one
+  timeout for a write of 16 is dropped for that call (the other servers' proofs decide, and the
+  proofs already held are kept for the next call).
 - **Build a fork above the newest pin**, where blocks are cheap (difficulty `1a00f0b5`): the
   minimum work and the height floor only raise the bar. Releases should bump the pins.
 - **Learn which scripts we watch** (privacy): every hot key and every unsettled channel's funding script.
