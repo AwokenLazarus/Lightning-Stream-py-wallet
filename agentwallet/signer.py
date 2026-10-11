@@ -706,19 +706,36 @@ class Signer:
                     act = {"state": "pending", "error": str(e)[:160]}
             if act["state"] == "open" or act.get("error"):
                 actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, "open_retry": act})
+        # The rule (AGP-106): **one channel's error does not end the tick for the channels after
+        # it.** The two loops over channels below had no guard of their own, so whatever one
+        # channel's step raised that its own handlers do not expect (a light backend's
+        # OverflowError for a height of 1e999 was one) ended the tick there, on every tick: every
+        # later refund, the settlements, the sweep and the anchor waited behind it. The error is
+        # reported as that channel's action (`watcher_error`) and the same step runs again at the
+        # next tick, as it did before.
+        def failed(rec, step: str, e: Exception) -> dict:
+            return {"dest": rec.dest, "chan": rec.chan, "height": h, "verdict": "deny", "rule": "watcher_error",
+                    "reason": f"{step}: {type(e).__name__}: {str(e)[:160]}"}
+
         for rec in self.channels.unproven_close_records():   # AGP-080 W3: closed on the provider's word
             with self._spend_lock, sigaudit.context(method="watcher"):
-                if self._prove_close(rec.dest, scan=h >= rec.expiry):
-                    now = self.channels.get(rec.dest)
-                    actions.append({"dest": rec.dest, "chan": rec.chan, "close_proven": now.closed_txid,
-                                    "close_change": now.close_change or "pending", "closed_txid": now.closed_txid,
-                                    "height": h})
-                elif h >= rec.expiry:
-                    self._reopen_unproven(rec.dest)           # never closed: the refund loop below takes it
+                try:
+                    if self._prove_close(rec.dest, scan=h >= rec.expiry):
+                        now = self.channels.get(rec.dest)
+                        actions.append({"dest": rec.dest, "chan": rec.chan, "close_proven": now.closed_txid,
+                                        "close_change": now.close_change or "pending", "closed_txid": now.closed_txid,
+                                        "height": h})
+                    elif h >= rec.expiry:
+                        self._reopen_unproven(rec.dest)       # never closed: the refund loop below takes it
+                except Exception as e:
+                    actions.append(failed(rec, "prove_close", e))
         for rec in self.channels.unsettled_records():
             if h >= rec.expiry:
                 with self._spend_lock, sigaudit.context(method="watcher"):
-                    r = self._refund_locked(rec.dest, auto=True)
+                    try:
+                        r = self._refund_locked(rec.dest, auto=True)
+                    except Exception as e:
+                        r = failed(rec, "refund", e)
                 actions.append({"dest": rec.dest, "chan": rec.chan, "height": h, **{k: r.get(k) for k in
                                 ("verdict", "rule", "txid", "sats", "reason")}})
         if self._xbt402.fwd.data["pending"]:       # AGP-089: a refunded channel's forward lot, once the refund confirmed

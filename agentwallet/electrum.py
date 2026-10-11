@@ -46,6 +46,14 @@ Trust (see docs/B2_CHAIN_BACKEND.md for the full threat model):
     nobody (`Late`); one that goes a whole timeout unanswered still does. A claim above a server's
     tip is a lie only against a tip it reported in the sync this call forced (`_Call.round`); an
     error about the method ("Method not found", JSON-RPC -32601) is never "not there".
+  * AGP-106. A header sync is not paid for out of a call's time: `_sync_round` gives its time back
+    to the budget it ran under, and `call` syncs before the budget and not again inside it (a
+    server that held a sync to its deadline ended the call with it). Every number a server sends
+    is a finite float or an integer of at most 64 bits where its line is read (`read_line`), and
+    a height or a position is an integer in its range (`whole`). Over TLS a write ends at its
+    deadline by a timer (`_write`). A connection keeps a slot for at most MAX_GIVEN_UP requests
+    given up at a call's deadline. In a scan a busy server has not answered for a transaction it
+    listed (`_supply`).
 What a malicious server can still do: hide a transaction (a close, a funding) from us until another
 server or a block shows it; if every configured server hides it, gettxout reads it as absent, which
 is why a close is booked on `proven_spend` and not on that. It can make calls fail or slow, never
@@ -106,6 +114,7 @@ VALUE_SLACK = 64                   # the same, in JSON values
 MAX_HISTORY = 10_000               # entries of one script in one server's get_history or listunspent answer
 MAX_TX_BYTES = 1_000_000           # a transaction above this (raw) is not fetched
 TX_BATCH = 16                      # proof requests written to one server together (`_prove_ahead`)
+MAX_GIVEN_UP = 16                  # requests given up at a call's deadline that one connection keeps a slot for
 TX_CACHE_BYTES = 32 << 20          # raw bytes of verified transactions kept; the oldest leave first
 SYNC_DEADLINE_TIMEOUTS = 4         # the default sync_deadline, in request timeouts
 CALL_DEADLINE_TIMEOUTS = 4         # the default call_deadline, in request timeouts
@@ -166,11 +175,52 @@ def says_not_there(e: Exception) -> bool:
     return isinstance(e, ServerError) and "method" not in m and any(w in m for w in NOT_THERE)
 
 
+# The rule (AGP-106): **every number a server sends is a finite float or an integer of at most 64
+# bits before anything reads it, and a field that is a height, a position or a count is an integer
+# in its range or its entry is malformed.** The first half is kept where a server's line is parsed
+# (`read_line`, the one place server JSON enters): Python's reader takes `1e999` and `Infinity` for
+# a float infinity, and `int()` of that raises OverflowError, which no handler of a malformed entry
+# catches; it left the backend as an error no caller expects and ended the signer's whole watcher
+# tick. A line with such a number is refused like any line that is not JSON: the connection is
+# closed and the server flagged. The second half is `whole`, at each field.
+def _float(text: str) -> float:
+    f = float(text)
+    if f != f or f in (float("inf"), float("-inf")):
+        raise _Dropped(f"a number no float holds ({text[:24]})")
+    return f
+
+
+def _int(text: str) -> int:
+    if len(text) > 20 or not -(1 << 63) <= (v := int(text)) < (1 << 64):
+        raise _Dropped(f"an integer of more than 64 bits ({text[:24]}..)")
+    return v
+
+
+def _constant(text: str):
+    raise _Dropped(f"a number that is not one ({text})")
+
+
+def read_line(line: bytes):
+    """One line from a server, parsed. Raises `_Dropped` for a number outside the rule above and
+    ValueError for a line that is not JSON."""
+    return json.loads(line, parse_float=_float, parse_int=_int, parse_constant=_constant)
+
+
+def whole(v, lo: int = 0, hi: int = 0xFFFF_FFFF) -> int:
+    """`v` where a server's answer must hold an integer from `lo` to `hi` (a height, a position);
+    ValueError otherwise, which the handlers of a malformed entry catch. Not `int(v)`: that takes
+    1.5 for 1 and "7" for 7, and a server that sends either has not sent a height."""
+    if type(v) is not int or not lo <= v <= hi:
+        raise ValueError(f"not an integer from {lo} to {hi}: {str(v)[:24]!r}")
+    return v
+
+
 @dataclass
 class _Call:
     """One call's budget: its requests end at `deadline` (monotonic), it forces one header sync, and
     it tries once to reach a server that is down (`gone`: the urls it could not reach; a dead server
-    used to cost every step of a call one timeout)."""
+    used to cost every step of a call one timeout). `deadline` moves only in `_sync_round`: a
+    header sync run for the call is not paid for out of the call's time."""
     deadline: float
     synced: bool = False
     gone: set = field(default_factory=set)
@@ -240,7 +290,7 @@ class _Pending:
     msg: dict | None = None
     # Its caller stopped waiting at a deadline that was not the server's (`request_by`): the slot
     # stays so that an answer that still comes is within what the connection allows, and goes when
-    # the answer or the end of the connection does.
+    # the answer or the end of the connection does, or when MAX_GIVEN_UP newer ones are kept.
     kept: bool = False
 
 
@@ -355,13 +405,17 @@ class ElectrumConnection:
     def close(self, why: str = "connection closed") -> None:
         with self._clock:
             s, self._sock = self._sock, None
+            # the requests of the connection that ends here: taken under the lock `connect` sets
+            # the next socket under, so a request of the next connection is never failed with
+            # this one's reason (it was, when a reconnect came between the two lines: AGP-106)
+            waiting = list(self._pending.items())
         if s is not None:
             try:
                 s.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             s.close()
-        for rid, slot in list(self._pending.items()):
+        for rid, slot in waiting:
             slot.msg = {"error": {"message": why}, "closed": True}      # ours, not the server's words
             slot.done.set()
             if slot.kept:                    # nobody waits for it and no answer can come now
@@ -397,7 +451,7 @@ class ElectrumConnection:
                     del buf[:end + 1]
                     self._admit(len(line), line)        # before it is parsed
                     if line.strip():
-                        self._dispatch(json.loads(line))
+                        self._dispatch(read_line(line))
                 seen = len(buf)
                 self._admit(seen)
         except OSError:
@@ -437,10 +491,21 @@ class ElectrumConnection:
         `sendall` on it waited for as long as the server did not read: a broadcast larger than the
         socket buffers was held for good, under the signer's lock. Each `send` here gets what is
         left of the deadline as the socket's send timeout (SO_SNDTIMEO: sends only, the reader is
-        untouched). Where that option cannot be set, a timer hangs up at the deadline, which ends
-        the write. A write that fails leaves a line half written: the caller hangs up."""
+        untouched). Where that option cannot be set, or does not end a send, a timer hangs up at
+        the deadline, which ends the write. A write that fails leaves a line half written: the
+        caller hangs up.
+
+        It does not end a send on a TLS socket (AGP-106): there the expired send timeout reaches
+        OpenSSL as "want write", and CPython's `SSLSocket.send` on a socket with no timeout of its
+        own tries again without end. So over TLS the timer is the deadline, for every write. It
+        hangs up on the socket this write began on and on no other."""
         deadline = time.monotonic() + timeout
         view, guard = memoryview(line), None
+
+        def hang_up() -> None:
+            if self._sock is s:
+                self.close("write deadline")
+
         try:
             while view:
                 left = deadline - time.monotonic()
@@ -448,10 +513,12 @@ class ElectrumConnection:
                     raise TimeoutError("the request was not written by its deadline")
                 if guard is None:
                     try:
+                        if isinstance(s, ssl.SSLSocket):
+                            raise OSError("a send timeout does not end a TLS send")
                         s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
                                      struct.pack("@ll", int(left), max(1, int((left % 1) * 1_000_000))))
                     except (OSError, AttributeError, struct.error):
-                        guard = threading.Timer(left, self.close, args=("write deadline",))
+                        guard = threading.Timer(left, hang_up)
                         guard.daemon = True
                         guard.start()
                 view = view[s.send(view):]
@@ -540,6 +607,17 @@ class ElectrumConnection:
                 # kept only while an answer can still come (one that came meanwhile is done with)
                 if not slot.kept or slot.done.is_set() or self._sock is None:
                     self._pending.pop(rid, None)
+            # The rule (AGP-106): **a connection keeps a slot for at most MAX_GIVEN_UP requests
+            # nobody waits for.** Each slot adds its answer's cap to what the next line may hold,
+            # and a server that answers what it is given a whole timeout for and never the requests
+            # of a call's last moments kept one more per call, without end (200 calls: a line of 12
+            # million JSON values was allowed). Past the bound the oldest is forgotten. Its answer,
+            # if it still comes, is then held to what the other requests allow: a small one is
+            # dropped unread as before, a large one closes the connection like any line nobody
+            # asked for.
+            kept = [rid for rid, sl in list(self._pending.items()) if sl.kept]
+            for rid in kept[:max(0, len(kept) - MAX_GIVEN_UP)]:
+                self._pending.pop(rid, None)
         return out
 
     def subscribe(self, method: str, *params, timeout: float | None = None):
@@ -715,16 +793,31 @@ class ElectrumBackend:
         self._sync_round(force)
         return self._believable()
 
-    def _sync_round(self, force: bool = False) -> int:
+    def _sync_round(self, force: bool = False, call: _Call | None = None) -> int:
         """`sync` without the answer: the number of the round this call ran, 0 when none was due or
-        another sync was in flight (then nothing was run, and the chain is as it was)."""
+        another sync was in flight (then nothing was run, and the chain is as it was).
+
+        The rule (AGP-106): **a header sync is not paid for out of a call's time.** A sync has its
+        own deadline (`sync_deadline`, per server), as long as a call's at the defaults, so a
+        server that held its part of a sync to that deadline ended the call it ran in: every later
+        request was `Late`, and the lookup of a confirmed coin an honest server proves failed on
+        every call, the refund's included. The time a round takes is given back to `call` (or to
+        the budget this thread is answering under). A call forces one sync at most, and `call`
+        (the method) syncs before its budget starts and not again inside it, so a budget is moved
+        by one round, which the sync deadline bounds."""
         ran = 0
         if force or self._tip_dirty or time.time() - self._last_sync >= self.sync_interval or not self.headers.ready:
-            if self._sync_gate.acquire(blocking=not self.headers.ready):
-                try:
-                    ran = self._sync_now()
-                finally:
-                    self._sync_gate.release()
+            began = time.monotonic()
+            try:
+                if self._sync_gate.acquire(blocking=not self.headers.ready):
+                    try:
+                        ran = self._sync_now()
+                    finally:
+                        self._sync_gate.release()
+            finally:
+                call = call if call is not None else getattr(self._tl, "call", None)
+                if call is not None:
+                    call.deadline += time.monotonic() - began
         return ran
 
     def _sync_now(self) -> int:
@@ -801,7 +894,7 @@ class ElectrumBackend:
             # refuses headers to that client for good. Hang up; the next round negotiates again.
             conn.close()
             raise
-        th = int(tip["height"])
+        th = whole(tip["height"])
         tip_h = parse_header(bytes.fromhex(tip["hex"]))
         self.server_state[conn.url].update(tip=th, tip_hash=tip_h.hash)
         self._tip_round[conn.url] = round_no
@@ -965,7 +1058,7 @@ class ElectrumBackend:
             two_heights = False
             for e in hist:
                 try:
-                    txid, height = str(e["tx_hash"]).lower(), int(e["height"])
+                    txid, height = str(e["tx_hash"]).lower(), whole(e["height"], lo=-1)
                 except (KeyError, TypeError, ValueError):
                     self._flag(c, "get_history: malformed entry")
                     continue
@@ -1040,7 +1133,14 @@ class ElectrumBackend:
                 asked = True
                 try:
                     raw = c.request_by(call.deadline, "blockchain.transaction.get", txid)
-                except ServerError:
+                except ServerError as e:
+                    # The rule (AGP-092, kept here since AGP-106): only "I have no such
+                    # transaction", in the server's words, is an answer. Busy, rate-limited or a
+                    # wording not known here is no answer: the server went silent for what it
+                    # listed, and a scan that needs it fails instead of leaving the coin out.
+                    if not says_not_there(e):
+                        self._flag(c, f"transaction.get: {e}")
+                        return True
                     raw = None
                 except Late:
                     return late(n)
@@ -1077,8 +1177,8 @@ class ElectrumBackend:
         """Does the server's get_merkle answer tie the transaction to our header at `height`? ""
         when it does, else why not."""
         try:
-            root = merkle_root_from_proof(txid, list(m["merkle"]), int(m["pos"]), hdr.txcount)
-            at = int(m.get("block_height", height))
+            root = merkle_root_from_proof(txid, list(m["merkle"]), whole(m["pos"]), hdr.txcount)
+            at = whole(m.get("block_height", height))
         except (HeaderError, KeyError, TypeError, ValueError, AttributeError) as e:
             return str(e) or type(e).__name__
         return "" if root == hdr.merkle_root and at == height else "proof does not reach our header"
@@ -1143,7 +1243,7 @@ class ElectrumBackend:
             hdr = self.headers.at(height)
             if hdr is None and not call.synced:
                 call.synced = True
-                call.round = self._sync_round(force=True)
+                call.round = self._sync_round(force=True, call=call)
                 self._believable()
                 hdr = self.headers.at(height)
             if hdr is None:
@@ -1296,7 +1396,10 @@ class ElectrumBackend:
         if fn is None:
             raise LightBackendError(f"{method} is not served by the light Electrum backend")
         if m in ("gettxout", "gettxspendingprevout", "getrawtransaction", "scantxoutset"):
-            self.sync()                     # the header sync has its own deadline; the call's starts after it
+            # The header sync has its own deadline; the call's starts after it. These four do not
+            # sync again inside the budget (AGP-106): they did, and any tip notification made
+            # that a second round, which a server could hold to its deadline.
+            self.sync()
         with self._budget():
             return fn(*params)
 
@@ -1335,7 +1438,6 @@ class ElectrumBackend:
         `include_mempool` is off. When a server did not answer, the last three are not known and the
         call raises instead (AGP-092: None used to cover "nobody answered", which callers read as
         spent)."""
-        self.sync()
         tx, st, complete = self._locate(str(txid))
         if tx is None or int(vout) >= len(tx.outputs) or int(vout) < 0:
             return None
@@ -1354,7 +1456,6 @@ class ElectrumBackend:
                 "value": out.value / XBT_SATS, "scriptPubKey": self._spk_json(out.script_pubkey), "coinbase": coinbase}
 
     def _rpc_gettxspendingprevout(self, outpoints):
-        self.sync()
         res = []
         for op in outpoints or []:
             txid, vout = str(op["txid"]).lower(), int(op["vout"])
@@ -1368,7 +1469,6 @@ class ElectrumBackend:
         return res
 
     def _rpc_getrawtransaction(self, txid, verbose=False, blockhash=None):
-        self.sync()
         tx, st, complete = self._locate(str(txid))
         if tx is not None and st is None and not complete:
             raise Unknown(f"where transaction {str(txid)[:16]}.. is, is not known: a server did not answer for it")
@@ -1403,7 +1503,6 @@ class ElectrumBackend:
     def _rpc_scantxoutset(self, action, descriptors=()):
         if action != "start":
             raise ElectrumError(f"scantxoutset {action}: only 'start'")
-        self.sync()
         unspents, total, complete = [], 0, True
         for desc in descriptors:
             d = desc if isinstance(desc, str) else desc.get("desc", "")
@@ -1416,9 +1515,10 @@ class ElectrumBackend:
             for c, rows in got:
                 for u in rows:
                     try:
-                        cl = claims.setdefault((str(u["tx_hash"]).lower(), int(u["tx_pos"])), [])
+                        key, height = (str(u["tx_hash"]).lower(), whole(u["tx_pos"])), whole(u["height"], lo=-1)
+                        cl = claims.setdefault(key, [])
                         if not any(k is c for k, _ in cl):
-                            cl.append((c, int(u["height"])))
+                            cl.append((c, height))
                     except (KeyError, TypeError, ValueError):
                         self._flag(c, "listunspent: malformed entry")
             listed: dict[str, list] = {}                 # who listed each transaction, for _supply

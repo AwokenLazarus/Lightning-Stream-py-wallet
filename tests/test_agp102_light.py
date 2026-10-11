@@ -198,7 +198,9 @@ class Holes(Rig):
         self.assertLess(took, 1.5)
 
     def test_measure_the_smallest_line_a_silent_tls_server_holds(self):
-        """Not a rule: the size from which the write is held, on a path with 1400-byte segments."""
+        """Not a rule: the size from which the write was held, on a path with 1400-byte segments.
+        On `ce81710` this pinned `{20_000: False, 60_000: True}`; since AGP-106 a TLS write ends at
+        its deadline whatever its size, so neither is held."""
         cert, key = self.tls_fixture()
         got = {}
         for chars in (20_000, 60_000):
@@ -206,7 +208,7 @@ class Holes(Rig):
             self.addCleanup(srv.close)
             got[chars] = self.held(srv, chars, 2.0)[0]
         print(f"\nAGP-102 measure (B2): held for good by a silent TLS server, by request size in hex characters: {got}")
-        self.assertEqual(got, {20_000: False, 60_000: True})
+        self.assertEqual(got, {20_000: False, 60_000: False})
 
     # --- what a server proves keeps working beside one hostile server ------------------------------
     def lookups(self, b, funding: str, n: int = 3) -> int:
