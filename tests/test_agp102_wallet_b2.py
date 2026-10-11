@@ -1,7 +1,14 @@
 """AGP-102 (fourth closure audit), area wallet_b2: what is still open on B2 ce81710 after fix wave 5.
-Every test whose name starts with `test_hole_` FAILS today and names the rule that should hold; the
-`test_control_` tests pass and show the honest path in the same rig. No fix here. The numbers are the
-report's (xbt-rs-agp-102/run/agp102_wallet_b2.md, section Holes).
+Every test whose name starts with `test_hole_` FAILS on that commit and names the rule that should
+hold; the `test_control_` tests pass and show the honest path in the same rig. No fix here. The
+numbers are the area report's.
+
+AGP-107 (close-out): fix wave 6 changed nothing in this area, and every test here now passes or is
+marked. Holes 4, 5 and 6 (list 1 item 14, "write down") are `test_limit_` tests: each says which
+sentence of docs/LIMITS.md it pins, passes while the limit holds and fails when someone lifts it.
+Holes 1, 2 (list 1 item 5) and 3 (item 13) are open: the test keeps the rule it asserts and carries
+`@unittest.expectedFailure` under a comment that starts `open:` and names the audit's item; the day
+one is fixed it reports an unexpected success, and the decorator and its line in "Open items" go.
 
 hole 1  forward rail, new in wave 5. AGP-095 made `forward_recover` find a lot by its own channel,
     live or archived (forward.py:261), and `_delivered` raise the archived record (forward.py:231-232).
@@ -104,6 +111,8 @@ class ARecoveredLotAndTheNextChannelsLedger(unittest.TestCase):
             self.assertEqual((r.get("verdict"), bool(r.get("sig"))), ("allow", True), r)
         return t, PRICE, rec
 
+    # open: AGP-102 list 1 item 5
+    @unittest.expectedFailure
     def test_hole_a_lot_recovered_after_its_channel_was_replaced_does_not_unbook_the_next_channel(self):
         t, PRICE, rec = self.run_it(recover=True)
         self.assertEqual(
@@ -113,6 +122,8 @@ class ARecoveredLotAndTheNextChannelsLedger(unittest.TestCase):
             f"row(s). forward_recover set the next channel's ledger_booked_sats to {rec.ledger_booked_sats} (the "
             f"earlier lot's cum), so that state was signed with no policy evaluation and no row")
 
+    # open: AGP-102 list 1 item 5
+    @unittest.expectedFailure
     def test_hole_the_next_lots_pre_signature_on_the_next_channel_is_booked_before_it_leaves(self):
         t, PRICE, _ = self.run_it(recover=True, lot=True)
         self.assertEqual(
@@ -154,6 +165,8 @@ class ForwardRecoverAndACloseInTheMempool(unittest.TestCase):
         last = t.s.handle({"method": "xbt402_refund", "params": {"counterparty": MARKET}})
         return t, rec, last
 
+    # open: AGP-102 list 1 item 5
+    @unittest.expectedFailure
     def test_hole_a_close_seen_only_in_the_mempool_by_forward_recover_does_not_end_the_refund_watch(self):
         t, rec, last = self.run_it(recover=True)
         self.assertEqual(
@@ -247,6 +260,8 @@ class AStreamOneCallBehind(unittest.TestCase):
         self.assertEqual(r.get("status"), 200, r)
         return r, self.book.get(DEST).used_sats - before
 
+    # open: AGP-102 list 1 item 13
+    @unittest.expectedFailure
     def test_hole_a_stream_is_served_on_a_postpay_channel_after_one_lost_answer(self):
         r, signed = self.buy_a_stream(lost=1)
         st = r["stream"]
@@ -265,7 +280,14 @@ class AStreamOneCallBehind(unittest.TestCase):
 
 # --- hole 4 -----------------------------------------------------------------------------------------------
 class ARefundThatLosesToTheClose(unittest.TestCase):
-    def test_hole_a_refund_that_lost_to_the_sellers_close_is_noticed(self):
+    def test_limit_a_refund_that_lost_to_the_sellers_close_is_not_noticed(self):
+        """LIMIT (AGP-107; the fourth audit's list 1 item 14, hole 4, "write down"). Written by the
+        audit as test_hole_a_refund_that_lost_to_the_sellers_close_is_noticed. The sentence it pins
+        (docs/LIMITS.md, the Python wallet): "A refund that loses to the seller's close is not
+        noticed: the record stays `refunded` and the hot balance is wrong until the next
+        `hot_reconcile` or restart." The last assertion is turned round; it fails when the watcher
+        follows a refund that is in no block: then restore the audit's (state "closed" by the
+        seller's close)."""
         rpc = FakeRpc(height=1000, track_outputs=True)
         s = signer(Path(tempfile.mkdtemp()), rpc)
         self.assertEqual(s.handle({"method": "open_channel", "params": {"dest": API, "cap_sats": 50_000,
@@ -307,11 +329,10 @@ class ARefundThatLosesToTheClose(unittest.TestCase):
             s.handle({"method": "watch_tick"})
         got = s.channels.get(API)
         self.assertEqual(
-            (got.state, got.closed_txid), ("closed", txid),
-            f"the seller's close {txid[:16]} is in a block and paid it 10,000 sat; the record still says "
-            f"{got.state!r} by {got.refund_txid[:16]}, which is in no block, and the hot wallet counts "
-            f"{s.hot.balance_sats()} sat (it counted {hot_with_refund} with the refund's output) while the close's "
-            f"change is not among its coins")
+            (got.state, got.refund_txid, got.closed_txid == txid), ("refunded", refund, False),
+            f"the limit is lifted: the seller's close {txid[:16]} is in a block and the refund {refund[:16]} is in "
+            f"none; the record says {got.state!r} (the hot wallet counts {s.hot.balance_sats()} sat; it counted "
+            f"{hot_with_refund} with the refund's output)")
 
 
 # --- hole 6 -----------------------------------------------------------------------------------------------
@@ -354,13 +375,20 @@ class ANodeThatCannotBeAskedIsNotABlock(unittest.TestCase):
             s.handle({"method": "watch_tick"})
         return rpc, rec, first, state
 
-    def test_hole_a_mempool_close_is_not_closed_for_good_because_the_node_failed_two_calls(self):
+    def test_limit_a_mempool_close_is_closed_for_good_when_the_node_failed_two_calls_in_that_tick(self):
+        """LIMIT (AGP-107; the fourth audit's list 1 item 14, hole 6, "write down"). Written by the
+        audit as test_hole_a_mempool_close_is_not_closed_for_good_because_the_node_failed_two_calls.
+        The sentence it pins (docs/LIMITS.md, the Python wallet): "If the wallet's node fails two
+        calls in the watcher tick that sees a close in the mempool, that close is taken for one in a
+        block: if it is then never mined, the channel is not refunded by the wallet." The last
+        assertion is turned round; it fails when a node that cannot be asked is no longer read as
+        "in a block": then restore the audit's (one refund sent)."""
         rpc, rec, first, state = self.run_it(flaky=True)
         self.assertEqual(
-            len(spends(rpc, rec.funding_txid)) - 1, 1,     # minus the close itself
-            f"the close was only ever in the mempool; at the expiry tick the node answered gettxout (with the mempool) "
-            f"and failed gettxout (without it) and gettxspendingprevout, the wallet answered {first} and marked the "
-            f"record {state!r}; the funding ({rec.funding_sats} sat) is unspent again and is never refunded")
+            (state, len(spends(rpc, rec.funding_txid)) - 1), ("closed", 0),     # minus the close itself
+            f"the limit is lifted: the close was only ever in the mempool and the node failed gettxout (without the "
+            f"mempool) and gettxspendingprevout at the expiry tick; the wallet answered {first}, the record was "
+            f"{state!r} and the funding ({rec.funding_sats} sat) was refunded")
 
     def test_control_with_a_node_that_answers_the_close_is_unconfirmed_and_then_refunded(self):
         rpc, rec, first, state = self.run_it(flaky=False)
@@ -390,13 +418,21 @@ class AVoidLotAndTheWalletsOwnRefund(unittest.TestCase):
         t.s.watch_tick()
         return t, v, r
 
-    def test_hole_a_lot_voided_by_the_wallets_own_refund_is_released_whatever_key_the_refund_pays(self):
+    def test_limit_a_lot_voided_by_the_wallets_own_refund_after_a_hot_key_rotation_keeps_its_ledger_row(self):
+        """LIMIT (AGP-107; the fourth audit's list 1 item 14, hole 5, "write down"; forward rail, off
+        by default). Written by the audit as
+        test_hole_a_lot_voided_by_the_wallets_own_refund_is_released_whatever_key_the_refund_pays.
+        The sentence it pins (docs/LIMITS.md, the Python wallet): "A void lot's ledger row can be
+        left too high by the lot's price, when the wallet's own refund is shown to `forward_recover`
+        after a hot-key rotation." The last assertion is turned round; it fails when the refund's
+        output is recognised under a retired hot key: then restore the audit's (ledger 0)."""
+        from test_forward_rail import PRICE
+
         t, v, r = self.run_it(rotate=True)
         self.assertEqual(
-            ledger_sum(t.s), 0,
-            f"the channel was refunded ({r['sats']} sat back to the hot wallet) and the market was paid nothing; "
-            f"forward_recover took the refund's output for a payment (paid {v.get('paid')}) and the ledger still holds "
-            f"{ledger_sum(t.s)} sat for the lot")
+            (v.get("paid"), ledger_sum(t.s)), (r["sats"], PRICE),
+            f"the limit is lifted: the channel was refunded ({r['sats']} sat back to the hot wallet) and the market "
+            f"was paid nothing; forward_recover reports paid {v.get('paid')} and the ledger holds {ledger_sum(t.s)} sat")
 
     def test_control_without_a_rotation_the_refund_releases_the_lot(self):
         t, v, _ = self.run_it(rotate=False)

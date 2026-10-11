@@ -141,9 +141,32 @@ AGP-095 (fix wave 5; tests `tests/test_agp093_wallet_b2.py`, `tests/test_agp095_
 Limits: on the light (Electrum) backend nothing is "the node's own refusal", because the servers are
 not ours: a funding they refuse stays pending until it is opened or an operator removes it, and its
 dest takes no new channel meanwhile. A kept channel funding that can never confirm (its coin was spent
-elsewhere) is answered `funding_unknown` at its expiry and stays on record. A crash between holding an
-approval and the payment costs the token with no payment made. The treasury records one funding
-outpoint: a second funding replaces the first in the file, as before.
+elsewhere) is closed at its expiry and its destination freed when the node shows that spend in a block;
+otherwise, and always on the light backend, it is answered `funding_unknown` and stays on record. A crash between holding an
+approval and the payment costs the token with no payment made. A second treasury
+funding keeps the first under `earlier_fundings` (corrected by AGP-107: this said it replaces it).
+
+**Review close-out (AGP-107).** The limits of this wallet are in `docs/LIMITS.md`, which points at the
+Rust workspace's file for everything the two share. After fix wave 6 eight of the fourth audit's tests
+were still red here (wave 6 changed the light backend only). Each got one decision; xbt-rs `README.md`,
+"Review close-out", has the rule for a limit test:
+
+| test (as the audit named it), `tests/test_agp102_*.py` | audit item | decision |
+|---|---|---|
+| `ARecoveredLotAndTheNextChannelsLedger` (two `test_hole_` tests) | 5 | open: after a lot is recovered on a channel that was since replaced, the next channel signs states that are not booked. Forward rail, off by default |
+| `ForwardRecoverAndACloseInTheMempool.test_hole_...` | 5 | open: a recovery from a close that is never mined ends that channel's refund watch |
+| `AStreamOneCallBehind.test_hole_...` | 13 | open: a stream on a postpay channel that is one call behind ends at its first chunk |
+| `ARefundThatLosesToTheClose.test_hole_...` | 14 | limit (`test_limit_a_refund_that_lost_to_the_sellers_close_is_not_noticed`) |
+| `ANodeThatCannotBeAskedIsNotABlock.test_hole_...` | 14 | limit (`test_limit_a_mempool_close_is_closed_for_good_when_the_node_failed_two_calls_in_that_tick`) |
+| `AVoidLotAndTheWalletsOwnRefund.test_hole_...` | 14 | limit (`test_limit_a_lot_voided_by_the_wallets_own_refund_after_a_hot_key_rotation_keeps_its_ledger_row`) |
+| `test_agp102_light` `Holes.test_a_scan_of_many_keys_succeeds_...` | 17 | limit (`test_limit_a_scan_of_many_keys_fails_beside_a_server_a_third_of_a_timeout_late`), written down by AGP-106 |
+
+The four open tests keep the rule they assert and are expected to fail (`@unittest.expectedFailure`
+under a comment that starts `open:`); the day one is fixed it reports an unexpected success. Items 5
+and 13 are open and not limits because their own sentences forbid a use until a fix: do not turn the
+forward rail on, and do not rely on buying streams on a postpay channel. Through B1, the wallet's
+payments also get the URL rule ported there (`x402_channel.sendable_url`): a URL whose host could be
+read two ways is refused before anything is paid.
 
 **Keys in memory are not wiped, and Python cannot guarantee that they could be.** The hot key, the
 payer keys and the treasury keys are Python `int`s for as long as the signer runs, the wrapping key
