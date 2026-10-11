@@ -1,5 +1,5 @@
 """AGP-024 on a real chain: Knots 29.4.2 (BLAKE2b from block 101, no txindex) and electrs 0.11.1 with the
-header-v2 patch, on ports 34980-34984. Skipped when either binary is missing (B2_TEST_BITCOIND_DIR,
+header-v2 patch, on ports 24980-24984 (B2_TEST_LIVE_PORT_BASE). Skipped when either binary is missing (B2_TEST_BITCOIND_DIR,
 B2_TEST_ELECTRS).
 
 1. Every RPC the client path makes answers as the node answers (tip, block hashes, gettxout in the
@@ -29,7 +29,7 @@ from _agp013 import keyfile_env, write_policy
 
 BIN = Path(os.environ.get("B2_TEST_BITCOIND_DIR", Path.home() / "lazarus-regtest/b1-xbt402/knots-29.4.2"))
 ELECTRS = Path(os.environ.get("B2_TEST_ELECTRS", Path.home() / "xbt-rnd/electrs-agp-024/src/target/release/electrs"))
-BASE = int(os.environ.get("B2_TEST_LIVE_PORT_BASE", "34980"))
+BASE = int(os.environ.get("B2_TEST_LIVE_PORT_BASE", "24980"))
 RPC, P2P, ELEC, MON = BASE, BASE + 1, BASE + 2, BASE + 3
 
 
