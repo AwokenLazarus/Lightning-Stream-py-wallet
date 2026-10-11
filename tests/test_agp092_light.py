@@ -151,6 +151,60 @@ class UnknownIsNotAbsent(unittest.TestCase):
         self.assertIsNone(b.proven_spend(other, 0, self.spk))
 
 
+class EveryConfiguredServerMustAnswer(unittest.TestCase):
+    def test_a_server_that_is_down_has_not_said_not_there(self):
+        """One liar and one honest server that cannot be reached: "every server asked answered" must
+        not shrink to the liar. It supplies the transaction and leaves it out of the history."""
+        sim = SimChain(height=200)
+        liar, honest = Knobs(sim), Knobs(sim)
+        self.addCleanup(liar.close)
+        spk_ = spk()
+        txid = sim.credit("", 0, 70_000, spk_)
+        real = liar._history
+        liar._history = lambda sh: [e for e in real(sh) if e["tx_hash"] != txid]
+        b = ElectrumBackend([liar.url, honest.url], chain="regtest", checkpoint=(CHECKPOINT, sim.bhash(CHECKPOINT)), timeout=2)
+        self.addCleanup(b.close)
+        self.assertEqual(b.call("gettxout", txid, 0, True)["confirmations"], 1)
+        honest.close()                                   # the honest server goes away
+        b2 = ElectrumBackend([liar.url, honest.url], chain="regtest", checkpoint=(CHECKPOINT, sim.bhash(CHECKPOINT)), timeout=2)
+        self.addCleanup(b2.close)                        # a restart: nothing cached
+        for mempool in (True, False):
+            with self.assertRaises(ElectrumError):
+                b2.call("gettxout", txid, 0, mempool)
+        with self.assertRaisesRegex(ElectrumError, "not known"):
+            b2.call("gettxout", "cd" * 32, 0, True)      # nor is an unknown txid "not there"
+
+    def test_a_dead_server_is_tried_once_per_call(self):
+        sim = SimChain(height=200)
+        honest = FakeElectrum(sim)
+        self.addCleanup(honest.close)
+        spk_ = spk()
+        txid = sim.credit("", 0, 70_000, spk_)
+        l = socket.socket()
+        l.bind(("127.0.0.1", 0))
+        l.listen(16)
+        self.addCleanup(l.close)
+        accepted = []
+
+        def accept():
+            try:
+                while True:
+                    accepted.append(l.accept()[0])       # accepted, never answered
+            except OSError:
+                pass
+
+        threading.Thread(target=accept, daemon=True).start()
+        b = ElectrumBackend([f"tcp://127.0.0.1:{l.getsockname()[1]}", honest.url], chain="regtest",
+                            checkpoint=(CHECKPOINT, sim.bhash(CHECKPOINT)), timeout=0.3)
+        self.addCleanup(b.close)
+        b.sync()
+        before = len(accepted)
+        t = time.monotonic()
+        self.assertIsNotNone(b.call("gettxout", txid, 0, False))
+        self.assertLessEqual(len(accepted) - before, 2, "one for the header sync, one for the call")
+        self.assertLess(time.monotonic() - t, 1.0)
+
+
 class ACallHasADeadline(unittest.TestCase):
     def setUp(self):
         self.sim = SimChain(height=200)

@@ -100,8 +100,9 @@ Cannot:
     server hiding the funding looks like. Without the proof the channel stays as it is, the refund
     answers `funding_unknown`, and the next watcher tick asks again;
   - a server that does not answer never reads as "not there". A lookup says so (no such
-    transaction, no such output, not in a block, no such coin) only when every server it asked
-    answered; if one did not, the call fails and the caller keeps what it had;
+    transaction, no such output, not in a block, no such coin) only when every configured server
+    answered; if one did not, or is down, the call fails and the caller keeps what it had
+    (`B2_ELECTRUM_MIN_SERVERS` is the floor for what is proven, not for this);
 - hide anything that another configured server shows: histories and unspent lists are the union over
   every server that answers;
 - get a short cheap fork believed on mainnet: it is below the pins or the minimum work (AGP-069);
@@ -135,8 +136,9 @@ Cannot:
   report an empty history.
 
 Can (and how it is bounded):
-- **Make calls fail or slow, never answer wrongly** (AGP-092). By not answering, a server turns
-  every "not there" into an error for as long as it is configured (the wallet does not guess). By
+- **Make calls fail or slow, never answer wrongly** (AGP-092). By not answering, or by being down,
+  a server turns every "not there" into an error for as long as it is configured (the wallet does
+  not guess). A server that is down costs a call one try to reach it. By
   listing transactions that pay the script, which cannot be told from unconfirmed payments, and
   supplying them slowly, it holds each call that reads that script up to `call_deadline`. Both are
   flagged in `status()["verification_failures"]`; the cure is to remove the server.

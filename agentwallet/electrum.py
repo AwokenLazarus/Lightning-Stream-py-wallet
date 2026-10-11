@@ -32,8 +32,8 @@ Trust (see docs/B2_CHAIN_BACKEND.md for the full threat model):
     TX_CACHE_BYTES. A server's part of a header sync ends at its first short answer and at
     `sync_deadline`, keeping what it proved. Transactions above MAX_TX_BYTES are not fetched.
   * Unknown is not absent (AGP-092). A lookup says "not there" (no such transaction or output, not
-    in a block, no such coin) only when every server it asked answered. If one did not, the call
-    raises. gettxout says "spent" (None for a known funding) only for a confirmed spend with a proof;
+    in a block, no such coin) only when every configured server answered. If one did not, or is
+    down, the call raises (`min_servers` is the floor for what is proven). gettxout says "spent" (None for a known funding) only for a confirmed spend with a proof;
     `proven_spend` names that spend, and it is what a caller must ask before it books a close.
   * A call has a deadline (`call_deadline`, AGP-092): every request made for it ends there, and it
     forces one header sync at most. A server is asked only for the transactions it listed itself,
@@ -42,8 +42,8 @@ Trust (see docs/B2_CHAIN_BACKEND.md for the full threat model):
 What a malicious server can still do: hide a transaction (a close, a funding) from us until another
 server or a block shows it; if every configured server hides it, gettxout reads it as absent, which
 is why a close is booked on `proven_spend` and not on that. It can make calls fail or slow, never
-answer wrongly: by not answering it turns a "not there" into an error for as long as it is
-configured, and by listing transactions that pay the script and supplying them slowly it holds
+answer wrongly: by not answering, or by being down, it turns a "not there" into an error for as
+long as it is configured, and by listing transactions that pay the script and supplying them slowly it holds
 each call that reads that script up to `call_deadline`. Both are flagged (`status()`); the cure is
 to remove the server. It can lie about fee estimates and learn which scripts we watch. Hiding a
 close delays counting the change (AGP-022's retry keeps asking) and makes the refund at expiry fail
@@ -145,9 +145,12 @@ def says_not_there(e: Exception) -> bool:
 
 @dataclass
 class _Call:
-    """One call's budget: its requests end at `deadline` (monotonic), and it forces one header sync."""
+    """One call's budget: its requests end at `deadline` (monotonic), it forces one header sync, and
+    it tries once to reach a server that is down (`gone`: the urls it could not reach; a dead server
+    used to cost every step of a call one timeout)."""
     deadline: float
     synced: bool = False
+    gone: set = field(default_factory=set)
 
     def left(self, conn) -> float:
         """The wait for the next request: the request timeout, or less when the deadline is nearer."""
@@ -162,8 +165,8 @@ class _Call:
 
 
 class _Hist(dict):
-    """txid -> [(conn, claimed height)]. `complete`: every server asked gave a usable answer; without
-    it "not listed" is not known."""
+    """txid -> [(conn, claimed height)]. `complete`: every configured server gave a usable answer;
+    without it "not listed" is not known."""
     complete = True
 
 
@@ -514,7 +517,15 @@ class ElectrumBackend:
         cur = getattr(self._tl, "call", None)
         return cur if cur is not None else _Call(time.monotonic() + self.call_deadline)
 
+    def _all_answer(self, answered: int) -> bool:
+        """Did every configured server answer? Only then is "none of them shows it" an answer. A server
+        that is down has not said so, whether it was down before the call or dropped in the middle of
+        it: with it left out, one lying server and one failing honest one would read as "not there".
+        (`min_servers` is the floor for what is proven.)"""
+        return answered == len(self.conns)
+
     def _live(self, call: _Call | None = None) -> list:
+        """The connected servers, after one try per call to connect those that are down."""
         call = call or self._call()
 
         def up(c):
@@ -522,10 +533,11 @@ class ElectrumBackend:
             self.server_state[c.url].update(proto=c.proto, server=c.server_id)
             for sh in list(self._watched):
                 c.subscribe("blockchain.scripthash.subscribe", sh, timeout=call.left(c))
-        down = [c for c in self.conns if not c.connected]
+        down = [c for c in self.conns if not c.connected and c.url not in call.gone]
         for c, r in zip(down, self._each(down, up)):
             if isinstance(r, Exception):
                 self._flag(c, f"unreachable: {r}")
+                call.gone.add(c.url)
         live = [c for c in self.conns if c.connected]
         if len(live) < self.min_servers:
             raise ElectrumError(f"{len(live)} of {len(self.conns)} Electrum servers reachable; "
@@ -732,6 +744,7 @@ class ElectrumBackend:
                 return tx
         finally:
             ex.shutdown(wait=False)          # a slower server's answer is not waited for
+        silent += [c.url for c in self.conns if c not in live]
         if silent:
             raise Unknown(f"whether transaction {txid[:16]}.. exists is not known: no answer from {', '.join(silent)}")
         return None
@@ -776,7 +789,7 @@ class ElectrumBackend:
                if isinstance(r, list)]
         if not got:
             raise Unknown(f"no server answered {method.rsplit('.', 1)[-1]} for the script")
-        return got, len(got) == len(live)
+        return got, self._all_answer(len(got))
 
     def _history(self, spk: bytes) -> _Hist:
         """The union of the servers' histories of a script, one claim per server and transaction."""
