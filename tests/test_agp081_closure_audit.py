@@ -132,7 +132,10 @@ class ElectrumE1(unittest.TestCase):
             self.assertLessEqual(cached, 64 << 10, "300 kB of invented transactions were fetched")
             self.assertLessEqual(set(b._conf), set(b._tx), "a confirmation is cached only with its transaction")
 
-        with self.subTest("a real spend and an entry whose prevout nobody serves are not flagged"):
+        # AGP-092: this part used to assert that the server listing the unserved entry is not flagged.
+        # AGP-087 showed that as the stall (entries no server can supply were asked of every server on
+        # every call); a server is now asked for what it listed, and flagged when it does not supply it.
+        with self.subTest("a real spend is found; the server listing an entry it does not serve is flagged, the honest one is not"):
             spend = Tx(version=2, inputs=[TxIn(bytes.fromhex(txid)[::-1], 0)],
                        outputs=[TxOut(40_000, bytes.fromhex("0014" + "77" * 20))], locktime=0)
             sim.call("sendrawtransaction", spend.hex())
@@ -144,7 +147,9 @@ class ElectrumE1(unittest.TestCase):
             odd.extra_history[sh] = [{"tx_hash": unserved, "height": 0}, {"tx_hash": child.txid(), "height": 0}]
             b = self.backend(sim, odd, honest)
             self.assertEqual(b.call("gettxspendingprevout", [{"txid": txid, "vout": 0}])[0]["spendingtxid"], spend.txid())
-            self.assertEqual(b.flags, [])
+            self.assertEqual(reasons(b, honest), [])
+            self.assertEqual(len(reasons(b, odd)), 1, b.flags)
+            self.assertIn("lists a transaction it does not supply", reasons(b, odd)[0])
 
         with self.subTest("an answer above MAX_HISTORY entries is flagged and not used"):
             long = self.hostile(sim)

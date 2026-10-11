@@ -22,6 +22,7 @@ unchanged on either.
 | `B2_ELECTRUM_MIN_SERVERS` | servers that must answer (default 2 on mainnet, 1 elsewhere). Configure at least one more than this, so one server down does not stop the wallet |
 | `B2_ELECTRUM_TIMEOUT` | seconds per request (default 15) |
 | `B2_ELECTRUM_SYNC_DEADLINE` | seconds one server has for its part of a header sync (default 4 timeouts); what it proved by then is kept (AGP-081) |
+| `B2_ELECTRUM_CALL_DEADLINE` | seconds every request of one call has together, after its header sync (default 4 timeouts) (AGP-092) |
 | `B2_CHAIN` | required with Electrum: a light client does not ask a node which chain it is on |
 
 The verified headers persist in `.run/headers-<chain>.bin` and are verified again at load.
@@ -89,15 +90,35 @@ Cannot:
   checkpoint;
 - invent a confirmation, a confirmed coin, a confirmed spend or a confirmed close (no proof);
 - substitute a different transaction for a txid;
-- talk the wallet out of a refund: a spend seen only in a mempool never makes `gettxout` report the
-  funding spent, so the watcher still refunds at expiry (if the spend was real the refund fails at
-  broadcast, harmlessly, and the close is counted once it confirms);
+- talk the wallet out of a refund (AGP-092 for the second and third):
+  - a spend seen only in a mempool never makes `gettxout` report the funding spent, so the watcher
+    still refunds at expiry (if the spend was real the refund fails at broadcast, harmlessly, and
+    the close is counted once it confirms);
+  - a channel is booked closed only on a confirmed spend of its funding with a Merkle proof into
+    our header chain (`ElectrumBackend.proven_spend`, asked through `chain.spend_is_evidence` by the
+    refund and by `funding_spent`). An empty `gettxout` is not that evidence: it is also what every
+    server hiding the funding looks like. Without the proof the channel stays as it is, the refund
+    answers `funding_unknown`, and the next watcher tick asks again;
+  - a server that does not answer never reads as "not there". A lookup says so (no such
+    transaction, no such output, not in a block, no such coin) only when every configured server
+    answered; if one did not, or is down, the call fails and the caller keeps what it had
+    (`B2_ELECTRUM_MIN_SERVERS` is the floor for what is proven, not for this);
 - hide anything that another configured server shows: histories and unspent lists are the union over
-  every server;
+  every server that answers. A `scantxoutset` answer says whether that was all of them
+  (`complete`): every coin in it is proven either way, and with a server missing a coin not in it
+  may be one only that server shows;
 - get a short cheap fork believed on mainnet: it is below the pins or the minimum work (AGP-069);
 - stall other callers: no lock is held across a network read, servers sync in parallel, and once a
   chain is held a caller that finds a sync running answers from it. Each chunk of headers is checked
   as it arrives, and on mainnet nothing above ours + (time since our tip / 150 s) + 2016 is fetched;
+- hold one call for longer than its deadline (AGP-092): every request a call makes ends at
+  `call_deadline` (4 request timeouts unless set), counted from the end of its header sync, and a
+  call forces one header sync at most. A server is asked only for the transactions it listed
+  itself, in parallel with the other servers. The first it does not supply, or that neither pays
+  the script nor can spend an output that does, ends its list and flags it. A server has one
+  claim per transaction: a block height replaces a mempool entry for it, and a second block height
+  is flagged and not used. Connecting costs one request timeout for TCP, TLS, `server.version` and the
+  subscriptions together;
 - hold a sync round open by trickling headers (AGP-081): an answer with fewer headers than asked
   for, below the tip the server itself claims, ends that server's part of the round ("withheld
   headers"), and so does `sync_deadline` ("sync deadline"). The headers it proved are kept, and it
@@ -117,6 +138,16 @@ Cannot:
   report an empty history.
 
 Can (and how it is bounded):
+- **Make calls fail or slow, never answer wrongly** (AGP-092). By not answering, or by being down,
+  a server turns every "not there" into an error for as long as it is configured (the wallet does
+  not guess). A server that is down costs a call one try to reach it. By
+  listing transactions that pay the script, which cannot be told from unconfirmed payments, and
+  supplying them slowly, it holds each call that reads that script up to `call_deadline`. Both are
+  flagged in `status()["verification_failures"]`; the cure is to remove the server.
+- **Hide a transaction on every configured server at once.** `gettxout` then reads it as absent:
+  the wallet's coins on that key go stale until a server shows them again (`hot_reconcile`), and
+  nothing is booked as a close (see above). "No such transaction" and "not in that block" are read
+  from the server's words (`electrum.NOT_THERE`); an error worded otherwise counts as no answer.
 - **Hide a transaction** from us until another server or a block shows it. A hidden close delays
   counting its change: AGP-022's retry keeps asking on every watcher tick (woken by the funding and
   hot-key subscriptions), and `hot_reconcile` finds the coin later. At expiry the refund is attempted and
@@ -129,11 +160,10 @@ Can (and how it is bounded):
 - **Report mempool facts that are false**: an invented unconfirmed coin or spend can make a broadcast
   fail or a pending change look counted until reconcile; it moves no coins.
 - **Lie about fee estimates** (reported as unverified; B2's fundings use its own fixed fees).
-- **Be slow or disconnect** (a timeout drops the connection; the next request reconnects). A call
-  that asks every server waits for the slowest, up to the timeout per request. Only the header sync
-  has a deadline for the whole of a server's part: a history of N entries is still N transaction
-  requests (N at most 10,000 per server and script), each of which may take up to the timeout, and
-  a reconnect is a handshake plus one request per watched script.
+- **Be slow or disconnect** (a timeout drops the connection; the next request reconnects). A step
+  that asks every server waits for the slowest, up to the timeout per request, and the whole call
+  ends at `call_deadline` after its header sync, which has `sync_deadline` (AGP-092; before it a
+  history of N entries was N requests to every server with no bound on the call).
 - **Build a fork above the newest pin**, where blocks are cheap (difficulty `1a00f0b5`): the
   minimum work and the height floor only raise the bar. Releases should bump the pins.
 - **Learn which scripts we watch** (privacy): every hot key and every unsettled channel's funding script.

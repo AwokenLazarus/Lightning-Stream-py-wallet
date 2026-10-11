@@ -8,7 +8,7 @@ call B2's client path makes. The RPC backend is KnotsRpc itself, unchanged. The 
 |---|---|---|
 | getblockchaininfo (netparams.detect_chain, hot.reconcile) | blockchain.headers.subscribe, blockchain.block.header(s) | our BLAKE2b header chain from the checkpoint |
 | getblockcount, getblockhash, getblockheader (height, network id, expiry) | same | same |
-| gettxout (funding confirmations, refund, close change, reconcile) | transaction.get, scripthash.get_history, transaction.get_merkle | txid hash, Merkle proof into our header, union of histories for spends |
+| gettxout (funding confirmations, refund, close change, reconcile) | transaction.get, scripthash.get_history, transaction.get_merkle | txid hash, Merkle proof into our header, union of histories for spends; None only on an answer from every server asked, else an error (AGP-092) |
 | gettxspendingprevout (close detection) | scripthash.get_history + transaction.get | spend parsed from the tx itself |
 | getrawtransaction (close, lock recovery, change) | transaction.get + get_history + get_merkle | txid hash, Merkle proof |
 | sendrawtransaction (funding, refund, sweeps) | transaction.broadcast (every server) | txid of what we sent |
@@ -28,6 +28,7 @@ Selection (`backend_from_env`), environment:
   B2_ELECTRUM_MIN_SERVERS servers that must answer (default 2 on mainnet, 1 elsewhere)
   B2_ELECTRUM_TIMEOUT   seconds per request (default 15)
   B2_ELECTRUM_SYNC_DEADLINE seconds one server has for its part of a header sync (default 4 timeouts)
+  B2_ELECTRUM_CALL_DEADLINE seconds every request of one call has together (default 4 timeouts)
   B2_CHAIN              the chain (required for electrum: a light client does not ask a node)
 """
 
@@ -44,6 +45,7 @@ ENV_CHECKPOINT = "B2_ELECTRUM_CHECKPOINT"
 ENV_MIN_SERVERS = "B2_ELECTRUM_MIN_SERVERS"
 ENV_TIMEOUT = "B2_ELECTRUM_TIMEOUT"
 ENV_SYNC_DEADLINE = "B2_ELECTRUM_SYNC_DEADLINE"
+ENV_CALL_DEADLINE = "B2_ELECTRUM_CALL_DEADLINE"
 BACKENDS = ("rpc", "electrum", "auto")
 
 
@@ -79,10 +81,12 @@ def electrum_from_env(run_dir: Path):
         raise BackendError(f"the Electrum backend needs {ENV_SERVERS}")
     ms = os.environ.get(ENV_MIN_SERVERS, "").strip()
     deadline = os.environ.get(ENV_SYNC_DEADLINE, "").strip()
+    call_deadline = os.environ.get(ENV_CALL_DEADLINE, "").strip()
     return ElectrumBackend(servers, chain=chain, checkpoint=checkpoint_from_env(os.environ.get(ENV_CHECKPOINT)),
                            store_path=Path(run_dir) / f"headers-{chain}.bin",
                            timeout=float(os.environ.get(ENV_TIMEOUT, "15")), min_servers=int(ms) if ms else None,
-                           sync_deadline=float(deadline) if deadline else None)
+                           sync_deadline=float(deadline) if deadline else None,
+                           call_deadline=float(call_deadline) if call_deadline else None)
 
 
 def backend_from_env(datadir: Path, conf: Path, wallet: str, run_dir: Path):
@@ -96,3 +100,18 @@ def backend_from_env(datadir: Path, conf: Path, wallet: str, run_dir: Path):
 
 def is_light(backend) -> bool:
     return bool(getattr(backend, "light", False))
+
+
+def spend_is_evidence(backend, txid: str, vout: int, spk: bytes | str | None = None) -> tuple[bool, str]:
+    """Is an empty gettxout enough to book this outpoint as spent, and by which transaction?
+
+    The rule (AGP-092): a close is booked only on evidence of a spend. A node's UTXO set is that
+    evidence, so on the RPC backend this answers (True, "") and the caller names the spender its own
+    way. On the light backend an empty gettxout is also what every server hiding the funding looks
+    like; there the evidence is a confirmed spend with a Merkle proof into our header chain
+    (`ElectrumBackend.proven_spend`): (True, its txid), or (False, "") when no server shows one. It
+    raises the backend's error when a server needed for the answer did not give one."""
+    if not is_light(backend):
+        return True, ""
+    found = backend.proven_spend(txid, int(vout), spk)
+    return (True, found[0]) if found else (False, "")

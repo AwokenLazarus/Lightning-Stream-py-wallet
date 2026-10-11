@@ -464,10 +464,21 @@ class Signer:
         except KnotsRpcError as e:
             return _deny("refund_rpc", str(e)[:200])
         if not utxo:
+            # AGP-092: "no server shows the funding" is not "the provider closed". On the light backend
+            # the close is booked only on a confirmed spend proven into our header chain; without one
+            # the channel stays as it is and the next tick asks again.
+            try:
+                evidence, proven = chainbackend.spend_is_evidence(self.rpc, rec.funding_txid, rec.funding_vout,
+                                                                     rec.params().spk)
+            except KnotsRpcError as e:
+                return {**_deny("refund_rpc", str(e)[:200]), **base}
+            if not evidence:
+                return {**_deny("funding_unknown", "no Electrum server shows the funding output, and none proves "
+                                                   "it spent; nothing is booked, the refund is tried again"), **base}
             # P6: no txindex. The spend is found in the mempool or by scanning blocks from the funding's
             # block; the funding counts as known once seen confirmed (funding_height) or in the mempool.
             start = rec.funding_height or rec.open_height
-            spender = netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, start)
+            spender = proven or netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, start)
             known = bool(spender or rec.funding_height or netparams.get_tx(self.rpc, rec.funding_txid))
             if known:
                 # AGP-022: the change first, then the state: a reader that sees "closed" sees the change
