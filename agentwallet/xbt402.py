@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from . import netparams
 from .b1path import ensure_b1
+from .chain import spend_is_evidence
 from .channels import ChannelBook, ChannelCapError, booked_through, fee_payer_kw
 from .hot import HotWallet
 from .rpc import KnotsRpcRefused
@@ -839,7 +840,13 @@ class Xbt402Session:
             return None
         if utxo:
             return None
-        spender = netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, 0)   # the mempool
+        try:        # AGP-092: on the light backend an empty gettxout is also every server hiding the funding
+            evidence, proven = spend_is_evidence(self.rpc, rec.funding_txid, rec.funding_vout, rec.params().spk)
+        except Exception:
+            return None
+        if not evidence:
+            return None
+        spender = proven or netparams.find_spender(self.rpc, rec.funding_txid, rec.funding_vout, 0)   # the mempool
         if spender:
             return spender
         if rec.funding_height or netparams.get_tx(self.rpc, rec.funding_txid):

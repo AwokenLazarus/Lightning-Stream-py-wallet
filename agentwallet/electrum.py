@@ -31,11 +31,24 @@ Trust (see docs/B2_CHAIN_BACKEND.md for the full threat model):
     that neither pays nor spends the script is flagged, and verified transactions are cached up to
     TX_CACHE_BYTES. A server's part of a header sync ends at its first short answer and at
     `sync_deadline`, keeping what it proved. Transactions above MAX_TX_BYTES are not fetched.
+  * Unknown is not absent (AGP-092). A lookup says "not there" (no such transaction or output, not
+    in a block, no such coin) only when every server it asked answered. If one did not, the call
+    raises. gettxout says "spent" (None for a known funding) only for a confirmed spend with a proof;
+    `proven_spend` names that spend, and it is what a caller must ask before it books a close.
+  * A call has a deadline (`call_deadline`, AGP-092): every request made for it ends there, and it
+    forces one header sync at most. A server is asked only for the transactions it listed itself,
+    in parallel with the others; the first it does not supply, or that cannot belong to the
+    script, ends its list and flags it. Connecting costs one timeout for TCP and TLS together.
 What a malicious server can still do: hide a transaction (a close, a funding) from us until another
-server or a block shows it, delay a call that asks it by up to the request timeout per request
-(a history of N entries is N transaction requests), lie about fee estimates, and learn which
-scripts we watch. Hiding a close delays counting the change (AGP-022's retry keeps
-asking) and makes the refund at expiry fail at broadcast; neither loses coins.
+server or a block shows it; if every configured server hides it, gettxout reads it as absent, which
+is why a close is booked on `proven_spend` and not on that. It can make calls fail or slow, never
+answer wrongly: by not answering it turns a "not there" into an error for as long as it is
+configured, and by listing transactions that pay the script and supplying them slowly it holds
+each call that reads that script up to `call_deadline`. Both are flagged (`status()`); the cure is
+to remove the server. It can lie about fee estimates and learn which scripts we watch. Hiding a
+close delays counting the change (AGP-022's retry keeps asking) and makes the refund at expiry fail
+at broadcast; neither loses coins. "No such transaction" and "not in that block" are read from the
+server's words (NOT_THERE); an error worded otherwise counts as no answer.
 """
 
 from __future__ import annotations
@@ -47,7 +60,7 @@ import socket
 import ssl
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -85,6 +98,9 @@ MAX_HISTORY = 10_000               # entries of one script in one server's get_h
 MAX_TX_BYTES = 1_000_000           # a transaction above this (raw) is not fetched
 TX_CACHE_BYTES = 32 << 20          # raw bytes of verified transactions kept; the oldest leave first
 SYNC_DEADLINE_TIMEOUTS = 4         # the default sync_deadline, in request timeouts
+CALL_DEADLINE_TIMEOUTS = 4         # the default call_deadline, in request timeouts
+# a server's words for "I have no such transaction" and "it is not in that block"
+NOT_THERE = ("no such", "not found", "not in block", "not confirmed", "no transaction", "missing")
 NODE_ONLY = {
     "getbalances", "getbalance", "sendtoaddress", "listunspent", "createrawtransaction", "fundrawtransaction",
     "signrawtransactionwithwallet", "getnewaddress", "generatetoaddress", "generatetodescriptor", "generateblock",
@@ -108,8 +124,47 @@ class ImplausibleChain(ElectrumError):
     """The verified chain is not believable yet (Plausibility): nothing is answered from it."""
 
 
+class ServerError(ElectrumError):
+    """The server answered the request with a JSON-RPC error: its own words."""
+
+
+class Unknown(ElectrumError):
+    """A server did not answer, so "not there" is not known (AGP-092): nothing is concluded from it."""
+
+
 class _OffCheckpoint(HeaderError):
     pass
+
+
+def says_not_there(e: Exception) -> bool:
+    """A server's own "I have no such transaction" (or, asked for a proof, "it is not in that block").
+    Any other error is no answer: busy, rate-limited, gone, or a wording not known here, which fails
+    closed."""
+    return isinstance(e, ServerError) and any(w in str(e).lower() for w in NOT_THERE)
+
+
+@dataclass
+class _Call:
+    """One call's budget: its requests end at `deadline` (monotonic), and it forces one header sync."""
+    deadline: float
+    synced: bool = False
+
+    def left(self, conn) -> float:
+        """The wait for the next request: the request timeout, or less when the deadline is nearer."""
+        t = self.deadline - time.monotonic()
+        if t <= 0:
+            raise ElectrumError("call deadline")
+        return min(conn.timeout, t)
+
+    @property
+    def over(self) -> bool:
+        return time.monotonic() >= self.deadline
+
+
+class _Hist(dict):
+    """txid -> [(conn, claimed height)]. `complete`: every server asked gave a usable answer; without
+    it "not listed" is not known."""
+    complete = True
 
 
 class _Dropped(Exception):
@@ -225,24 +280,40 @@ class ElectrumConnection:
     def connected(self) -> bool:
         return self._sock is not None
 
-    def connect(self) -> None:
+    def connect(self, timeout: float | None = None) -> None:
+        """Rule (AGP-092): reaching a server costs one deadline, `timeout` (the request timeout if
+        None), for the TCP connect, the TLS handshake, `server.version` and the subscriptions
+        together, whatever the server sends and however slowly."""
+        deadline = time.monotonic() + (self.timeout if timeout is None else min(timeout, self.timeout))
+
+        def left() -> float:
+            t = deadline - time.monotonic()
+            if t <= 0:
+                raise ElectrumError(f"{self.url}: not connected by its deadline")
+            return t
+
         with self._clock:
             if self._sock is not None:
                 return
-            raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
-            if self.tls:
-                ctx = ssl.create_default_context()
-                raw = ctx.wrap_socket(raw, server_hostname=self.host)
+            try:
+                raw = socket.create_connection((self.host, self.port), timeout=left())
+                if self.tls:
+                    ctx = ssl.create_default_context()
+                    raw = ctx.wrap_socket(raw, server_hostname=self.host, do_handshake_on_connect=False)
+                    raw.settimeout(left())      # CPython holds one do_handshake() call to this, as a deadline
+                    raw.do_handshake()
+            except OSError as e:
+                raise ElectrumError(f"{self.url}: {type(e).__name__}: {str(e)[:120]}") from e
             raw.settimeout(None)
             self._sock = raw
             self._reader = threading.Thread(target=self._read_loop, args=(raw,), name=f"electrum:{self.url}",
                                             daemon=True)
             self._reader.start()
         try:
-            sid, proto = self.request("server.version", CLIENT_NAME, PROTOCOL)
+            sid, proto = self.request("server.version", CLIENT_NAME, PROTOCOL, timeout=left())
             self.server_id, self.proto = str(sid), str(proto)
             for method, params in list(self._subs):
-                self.request(method, *params)
+                self.request(method, *params, timeout=left())
         except Exception:
             self.close()
             raise
@@ -257,7 +328,7 @@ class ElectrumConnection:
                 pass
             s.close()
         for slot in list(self._pending.values()):
-            slot.msg = {"error": {"message": why}}
+            slot.msg = {"error": {"message": why}, "closed": True}      # ours, not the server's words
             slot.done.set()
 
     def _allowance(self) -> AnswerCap:
@@ -322,7 +393,7 @@ class ElectrumConnection:
 
     def request(self, method: str, *params, timeout: float | None = None):
         if self._sock is None:
-            self.connect()
+            self.connect(timeout)
         rid = next(self._ids)
         slot = _Pending(answer_cap(method, params))
         self._pending[rid] = slot
@@ -344,7 +415,8 @@ class ElectrumConnection:
         msg = slot.msg or {}
         if msg.get("error"):
             err = msg["error"]
-            raise ElectrumError(str(err.get("message") if isinstance(err, dict) else err)[:400])
+            kind = ElectrumError if msg.get("closed") else ServerError
+            raise kind(str(err.get("message") if isinstance(err, dict) else err)[:400])
         return msg.get("result")
 
     def subscribe(self, method: str, *params, timeout: float | None = None):
@@ -362,12 +434,14 @@ class ElectrumBackend:
                  store_path: Path | None = None, timeout: float = 15.0, min_servers: int | None = None,
                  sync_interval: float = 1.0, connection=ElectrumConnection, clock=time.time,
                  plausibility: Plausibility | None = None, tip_cap_spacing_s: int | None = None,
-                 sync_deadline: float | None = None):
+                 sync_deadline: float | None = None, call_deadline: float | None = None):
         """`tip_cap_spacing_s`: a claimed tip is believed up to one block per this many seconds since our
         tip's time, plus HEADERS_CHUNK. None: TIP_CAP_SPACING_S on mainnet, no cap elsewhere (regtest
         mines blocks as fast as it is asked to).
         `sync_deadline`: seconds one server has for its part of a sync round (None: SYNC_DEADLINE_TIMEOUTS
-        request timeouts). What it proved by then is kept."""
+        request timeouts). What it proved by then is kept.
+        `call_deadline`: seconds every request of one call has together (None: CALL_DEADLINE_TIMEOUTS
+        request timeouts); the header sync before it has its own deadline."""
         if not servers:
             raise ElectrumError("no Electrum servers configured (B2_ELECTRUM_SERVERS)")
         try:
@@ -392,6 +466,8 @@ class ElectrumBackend:
         self.plausibility = plausibility or (Plausibility.mainnet(checkpoint) if chain == "main" else None)
         self.tip_cap_spacing_s = tip_cap_spacing_s or (TIP_CAP_SPACING_S if chain == "main" else None)
         self.sync_deadline = float(sync_deadline or SYNC_DEADLINE_TIMEOUTS * float(timeout))
+        self.call_deadline = float(call_deadline or CALL_DEADLINE_TIMEOUTS * float(timeout))
+        self._tl = threading.local()             # the call this thread is answering (_call)
         self.conns = [connection(u, timeout=timeout, on_notify=self._on_notify, on_drop=self._flag) for u in servers]
         self.min_servers = max(1, min(len(self.conns), int(min_servers if min_servers is not None
                                                            else (2 if chain == "main" else 1))))
@@ -432,12 +508,20 @@ class ElectrumBackend:
         with ThreadPoolExecutor(max_workers=len(conns)) as ex:
             return list(ex.map(run, conns))
 
-    def _live(self) -> list:
+    def _call(self) -> _Call:
+        """The budget of the call this thread is answering (`call` sets it; a method used on its own
+        gets one of its own)."""
+        cur = getattr(self._tl, "call", None)
+        return cur if cur is not None else _Call(time.monotonic() + self.call_deadline)
+
+    def _live(self, call: _Call | None = None) -> list:
+        call = call or self._call()
+
         def up(c):
-            c.connect()
+            c.connect(call.left(c))
             self.server_state[c.url].update(proto=c.proto, server=c.server_id)
             for sh in list(self._watched):
-                c.subscribe("blockchain.scripthash.subscribe", sh)
+                c.subscribe("blockchain.scripthash.subscribe", sh, timeout=call.left(c))
         down = [c for c in self.conns if not c.connected]
         for c, r in zip(down, self._each(down, up)):
             if isinstance(r, Exception):
@@ -474,7 +558,7 @@ class ElectrumBackend:
 
     def _sync_now(self) -> None:
         self._tip_dirty = False
-        live = self._live()
+        live = self._live(_Call(time.monotonic() + self.sync_deadline))
         off_chain = []
         for c, r in zip(live, self._each(live, self._sync_from)):
             if isinstance(r, _OffCheckpoint):
@@ -597,26 +681,52 @@ class ElectrumBackend:
             raise ElectrumError(f"withheld headers: served up to {start - 1}, claims tip {th}")
 
     # --- verified transactions -----------------------------------------------------------------------
+    @staticmethod
+    def _verify_raw(txid: str, raw) -> Tx | None:
+        """A raw tx counts only if it re-serializes byte for byte and hashes to the txid asked for."""
+        try:
+            tx = Tx.parse(bytes.fromhex(raw))
+            return tx if tx.hex() == str(raw).lower() and tx.txid() == txid else None
+        except Exception:
+            return None
+
     def _fetch_tx(self, txid: str) -> Tx | None:
+        """The transaction, from the cache or the first server that supplies it (all are asked at
+        once). None only when every server asked said it has no such transaction; if one did not
+        answer, whether it exists is not known and Unknown is raised."""
         txid = txid.lower()
         cached = self._tx.get(txid)
         if cached is not None:
             return cached
-        for c in self._live():
-            try:
-                raw = c.request("blockchain.transaction.get", txid)   # "not found" is an answer, not a fault
-            except ElectrumError:
-                continue
-            try:
-                tx = Tx.parse(bytes.fromhex(raw))
-                ok = tx.hex() == str(raw).lower() and tx.txid() == txid
-            except Exception:
-                ok = False
-            if not ok:
-                self._flag(c, f"transaction.get {txid[:16]}: not the transaction asked for")
-                continue
-            self._remember(txid, tx, len(raw) // 2)
-            return tx
+        call = self._call()
+        live = self._live(call)
+
+        def get(c):
+            return c.request("blockchain.transaction.get", txid, timeout=call.left(c))
+
+        silent = []
+        ex = ThreadPoolExecutor(max_workers=len(live))
+        try:
+            asked = {ex.submit(get, c): c for c in live}
+            for f in as_completed(asked):
+                c = asked[f]
+                try:
+                    raw = f.result()
+                except Exception as e:       # noqa: BLE001 - judged per server just below
+                    if not says_not_there(e):
+                        self._flag(c, f"transaction.get: {e}")
+                        silent.append(c.url)
+                    continue
+                tx = self._verify_raw(txid, raw)
+                if tx is None:               # a lie is an answer: this server does not supply it
+                    self._flag(c, f"transaction.get {txid[:16]}: not the transaction asked for")
+                    continue
+                self._remember(txid, tx, len(raw) // 2)
+                return tx
+        finally:
+            ex.shutdown(wait=False)          # a slower server's answer is not waited for
+        if silent:
+            raise Unknown(f"whether transaction {txid[:16]}.. exists is not known: no answer from {', '.join(silent)}")
         return None
 
     def _remember(self, txid: str, tx: Tx, size: int) -> None:
@@ -633,11 +743,11 @@ class ElectrumBackend:
                 self._tx_bytes -= self._tx_size.pop(old)
                 self._conf.pop(old, None)
 
-    def _listing(self, conn, method: str, sh: str) -> list | None:
+    def _listing(self, conn, method: str, sh: str, call: _Call) -> list | None:
         """One server's get_history or listunspent answer for a script, or None when it has none we
         can use: no answer, or more than MAX_HISTORY entries (flagged)."""
         try:
-            rows = self._ask(conn, method, sh) or []
+            rows = self._ask(conn, method, sh, timeout=call.left(conn)) or []
         except ElectrumError:
             return None
         name = method.rsplit(".", 1)[-1]
@@ -649,100 +759,189 @@ class ElectrumBackend:
             return None
         return rows
 
-    def _history(self, spk: bytes) -> dict[str, list]:
-        """txid -> [(conn, claimed height)], the union over every live server whose answer can be
-        used. With no such answer it raises: an empty history means the servers say there is none."""
-        sh = scripthash(spk)
-        out: dict[str, list] = {}
-        answered = 0
-        for c in self._live():
-            hist = self._listing(c, "blockchain.scripthash.get_history", sh)
-            if hist is None:
-                continue
-            answered += 1
+    def _listings(self, method: str, sh: str) -> tuple[list, bool]:
+        """[(conn, rows)] for every live server whose answer can be used, asked in parallel, and
+        whether that is all of them. With no such answer it raises: an empty list means the servers
+        say there is nothing."""
+        call = self._call()
+        live = self._live(call)
+        got = [(c, r) for c, r in zip(live, self._each(live, lambda c: self._listing(c, method, sh, call)))
+               if isinstance(r, list)]
+        if not got:
+            raise Unknown(f"no server answered {method.rsplit('.', 1)[-1]} for the script")
+        return got, len(got) == len(live)
+
+    def _history(self, spk: bytes) -> _Hist:
+        """The union of the servers' histories of a script, one claim per server and transaction."""
+        got, complete = self._listings("blockchain.scripthash.get_history", scripthash(spk))
+        out = _Hist()
+        out.complete = complete
+        for c, hist in got:
+            twice = False
             for e in hist:
                 try:
-                    out.setdefault(str(e["tx_hash"]).lower(), []).append((c, int(e["height"])))
+                    txid, height = str(e["tx_hash"]).lower(), int(e["height"])
                 except (KeyError, TypeError, ValueError):
                     self._flag(c, "get_history: malformed entry")
-        if not answered:
-            raise ElectrumError("no server answered get_history for the script")
+                    continue
+                claims = out.setdefault(txid, [])
+                # a history names a transaction once: a second height for it is not a claim (each one
+                # used to cost a proof request, and a header sync when above our tip)
+                if any(k is c for k, _ in claims):
+                    twice = True
+                else:
+                    claims.append((c, height))
+            if twice:
+                self._flag(c, "get_history lists a transaction more than once: only its first entry is used")
         return out
 
-    def _history_txs(self, spk: bytes, hist: dict[str, list]):
-        """Yield (txid, Tx) for each transaction of a script's history that a server supplies, one
-        at a time. Once all are seen, an entry that neither pays `spk` nor spends an output of this
-        history that pays it was invented: every server that listed it is flagged. An entry whose
-        prevout transaction is in the history but was not supplied is left alone (unknown)."""
-        pays: dict[str, frozenset[int]] = {}             # txid -> its outputs that pay spk
-        spends: dict[str, list[tuple[str, int]]] = {}    # txid -> its prevouts in this history, if it pays nothing
-        for txid in hist:
-            tx = self._fetch_tx(txid)
-            if tx is None:
+    def _invented(self, tx: Tx, spk: bytes, listed: dict) -> bool | None:
+        """Can `tx` not belong to the history of `spk` at all? It pays the script, or spends an output
+        that does, and then the paying transaction is in the history too. None: a possible funder is
+        listed and not held, so it cannot be told yet."""
+        if any(o.script_pubkey == spk for o in tx.outputs):
+            return False
+        unheld = False
+        for i in tx.inputs:
+            prev = i.txid[::-1].hex()
+            if prev not in listed:
                 continue
-            pays[txid] = frozenset(n for n, o in enumerate(tx.outputs) if o.script_pubkey == spk)
-            if not pays[txid]:
-                spends[txid] = [(prev, i.vout) for i in tx.inputs if (prev := i.txid[::-1].hex()) in hist]
-            yield txid, tx
-        liars = set()
-        for txid, prevouts in spends.items():
-            if not any(prev not in pays or vout in pays[prev] for prev, vout in prevouts):
-                liars.update(c for c, _ in hist[txid])
-        for c in liars:
+            funder = self._tx.get(prev)
+            if funder is None:
+                unheld = True
+            elif i.vout < len(funder.outputs) and funder.outputs[i.vout].script_pubkey == spk:
+                return False
+        return None if unheld else True
+
+    def _supply(self, listed: dict, spk: bytes | None = None) -> set:
+        """Fetch the transactions of `listed` that are not held, each from the servers that listed
+        it, every server in parallel. A server's part ends at the first transaction it does not
+        supply, at the first that cannot belong to `spk` (when given), and at the call's deadline;
+        each ends with a flag. Returns the urls that went silent: what only they listed is not known.
+
+        Why from the server that listed it: a transaction no server can supply used to be asked of
+        every server, on every call, one timeout each (AGP-087: 41 hours for one gettxout)."""
+        call = self._call()
+        work: dict = {}
+        for txid in sorted(listed):
+            if txid not in self._tx:
+                for c, _ in listed[txid]:
+                    work.setdefault(c, []).append(txid)
+
+        def part(c) -> bool:
+            """True when the server went silent."""
+            todo = work[c]
+            for n, txid in enumerate(todo):
+                if txid in self._tx:
+                    continue
+                if call.over:
+                    self._flag(c, f"transaction.get: {len(todo) - n} of the transactions it listed were not "
+                                  f"supplied by the call deadline ({self.call_deadline:g} s)")
+                    return True
+                try:
+                    raw = c.request("blockchain.transaction.get", txid, timeout=call.left(c))
+                except ServerError:
+                    raw = None
+                except ElectrumError as e:
+                    self._flag(c, f"transaction.get: {e}")
+                    return True
+                tx = self._verify_raw(txid, raw) if isinstance(raw, str) and len(raw) <= 2 * MAX_TX_BYTES else None
+                if tx is None:
+                    self._flag(c, f"lists a transaction it does not supply ({txid[:16]}..): the rest of its list is not asked for")
+                    return False
+                if spk is not None and self._invented(tx, spk, listed) is True:
+                    # the rest of its list is not asked for; the reason is worded as _flag_invented words it
+                    self._flag(c, "get_history lists a transaction that neither pays nor spends the script")
+                    return False
+                self._remember(txid, tx, len(raw) // 2)
+            return False
+
+        conns = list(work)
+        return {c.url for c, silent in zip(conns, self._each(conns, part)) if silent is True or isinstance(silent, Exception)}
+
+    def _flag_invented(self, spk: bytes, hist: dict) -> None:
+        """Flag every server that listed an entry which, from the transactions we hold, neither pays
+        `spk` nor spends an output of this history that pays it (AGP-081)."""
+        liars = {}
+        for txid, claims in hist.items():
+            tx = self._tx.get(txid)
+            if tx is not None and self._invented(tx, spk, hist) is True:
+                liars.update({c.url: c for c, _ in claims})
+        for c in liars.values():
             self._flag(c, "get_history lists a transaction that neither pays nor spends the script")
 
-    def _confirmed(self, txid: str, claims: list) -> tuple[int, str] | int | None:
-        """(height, blockhash) once a Merkle proof ties txid to our header at a claimed height; 0 if
-        only mempool claims remain; None if no claim holds."""
+    def _confirmed(self, txid: str, claims: list) -> tuple:
+        """(status, checked). status: (height, blockhash) once a Merkle proof ties txid to our header
+        at a claimed height; 0 if only mempool claims remain; None if no claim holds. `checked` is
+        False when a claim could not be judged: its server did not answer for it, or it names a block
+        we do not hold after the call's one forced sync. Then "not confirmed" is not known."""
         cached = self._conf.get(txid)
         if cached:
             h = self.headers.at(cached[0])
             if h is not None and h.hash == cached[1]:
-                return cached
+                return cached, True
             self._conf.pop(txid, None)                  # reorged out: prove it again
-        tried = set()
-        mempool = False
+        call = self._call()
+        mempool, checked = False, True
         for c, height in claims:
             if height <= 0:
                 mempool = True
                 continue
-            if (c.url, height) in tried:
-                continue
-            tried.add((c.url, height))
             hdr = self.headers.at(height)
-            if hdr is None:
+            if hdr is None and not call.synced:
+                call.synced = True
                 self.sync(force=True)
                 hdr = self.headers.at(height)
-                if hdr is None:
-                    continue                            # a height beyond our best chain: not proven
+            if hdr is None:
+                # above its own tip it is a lie; at or below, a block we could not fetch: not known
+                own_tip = (self.server_state.get(c.url) or {}).get("tip")
+                if own_tip is not None and height > int(own_tip):
+                    self._flag(c, f"get_history: {txid[:16]}.. at height {height}, above the tip it reports")
+                else:
+                    checked = False
+                continue
             try:
-                m = self._ask(c, "blockchain.transaction.get_merkle", txid, height)
+                m = self._ask(c, "blockchain.transaction.get_merkle", txid, height, timeout=call.left(c))
+            except ElectrumError as e:
+                # "not in that block", in its own words, withdraws its claim (flagged by _ask); busy,
+                # gone or silent leaves the claim unjudged
+                checked = checked and says_not_there(e)
+                continue
+            try:
                 root = merkle_root_from_proof(txid, list(m["merkle"]), int(m["pos"]), hdr.txcount)
-            except (ElectrumError, HeaderError, KeyError, TypeError, ValueError) as e:
+                at = int(m.get("block_height", height))
+            except (HeaderError, KeyError, TypeError, ValueError, AttributeError) as e:
                 self._flag(c, f"get_merkle {txid[:16]}@{height}: {e}")
                 continue
-            if root != hdr.merkle_root or int(m.get("block_height", height)) != height:
+            if root != hdr.merkle_root or at != height:
                 self._flag(c, f"get_merkle {txid[:16]}@{height}: proof does not reach our header")
                 continue
             with self._cache_lock:
                 if txid in self._tx:                    # evicted meanwhile: proven, but not kept
                     self._conf[txid] = (height, hdr.hash)
-            return height, hdr.hash
-        return 0 if mempool else None
+            return (height, hdr.hash), True
+        return (0 if mempool else None), checked
 
-    def _locate(self, txid: str) -> tuple[Tx | None, tuple[int, str] | int | None]:
-        """The transaction and its status: (height, blockhash), 0 (mempool), or None (unknown)."""
+    def _locate(self, txid: str) -> tuple:
+        """(tx, status, complete). status: (height, blockhash), 0 (mempool), or None (no claim holds).
+        `complete` is False when a server did not answer on the way and the status is short of
+        confirmed: then it is not known, and a caller that would answer "not there" raises instead."""
+        txid = txid.lower()
         tx = self._fetch_tx(txid)
         if tx is None:
-            return None, None
-        cached = self._conf.get(txid.lower())
+            return None, None, True
+        cached = self._conf.get(txid)
         if cached and (h := self.headers.at(cached[0])) is not None and h.hash == cached[1]:
-            return tx, cached
+            return tx, cached, True
+        complete = True
         for spk in self._index_spks(tx):
-            claims = self._history(spk).get(txid.lower())
+            hist = self._history(spk)
+            complete = complete and hist.complete
+            claims = hist.get(txid)
             if claims:
-                return tx, self._confirmed(txid.lower(), claims)
-        return tx, None
+                st, checked = self._confirmed(txid, claims)
+                return tx, st, isinstance(st, tuple) or (complete and checked)
+        return tx, None, complete
 
     @staticmethod
     def _index_spks(tx: Tx) -> list[bytes]:
@@ -752,20 +951,44 @@ class ElectrumBackend:
 
     def _spender(self, txid: str, vout: int, spk: bytes, *, mempool: bool) -> tuple[str, int] | None:
         """(spending txid, height or 0) from the union of the script's histories. A confirmed spend
-        comes before a mempool one, which is returned only with `mempool`."""
+        comes before a mempool one, which is returned only with `mempool`.
+
+        This search does not wait for every server: a spend that only a silent server lists, or whose
+        proof went unanswered, is not reported. Were it an error, one server could hold a refund back
+        by listing a spend and never proving it; the answer "unspent" can only be acted on by a
+        broadcast, which the network refuses if it is wrong."""
         hist = self._history(spk)
-        confirmed = unconfirmed = None
-        for t, stx in self._history_txs(spk, hist):      # run to the end: it flags invented entries
-            if t == txid or confirmed:
+        self._supply(hist, spk)
+        self._flag_invented(spk, hist)
+        unconfirmed = None
+        for t in sorted(hist):
+            stx = self._tx.get(t)
+            if t == txid or stx is None:                 # not supplied: its server is flagged
                 continue
             if not any(i.txid[::-1].hex() == txid and i.vout == int(vout) for i in stx.inputs):
                 continue
-            st = self._confirmed(t, hist[t])
+            st, _ = self._confirmed(t, hist[t])
             if isinstance(st, tuple):
-                confirmed = (t, st[0])
-            elif st == 0 and mempool:
+                return t, st[0]
+            if st == 0 and mempool:
                 unconfirmed = (t, 0)
-        return confirmed or unconfirmed
+        return unconfirmed
+
+    def proven_spend(self, txid: str, vout: int, spk: bytes | str | None = None) -> tuple[str, int] | None:
+        """(spending txid, its height) of a confirmed spend of the outpoint, proven by a Merkle proof
+        into our header chain; None when no server shows one. This, and not an empty gettxout, is the
+        evidence a close is booked on (AGP-092): gettxout is also empty when every server hides the
+        funding. `spk` is the outpoint's script, so the question can be asked while the funding
+        transaction itself is hidden; without it the transaction is fetched for it (Unknown if no
+        server supplies it)."""
+        self.sync()
+        txid, vout = str(txid).lower(), int(vout)
+        if spk is None:
+            tx = self._fetch_tx(txid)
+            if tx is None or not 0 <= vout < len(tx.outputs):
+                raise Unknown(f"no server shows transaction {txid[:16]}..: whether its output is spent is not known")
+            spk = tx.outputs[vout].script_pubkey
+        return self._spender(txid, vout, bytes.fromhex(spk) if isinstance(spk, str) else bytes(spk), mempool=False)
 
     def _address(self, spk: bytes) -> str | None:
         if len(spk) in (22, 34) and spk[0] in (0x00, 0x51) and spk[1] == len(spk) - 2:
@@ -806,7 +1029,14 @@ class ElectrumBackend:
         fn = getattr(self, f"_rpc_{m}", None)
         if fn is None:
             raise LightBackendError(f"{method} is not served by the light Electrum backend")
-        return fn(*params)
+        if m in ("gettxout", "gettxspendingprevout", "getrawtransaction", "scantxoutset"):
+            self.sync()                     # the header sync has its own deadline; the call's starts after it
+        outer = getattr(self._tl, "call", None)
+        self._tl.call = _Call(time.monotonic() + self.call_deadline)
+        try:
+            return fn(*params)
+        finally:
+            self._tl.call = outer
 
     def _rpc_getblockchaininfo(self):
         tip = self.sync()
@@ -838,11 +1068,19 @@ class ElectrumBackend:
                 "merkleroot": h.merkle_root[::-1].hex(), **({"previousblockhash": prev.hash} if prev else {})}
 
     def _rpc_gettxout(self, txid, vout, include_mempool=True):
+        """None means one of: a confirmed spend is proven; the transaction has no such output; every
+        server asked says there is no such transaction, or none lists it; it is unconfirmed and
+        `include_mempool` is off. When a server did not answer, the last three are not known and the
+        call raises instead (AGP-092: None used to cover "nobody answered", which callers read as
+        spent)."""
         self.sync()
-        tx, st = self._locate(str(txid))
-        if tx is None or st is None or int(vout) >= len(tx.outputs) or int(vout) < 0:
+        tx, st, complete = self._locate(str(txid))
+        if tx is None or int(vout) >= len(tx.outputs) or int(vout) < 0:
             return None
-        if st == 0 and not include_mempool:
+        if st is None or (st == 0 and not include_mempool):
+            if not complete:
+                raise Unknown(f"whether a block holds transaction {str(txid)[:16]}.. is not known: a server "
+                              "did not answer for it (see verification_failures)")
             return None
         out = tx.outputs[int(vout)]
         if self._spender(str(txid).lower(), int(vout), out.script_pubkey, mempool=False):
@@ -869,7 +1107,9 @@ class ElectrumBackend:
 
     def _rpc_getrawtransaction(self, txid, verbose=False, blockhash=None):
         self.sync()
-        tx, st = self._locate(str(txid))
+        tx, st, complete = self._locate(str(txid))
+        if tx is not None and st is None and not complete:
+            raise Unknown(f"where transaction {str(txid)[:16]}.. is, is not known: a server did not answer for it")
         if tx is None or st is None:
             raise ElectrumError("No such mempool or blockchain transaction")
         if blockhash and not (isinstance(st, tuple) and st[1] == str(blockhash).lower()):
@@ -882,9 +1122,10 @@ class ElectrumBackend:
         except Exception as e:
             raise ElectrumError(f"TX decode failed: {type(e).__name__}") from e
         txid, errors, accepted = tx.txid(), [], False
-        for c in self._live():
+        call = self._call()
+        for c in self._live(call):
             try:
-                got = c.request("blockchain.transaction.broadcast", hex_tx)
+                got = c.request("blockchain.transaction.broadcast", hex_tx, timeout=call.left(c))
             except ElectrumError as e:
                 errors.append(str(e))
                 continue
@@ -907,30 +1148,40 @@ class ElectrumBackend:
             if not (d.startswith("raw(") and d.endswith(")")):
                 raise ElectrumError(f"scantxoutset: the light backend takes raw(<script>) descriptors, not {d!r}")
             spk = bytes.fromhex(d[4:-1])
+            got, _ = self._listings("blockchain.scripthash.listunspent", scripthash(spk))
             claims: dict[tuple, list] = {}
-            answered = 0
-            for c in self._live():
-                rows = self._listing(c, "blockchain.scripthash.listunspent", scripthash(spk))
-                if rows is None:
-                    continue
-                answered += 1
+            for c, rows in got:
                 for u in rows:
                     try:
-                        claims.setdefault((str(u["tx_hash"]).lower(), int(u["tx_pos"])), []).append((c, int(u["height"])))
+                        cl = claims.setdefault((str(u["tx_hash"]).lower(), int(u["tx_pos"])), [])
+                        if not any(k is c for k, _ in cl):
+                            cl.append((c, int(u["height"])))
                     except (KeyError, TypeError, ValueError):
                         self._flag(c, "listunspent: malformed entry")
-            if not answered:                    # as _history: no answer is not "nothing unspent"
-                raise ElectrumError("no server answered listunspent for the script")
-            for (txid, n), cl in claims.items():
-                tx = self._fetch_tx(txid)
+            listed: dict[str, list] = {}                 # who listed each transaction, for _supply
+            for (txid, _), cl in claims.items():
+                listed.setdefault(txid, []).extend(x for x in cl if not any(k is x[0] for k, _ in listed[txid]))
+            silent = self._supply(listed)
+            # A coin a server lists is left out only on an answer: the server does not supply its
+            # transaction, the output does not pay the script, the claims were checked and none is a
+            # proof, or a confirmed spend is proven. If the server went silent instead, the scan
+            # raises: a shorter list would read as "no such coin" (AGP-092).
+            for (txid, n), cl in sorted(claims.items(), key=lambda kv: kv[0]):
+                tx = self._tx.get(txid)
                 if tx is None:
-                    continue
+                    if any(c.url in silent for c, _ in listed[txid]):
+                        raise Unknown(f"whether the script holds a coin of transaction {txid[:16]}.. is not known: "
+                                      "the server that listed it did not answer for it")
+                    continue                    # every server that listed it was asked and did not supply it
                 if not 0 <= n < len(tx.outputs) or tx.outputs[n].script_pubkey != spk:
                     for c in {c for c, _ in cl}:
                         self._flag(c, "listunspent lists an output that does not pay the script")
                     continue
-                st = self._confirmed(txid, cl)
+                st, checked = self._confirmed(txid, cl)
                 if not isinstance(st, tuple):   # the UTXO set holds confirmed coins only
+                    if not checked:
+                        raise Unknown(f"whether a block holds transaction {txid[:16]}.. is not known: a server "
+                                      "did not answer for it")
                     continue
                 if self._spender(txid, n, spk, mempool=False):
                     continue
@@ -943,9 +1194,10 @@ class ElectrumBackend:
                 "unspents": unspents, "total_amount": total / XBT_SATS}
 
     def _rpc_estimatesmartfee(self, blocks=1, *_):
-        for c in self._live():
+        call = self._call()
+        for c in self._live(call):
             try:
-                fee = float(self._ask(c, "blockchain.estimatefee", int(blocks)))
+                fee = float(self._ask(c, "blockchain.estimatefee", int(blocks), timeout=call.left(c)))
             except (ElectrumError, TypeError, ValueError):
                 continue
             if fee > 0:
@@ -960,10 +1212,11 @@ class ElectrumBackend:
         new = [scripthash(bytes.fromhex(s) if isinstance(s, str) else s) for s in spks]
         new = [sh for sh in new if sh not in self._watched]
         if new:
-            for c in self._live():
+            call = self._call()
+            for c in self._live(call):
                 for sh in new:
                     try:
-                        c.subscribe("blockchain.scripthash.subscribe", sh)
+                        c.subscribe("blockchain.scripthash.subscribe", sh, timeout=call.left(c))
                     except ElectrumError as e:
                         self._flag(c, f"subscribe: {e}")
             self._watched.update(new)
@@ -1010,6 +1263,7 @@ def servers_from_env(value: str | None) -> list[str]:
     return [s.strip() for s in (value or "").split(",") if s.strip()]
 
 
-__all__ = ["ElectrumBackend", "ElectrumConnection", "ElectrumError", "CheckpointMismatch", "LightBackendError",
+__all__ = ["ElectrumBackend", "ElectrumConnection", "ElectrumError", "ServerError", "Unknown", "CheckpointMismatch",
+           "LightBackendError",
            "ImplausibleChain", "Plausibility", "AnswerCap", "answer_cap", "is_loopback_host", "scripthash",
            "checkpoint_from_env", "servers_from_env"]
