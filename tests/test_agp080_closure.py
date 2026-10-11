@@ -198,7 +198,12 @@ class SignedAhead(unittest.TestCase):
         t.rpc.height = 8000
         r = t.s.handle({"method": "xbt402_refund", "params": {"counterparty": MARKET}})
         self.assertEqual(r["rule"], "refund", r)
-        self.assertEqual(ledger_sum(t.s), 0, "our refund spent the funding: the pre-signature is void")
+        # AGP-089: void once the refund is in a block, not when it is broadcast (the market's close with
+        # the completed pre-signature could still be mined instead; this test used to expect 0 here)
+        self.assertEqual(ledger_sum(t.s), PRICE, "the refund is only in the mempool: still booked")
+        t.rpc.txs[r["txid"]]["confirmations"] = 1
+        t.s.watch_tick()
+        self.assertEqual(ledger_sum(t.s), 0, "our refund spent the funding, in a block: the pre-signature is void")
 
 
 class AdaptorBooking(unittest.TestCase):

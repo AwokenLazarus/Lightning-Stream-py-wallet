@@ -213,6 +213,12 @@ class ForwardRail(unittest.TestCase):
         self.rpc.height = 8000
         r = self.s.handle({"method": "xbt402_refund", "params": {"counterparty": MARKET}})
         self.assertEqual(r["rule"], "refund", r)
+        # AGP-089: the refund is only broadcast; the market's close with the completed pre-signature can
+        # still be the one mined, so the lot stays pending and counted (this test used to expect the
+        # release here, at the broadcast)
+        self.assertEqual(self.s.handle({"method": "forward_status"})["spent_24h_sats"], PRICE)
+        self.rpc.txs[r["txid"]]["confirmations"] = 1          # the refund is in a block
+        self.s.watch_tick()
         st = self.s.handle({"method": "forward_status"})
         self.assertEqual((st["pending"], st["spent_24h_sats"]), ({}, 0))
 

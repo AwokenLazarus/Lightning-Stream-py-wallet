@@ -145,6 +145,42 @@ def _store_body(raw: bytes, name: str) -> dict:
     return {"body_digest": digest, "saved_to": path, "bytes": len(raw)}
 
 
+def max_expiry_blocks(channel_expiry_blocks: int) -> int:
+    """The longest a channel's coins may be locked, in blocks from now (AGP-063 W3, AGP-089): the
+    policy's channel_expiry_blocks, but at least four weeks so a provider's minimum fits. Every path
+    that funds a channel holds the expiry to this, whoever named it (a seller's offer too)."""
+    return max(int(channel_expiry_blocks), 4032)
+
+
+# AGP-089: the longest a stream's last chunk may stay hash-locked on the seller's word (four weeks)
+MAX_COND_CSV_BLOCKS = 4032
+
+
+def _count(v, what: str, least: int = 0) -> int:
+    """A counterparty's number that must be a whole number of at least `least` (AGP-089, review W1):
+    not a bool, a float, a string or a negative that Python would multiply or compare all the same."""
+    if type(v) is not int or v < least:
+        raise StreamError(f"{what} is not a whole number of at least {least}")
+    return v
+
+
+class CallBudget:
+    """What one xbt402_pay may sign (AGP-089, review W1). The rule: a call never raises what its
+    channel's ledger holds by more than the max_sats the policy approved for it, whatever the
+    seller's numbers are (its receipt's `charged` included: that is a report, never a budget).
+    `start` is the ledger when the call began; every state after the call's first is checked here
+    before it is signed."""
+
+    def __init__(self, start: int, max_sats: int):
+        self.start, self.max_sats = int(start), int(max_sats)
+
+    def fits(self, cum: int) -> bool:
+        return int(cum) - self.start <= self.max_sats
+
+    def left(self, signed: int) -> int:
+        return self.max_sats - (int(signed) - self.start)
+
+
 class Xbt402Session:
     """One signer-owned client session: channels keyed by HTTP origin.
 
@@ -199,6 +235,8 @@ class Xbt402Session:
             # no provider text in the wallet's own errors: the model reads them unlabelled (AGP-005 L12)
             raise RuntimeError(f"provider channel binding (extra.derivation) is not {DERIVATION!r}; refused before funding")
         close_fee = int(extra.get("closeFeeSat") or 600)
+        if close_fee < 0:
+            raise RuntimeError("offer closeFeeSat is negative; refused before funding")
         # the cap holds under payee-pays too: the least state is dust + closeFeeSat (xbt402 v1.2)
         if self.close_fee_max and close_fee > self.close_fee_max:
             raise RuntimeError(f"offer closeFeeSat {close_fee} is above this wallet's cap {self.close_fee_max}; "
@@ -232,7 +270,18 @@ class Xbt402Session:
             margin = -1
         if margin < 0:
             raise RuntimeError("offer closeMarginBlocks is missing or not a block count; refused before funding")
+        # AGP-089 (review C2): these three are the seller's numbers and they decide how long the owner's
+        # coins are locked if the seller then never opens or closes the channel. The owner's bound holds
+        # here as on the socket's open_channel; refused before the preflight.
+        most = max_expiry_blocks(expiry_blocks)
+        floor = max(0, min_exp) + min_conf + margin
+        if floor > most:
+            raise ChannelError("expiry", f"the offer needs the channel locked for {floor} blocks (minExpiryBlocks + minConf "
+                                         f"+ closeMarginBlocks); this wallet locks a channel for at most {most}; "
+                                         "refused before funding")
         blocks = open_expiry_blocks(expiry_blocks, min_exp, max_exp, min_conf, margin)
+        if not 0 < blocks <= most:
+            raise ChannelError("expiry", "offer expiry window is not a block count this wallet accepts")
         check = getattr(self.hot, "check_channel_funding", None)
         if check is not None:  # AGP-013: above the hot-balance cap, a human sweeps before new channels
             check()
@@ -440,17 +489,18 @@ class Xbt402Session:
         return delta
 
     @staticmethod
-    def check_seller_receipt(rec, resp, method: str, url: str, body: bytes, answer: tuple, quote: int) -> int:
-        """The seller's receipt: signature, request and answer binding, and a charged that is not
-        negative and not above the quote. The number itself is never what the wallet books."""
+    def receipt_for_state(rec, resp) -> tuple[dict, int]:
+        """The payee's own word that it has the state `rec` was just sent with (AGP-089, review T4): a
+        receipt it signed, for this channel and for the seq of this request, with a cum no higher than
+        the one signed. `rec` is the record as the request left with it. A receipt for an earlier seq
+        is an earlier answer played again: the seller never saw this request. Returns (receipt, cum)."""
+        if not isinstance(resp, dict):
+            raise ChannelError("bad_receipt", "PAYMENT-RESPONSE is not a settlement response")
         r = receipt_of(resp)
-        if str(r.get("req")) != request_digest_v2(method, url, body or b""):
-            raise ChannelError("bad_receipt", "receipt is for another request")
-        status, answer_body = answer
-        if str(r.get("status")) != str(status) or str(r.get("bodyHash")) != body_hash(answer_body or b""):
-            raise ChannelError("bad_receipt", "receipt is for another answer (status or body differs)")
         if str(r.get("chan")) != rec.chan:
             raise ChannelError("bad_receipt", "receipt is for another channel")
+        if str(r.get("seq")) != str(rec.seq):
+            raise ChannelError("bad_receipt", "receipt is for another request of this channel (its seq is not this call's)")
         try:
             cum = int(r["cum"])
         except (KeyError, TypeError, ValueError):
@@ -464,6 +514,18 @@ class Xbt402Session:
             raise ChannelError("bad_receipt", "receipt signature is not hex")
         if not ecc.verify(payee, receipt_message(r), sig):
             raise ChannelError("bad_receipt", "receipt not signed by the channel payee key")
+        return r, cum
+
+    @staticmethod
+    def check_seller_receipt(rec, resp, method: str, url: str, body: bytes, answer: tuple, quote: int) -> int:
+        """The seller's receipt: signature, seq, request and answer binding, and a charged that is not
+        negative and not above the quote. The number itself is never what the wallet books."""
+        r, _ = Xbt402Session.receipt_for_state(rec, resp)
+        if str(r.get("req")) != request_digest_v2(method, url, body or b""):
+            raise ChannelError("bad_receipt", "receipt is for another request")
+        status, answer_body = answer
+        if str(r.get("status")) != str(status) or str(r.get("bodyHash")) != body_hash(answer_body or b""):
+            raise ChannelError("bad_receipt", "receipt is for another answer (status or body differs)")
         try:
             charged = int(r["charged"])
         except (KeyError, TypeError, ValueError):
@@ -551,12 +613,21 @@ class Xbt402Session:
         if sig:
             payload["sig"] = sig.hex() if isinstance(sig, bytes) else sig
         st2, _, out2, receipt = self._paid(method, url, body, acc, payload)
-        if receipt:
-            self.book.ack_state(dest, rec.used_sats)
+        # AGP-089 (review T4): the state counts as arrived only on the payee's signature over this
+        # request's seq. Any other PAYMENT-RESPONSE (none, one for an earlier request, one someone on
+        # the path made up) leaves it unacked, so the next call sends the same state again and signs
+        # nothing higher.
+        sent = self.book.get(dest)
+        try:
+            _, acked = self.receipt_for_state(sent, receipt)
+        except (ChannelError, ValueError, TypeError, KeyError, AttributeError):
+            acked = None
+        if acked is not None:
+            self.book.ack_state(dest, acked)
         if st2 < 400:
             if not receipt:
                 raise ChannelError("bad_receipt", "paid call returned no receipt")
-            charged = self.check_seller_receipt(self.book.get(dest), receipt, method, url, body or b"", (st2, out2), price)
+            charged = self.check_seller_receipt(sent, receipt, method, url, body or b"", (st2, out2), price)
         else:
             charged = 0
         _log("call", url=url, status=st2, ms=round(1000 * (time.time() - t0), 1), chargedSat=charged,
@@ -580,7 +651,7 @@ class Xbt402Session:
             return res
         if st2 == 200 and isinstance(doc, dict) and doc.get("stream") == "xbt402-merkle-v1":
             res["receipt_scope"] = "manifest call only; chunk payments are in stream.paid_sats"
-            res.update(self.stream(dest, acc, doc, max_sats - charged))
+            res.update(self.stream(dest, acc, doc, CallBudget(ledger_before, max_sats)))
             res["charged_sats"] = charged + res.pop("stream_charged")
             after = self.book.get(dest)
             res["booked_sats"] = self._booked_through(after) - ledger_before
@@ -598,12 +669,20 @@ class Xbt402Session:
             refuse_fragment(doc.get("chunkUrl"))    # the seller's URL for every chunk, the hash-locked last one too
         except (StreamError, ChannelError) as e:
             return {**out, "stream": {"ok": False, "refused": str(e)}}
-        if m["n"] * m["price"] > budget:
+        if not isinstance(budget, CallBudget):       # a caller with a plain amount left: from where the channel is
+            budget = CallBudget(self._signed_through(dest), budget)
+        try:
+            n, price = _count(m.get("n"), "manifest n", 1), _count(m.get("price"), "manifest price", 0)
+        except StreamError as e:
+            return {**out, "stream": {"ok": False, "refused": str(e)}}
+        # AGP-089: the last state of the stream is signed + n * price, and it must be inside the call's budget
+        signed = self._signed_through(dest)
+        if not budget.fits(signed + n * price):
             return {
                 **out,
                 "stream": {
                     "ok": False,
-                    "refused": f"result costs {m['n']} x {m['price']} sat more; max_sats leaves {budget}",
+                    "refused": f"result costs {n} x {price} sat more; max_sats leaves {budget.left(signed)}",
                 },
                 "body": "",
             }
@@ -640,13 +719,18 @@ class Xbt402Session:
                     },
                 }
             parts.append(data)
+            nxt = self.book.next_cum(dest, m["price"])
+            if not budget.fits(nxt):        # refused before signing: nothing was paid for this chunk
+                return {**out, "stream_charged": spent, "body": "",
+                        "stream": {"ok": False, "id": m["id"], "refused_chunk": i, "verified_chunks": i, "paid_sats": spent,
+                                   "reason": f"the next state signs {nxt} sat; max_sats does not cover it"}}
             rec, sig = self.book.increment(dest, m["price"])
             self._book_unbooked(dest)
             self._verify_post(dest, acc, {"chan": rec.chan, "cum": str(rec.used_sats), "sig": sig.hex()})
             spent += m["price"]
             _log("chunk", i=i, ms=round(1000 * (time.time() - t), 1), chargedSat=m["price"], chan=rec.chan, cum=rec.used_sats)
         try:
-            pt, cond_ms = self._final_chunk(dest, doc, m)
+            pt, cond_ms = self._final_chunk(dest, doc, m, budget)
         except (StreamError, ValueError, KeyError) as e:
             _log("refused_chunk", i=m["n"] - 1, reason=str(e), refusedSat=0, chan=self.book.get(dest).chan)
             return {
@@ -710,7 +794,14 @@ class Xbt402Session:
         if not valid:
             raise StreamError(f"provider refused our payment state (HTTP {st})")
 
-    def _final_chunk(self, dest, doc, m):
+    def _signed_through(self, dest: str) -> int:
+        """The most this channel is signed or booked for."""
+        rec = self.book.get(dest)
+        if rec is None:
+            raise ChannelError("unknown_channel", dest)
+        return max(rec.used_sats, self._booked_through(rec))
+
+    def _final_chunk(self, dest, doc, m, budget: "CallBudget | None" = None):
         t = time.time()
         try:
             url = same_origin_url(dest, doc.get("chunkUrl")).replace("{i}", str(m["n"] - 1))
@@ -736,8 +827,15 @@ class Xbt402Session:
         # does not move used_sats: book it before it is signed. The plain state that folds it in then
         # books nothing more, and a last chunk that fails keeps the booking (the provider holds the lock).
         try:
+            csv = cond.get("csvDelta", 10)   # the seller's number: how long the price stays locked if the key never comes
+            if type(csv) is not int or not 0 <= csv <= MAX_COND_CSV_BLOCKS:
+                raise StreamError(f"last chunk offer's csvDelta is not a block count up to {MAX_COND_CSV_BLOCKS}; "
+                                  "refused before signing")
+            locked = self.book.get(dest).used_sats + _count(m.get("price"), "manifest price", 1)
+            if budget is not None and not budget.fits(locked):
+                raise StreamError("the last chunk's hash-locked state is above what max_sats leaves; refused before signing")
             self.book.check_signable(dest, int(m["price"]))
-            self._book_through(dest, self.book.get(dest).used_sats + int(m["price"]))
+            self._book_through(dest, locked)
         except ChannelCapError as e:
             raise StreamError(f"last chunk: {e}") from None
         except ChannelError as e:
@@ -745,7 +843,7 @@ class Xbt402Session:
         with self.book._lock:
             rec = self.book._records[dest]
             payer = self.book._payer_locked(rec)
-            cp = ConditionalParams(payer.params, bytes.fromhex(cond["hash"]), m["price"], int(cond.get("csvDelta", 10)))
+            cp = ConditionalParams(payer.params, bytes.fromhex(cond["hash"]), m["price"], csv)
             sig = ecc.sign(payer.secret, cp.sighash(cp.state_tx(rec.used_sats))) + bytes([SIGHASH_ALL_UNIFIED])
             self.book.audit.record("conditional_state", sig=sig, chan=rec.chan, dest=dest, cum=rec.used_sats,
                                    hashlock=cond["hash"], cond_sats=m["price"], sighash="0x21")

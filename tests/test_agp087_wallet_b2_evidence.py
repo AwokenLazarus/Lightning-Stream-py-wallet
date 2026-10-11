@@ -117,7 +117,10 @@ class RotateReplay(unittest.TestCase):
 
 
 class AckBeforeVerify(unittest.TestCase):
-    """AGP-081 "noticed": any PAYMENT-RESPONSE header acks the state before the receipt is checked."""
+    """AGP-081 "noticed": any PAYMENT-RESPONSE header acked the state before the receipt was checked.
+    AGP-089 changed the second test: it pinned that limit ([600, 1200, 1800], all booked), and the fix
+    for the receipt's seq removes it: a state is acked only by a receipt the payee signed for that
+    request, so a made-up header gets the same state again, as no header does."""
 
     def rig(self, header):
         rpc = FakeRpc(height=1000)
@@ -144,10 +147,10 @@ class AckBeforeVerify(unittest.TestCase):
         self.assertEqual((seen, booked, rec.acked_sats), ([600, 600, 600], 600, 0))
 
     def test_an_error_answer_with_any_header_gets_a_higher_state_each_call_all_booked(self):
-        """The limit: an unverified header (a seller's, or anyone's on plain http) turns the one-call
-        slack off. Each state is booked before it leaves, and nothing is rolled back."""
+        """Was the limit "an unverified header turns the one-call slack off" (the name is kept so the
+        audit's reference still finds it). Now: an unverified header acks nothing."""
         seen, booked, rec = self.rig({"PAYMENT-RESPONSE": b64json({"junk": 1})})
-        self.assertEqual((seen, booked, rec.acked_sats, rec.used_sats), ([600, 1_200, 1_800], 1_800, 1_800, 1_800))
+        self.assertEqual((seen, booked, rec.acked_sats, rec.used_sats), ([600, 600, 600], 600, 0, 600))
 
 
 class AllowlistBeforeAnyRequest(unittest.TestCase):

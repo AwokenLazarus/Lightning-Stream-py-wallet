@@ -165,3 +165,40 @@ def load_public_key(path: Path) -> bytes:
     if len(raw) == 32:
         return raw
     return x2b(raw.decode("ascii"))
+
+
+class UsedSigs:
+    """AGP-089, the rule for human signatures: **one signed message authorises one operation, once.**
+    Every message the human signs carries an expiry and no nonce, so whoever held a signature could
+    run its operation again until it expired (a second sweep, a second treasury funding). The
+    message's hash is written here, fsynced, before its operation runs, and a message found here is
+    refused. Entries leave when their expiry has passed (the expiry check refuses them from then on).
+    Keyed by the message, not the signature bytes, so another encoding of a signature is the same
+    entry. A file that cannot be read refuses the operation: it is never taken for empty."""
+
+    def __init__(self, path):
+        import threading
+        from pathlib import Path
+        self.path, self._lock = Path(path), threading.Lock()
+
+    def spend(self, message: bytes, expiry: int, now: float) -> bool:
+        """Record `message` as used. False: it was used before."""
+        import hashlib
+        import json
+        from .keystore import write_private
+        with self._lock:
+            used = {}
+            if self.path.exists():
+                try:
+                    used = json.loads(self.path.read_text(encoding="utf-8"))["used"]
+                    if not isinstance(used, dict):
+                        raise ValueError("used is not an object")
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    raise RuntimeError(f"{self.path}: unreadable, so no human-signed operation runs") from e
+            key = hashlib.sha256(message).hexdigest()
+            if key in used:
+                return False
+            used = {k: v for k, v in used.items() if isinstance(v, (int, float)) and v >= now}
+            used[key] = int(expiry)
+            write_private(self.path, json.dumps({"used": used}, indent=2, sort_keys=True))
+            return True

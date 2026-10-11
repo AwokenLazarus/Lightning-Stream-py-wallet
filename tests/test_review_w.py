@@ -78,7 +78,7 @@ class ReviewWTests(unittest.TestCase):
     def test_w1_a_negative_or_oversized_charged_is_refused(self):
         sk = secrets.randbelow(ecc.N - 1) + 1
         pk = ecc.pubkey(sk)
-        rec = type("R", (), {"chan": "aa" * 32 + ":0", "payee_pub": pk.hex(), "used_sats": 546})()
+        rec = type("R", (), {"chan": "aa" * 32 + ":0", "payee_pub": pk.hex(), "used_sats": 546, "seq": 1})()
         req = request_digest_v2("GET", URL, b"")
 
         def resp(charged: str):

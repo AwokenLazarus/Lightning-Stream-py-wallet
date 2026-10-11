@@ -228,8 +228,12 @@ class OwnRailFundingKeepsItsKey(unittest.TestCase):
         self.assertEqual(rec.state, "pending")
 
 
+_SIGNED = iter(range(1, 1_000_000))
+
+
 def fund_treasury(s: Signer, sats: int = 100_000) -> object:
-    exp = int(s.engine.clock()) + 600
+    # each call is a funding the human signed for itself (AGP-089: a signature is used once)
+    exp = int(s.engine.clock()) + 600 + next(_SIGNED)
     sig = sign(HUMAN_PRIV, treasury_fund_message(s.hot.address, s.treasury.address, sats, exp))
     return attempt(lambda: s.handle({"method": "fund_treasury",
                                      "params": {"sats": sats, "expiry": exp, "signature": b2x(sig)}}))
