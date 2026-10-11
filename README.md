@@ -1,192 +1,32 @@
-# B2 · Agent wallet MCP + policy engine
+# Agent wallet
 
-Local-only prototype (no remote). Keys stay in a Knots signer process; the MCP
-server only talks to that signer after the policy engine decides. MCP tools are
-exactly `balance`, `quote_payment`, `pay`, `history`, `channels`, `xbt402_pay`,
-`close_channel`, `xbt402_refund`, `forward_status`, `forward_recover` (AGP-013).
-Over-threshold pays need a human ed25519 signature via `agentwallet-approve`
-(private key on `~/xbt-rnd/b2-human-device/`, never under this workspace).
-Allowlisted counterparties spend through Spillman channels (cap = policy budget);
-fundings are 0x21. The treasury has a CSV `older(4320)` recovery path;
-`fund_treasury` and `recover_treasury` need the human's signature, over the amount and over the
-destination (AGP-080).
+Python reference for the Lightning Stream agent wallet: keys stay in a signer process, and the MCP
+server spends only after the policy engine allows it. Channels use the `xbt402` reference (the
+sibling `b1` tree) and settle as x402 v2 `batch-settlement` on XBT.
 
+**Status: reference, test networks only.** It has had an internal review, and it carries the fixes that followed an external review of the Rust tree and four follow-up audits of our own; some findings end as stated limits and two items are open (`docs/LIMITS.md`). None of this is an independent audit. Do not
+use it with mainnet funds. The Rust wallet is [Lightning Stream](https://github.com/AwokenLazarus/Lightning-Stream).
+
+MCP tools: `balance`, `quote_payment`, `pay`, `history`, `channels`, `xbt402_pay`, `close_channel`,
+`xbt402_refund`, `forward_status`, `forward_recover`. Over-threshold payments need a human ed25519
+signature (`agentwallet-approve`). The hot key is encrypted at rest, signatures are appended to a
+hash-chained log, and channels a provider never closes are refunded at expiry.
+
+The signer socket is described in `docs/B2_SIGNER_API.md`. The chain backend (headers, proof of
+work, what the light client checks) is in `docs/B2_CHAIN_BACKEND.md`.
+
+## Checks
+
+Python 3.12, plus the `b1` tree on `PYTHONPATH`.
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+PYTHONPATH=".:/path/to/b1" .venv/bin/python -m unittest discover -s tests
 ```
-verify: cd ~/xbt-rnd/b2 && bash demo.sh && python3 ~/xbt-rnd/tools/miners_left.py 30300-30399
-```
 
-Uses an **isolated** Knots 29.4.2 on `127.0.0.1:30300` (datadir `~/xbt-rnd/xbt-062/run/`).
-It does not generate blocks on the shared rig (`:18443`) and does not start miners.
+Regtest needs `XBT_BIN` pointing at a Bitcoin Knots 29.4.2 build and a throwaway datadir. Nothing
+here starts a miner on a shared node.
 
-AGP-013: the hot key and channel keys are encrypted at rest (set `B2_HOT_KEYFILE` or
-`B2_HOT_PASSPHRASE` for the signer), the hot key rotates (`rotate_hot_key`) and has a balance cap
-with a human sweep (`agentwallet-approve --sweep`), every signature is in `.run/signatures.jsonl`
-(hash-chained), channels the provider never closes are refunded at expiry (`xbt402_refund` + a
-watcher), and `xbt402_pay` buys B5 forward lots atomically (`agentwallet/forward.py`). Socket API:
-`docs/B2_SIGNER_API.md`.
+## Licence
 
-AGP-016: the signature log's head is anchored with a witness process (`python -m agentwallet.anchor
-serve --store DIR --sock PATH`, run as its own Unix user; the signer finds it through
-`B2_ANCHOR_SOCK`), the hot UTXO set is sealed on disk and reconciled against the node at start, and
-`treasury.json`'s secrets are sealed like the hot key.
-
-AGP-017 (mainnet readiness, `agentwallet/netparams.py`): the signer learns its chain from the node
-(`B2_CHAIN`, if set, must agree). Off regtest it never mines (a policy `regtest_mine: true` there
-refuses to start; the RPC client refuses `generate*`), addresses use that chain's hrp (`bc1…` on
-mainnet), and the xbt402 network id is block 961640's. A channel is recorded, payer key sealed,
-*before* its funding is broadcast (state `pending`), and its open is posted once the funding has the
-offer's `minConf`: `xbt402_pay` returns `verdict: pending` until then, the watcher finishes the open,
-and a channel that never opens is refunded at expiry. Nothing needs txindex (pruned nodes work).
-Offers are bounded by `close_fee_max_sats`; `minCapacity`/`maxCapacity` bound the funding output
-(cap + closeFeeSat). Ten 500-sat calls now sign exactly 5,000 (the first state's dust top-up is no
-longer charged twice). Policy: `regtest_mine`, `open_wait_s`, `open_retry_s`, `close_fee_max_sats`;
-`B2_SIGNER_TIMEOUT` sets the socket client's timeout.
-
-AGP-074 (review C2, the AGP-067 follow-up): `open_from_offer` posts `/open` with `"preflight": true`
-and no outpoint before it funds, and funds only when the provider answers `preflight: true` on the
-same terms (including `closeFeePayer`). A refusal names nothing funded and records no channel. A
-provider from before the preflight answers `bad_request` (no `vout`), and only after its own terms
-checks, so on that answer the wallet funds and opens as before.
-
-AGP-021 (hub routing, `agentwallet/routing.py`): B2 signs adaptor-locked channel states for xbt402
-hub routing (B1 agp-021 `xbt402/hub.py`, `RoutePayer`): `xbt402_sign_state_adaptor(chan, cum, point,
-route)` pre-signs the next state under T1 = T + r*G (T the provider's invoice point, r fresh) after the
-routing policy (`"routing": {"hubs": {origin: {max_fee_ppm, max_fee_base_msat}}, "max_lock_sats",
-"daily_budget_sats"}`: allowed hub, that hub's fee caps with a 1-sat carry allowance, max lock, 24 h
-routed budget counting pending locks) and the policy engine allow it. One pending lock per channel; a
-plain state below it is refused, one at or above it dominates it. The lock (cum, pre-signature, r, T)
-is on disk before the pre-signature leaves; `xbt402_resolve_lock` takes t + r (hub) or t (the
-provider's signed receipt); `xbt402_recover_lock` reads t + r off the hub's ch1 close after a restart;
-`xbt402_void_lock` gives a lock up and `xbt402_adopt_lock` accepts only the cum of a lock this wallet
-gave up (the hub completed it later from chain). A lock is booked in the policy ledger and the routed
-budget when it is pre-signed, and a void releases nothing (AGP-080): the hub may still hold the
-pre-signature, so a later lock or state on that channel up to the voided amount rides on the booking. `RouteSigner` is the same over an in-process
-ChannelBook with B1's signer API, for `RoutePayer(signer=...)`. Uses B1's `xbt402.adaptor` when the
-pinned B1 has it (libsecp256k1 secret multiplications), else `fwd/adaptor.py`.
-
-AGP-084 (on-chain `pay` is write-ahead; key wiping): an on-chain `pay` is in the policy ledger before
-the node is asked to send, under `onchain:unconfirmed:<token>`, and moves to a row under the txid when
-the node answers. Only the node's own JSON-RPC error (`KnotsRpcRefused`, the Rust signer's
-`rpc_refused`: insufficient funds, a bad address) takes the row back. A timeout, a dropped connection,
-an HTTP error with no JSON-RPC error in it, an answer that is not a txid, or a crash leaves the payment
-counted against the budgets, because the node may have sent it; the error names the row. Such a row is
-not cleared by itself: it ages out of the budget windows like any payment.
-
-AGP-085 (what is written ahead is taken back only on the node's own refusal): a channel funding, a
-treasury funding and an approved payment each leave a record before the node is asked to send. That
-record is undone only when the node itself answered with a JSON-RPC error (`KnotsRpcRefused`) and, for
-a transaction, then answered that it has no such output. A timeout, a reset, a non-JSON answer or a
-lookup that failed too is "unknown" (`BroadcastUnknown`): the node may hold the transaction.
-- **Channel funding** (`xbt402_pay`, `open_channel`, `pay` to a registered `pay_to`): on "unknown" the
-  pending record and its sealed payer key stay, the spent hot coin is set aside, and the watcher sends
-  the funding again, opens the channel or refunds it at expiry. Before, any failure forgot the key. An
-  `open_channel` to a dest with a kept funding finishes that open; it never funds a second channel.
-- **`fund_treasury`** writes `pending_funding` (outpoint, amount, the signed transaction) into
-  `treasury.json` before the broadcast. The start and every watcher tick settle it: recorded when the
-  node shows the output, sent again when it does not. While it is unsettled a new `fund_treasury` is
-  refused (`treasury_funding_pending`). If the node refuses it when it is sent again, it moves to
-  `unsettled_fundings` (shown as `treasury_unsettled_outpoints`), stops holding up new fundings, and is
-  recorded if it confirms after all.
-- **`approve`** marks its token used on disk while the payment runs. The token is free again (until
-  its expiry) when the node refused the payment or the policy denied it; it is removed when the
-  payment is made; after a crash or a payment of unknown fate it stays used and is never valid again
-  (`approval_replay`): the human signs a new approval after checking the chain.
-
-AGP-089 (fix wave 4):
-
-- **One human signature, one operation.** `sweep_hot`, `fund_treasury` and `rotate_hot_key` write the
-  hash of the signed message to `.run/human_sigs.json` before they act and refuse a message found
-  there (`human_sig_replay`); an unreadable file refuses every such operation. `recover_treasury` and
-  `recover_vault` are left repeatable: they rebuild the same transactions to the address signed.
-- **The treasury forgets no outpoint.** A second funding keeps the first under `earlier_fundings`
-  (`treasury_earlier_outpoints`), and `recover_treasury` spends every recorded one.
-- **`approve`** runs under the spend lock from the token's read to its payment: two calls pay once.
-- **`xbt402_pay`**: a stream is held to `max_sats` from the ledger, chunk by chunk, never from the
-  seller's `charged`; an offer whose `minExpiryBlocks + minConf + closeMarginBlocks` is above
-  `max(channel_expiry_blocks, 4032)` is refused before funding (`deny/expiry`); a receipt must carry
-  this request's `seq`, and only such a receipt acks the state.
-- **Forward rail**: a lot is void only when our node shows, in a block, a spend of the funding that
-  does not carry its pre-signature (a close, or our refund); the release lowers the lot's ledger row
-  to what the plain states signed meanwhile still reach, and removes it only when they reach nothing.
-- **A kept funding that can never confirm** (the node names another transaction that spent one of
-  its inputs) is closed at expiry and its destination is free; never on the light backend.
-
-AGP-095 (fix wave 5; tests `tests/test_agp093_wallet_b2.py`, `tests/test_agp095_wallet_b2.py`):
-
-- **`xbt402_pay` signs at most one new state a call, and only when the seller holds the last one.** A
-  state without a receipt is sent again. When the seller answers it with a 402 that names it
-  (`insufficient_payment`, this channel, this `cum`, this `seq`), which is what it answers after it
-  served a call whose answer was lost, the call signs one new state of the quoted price and sends
-  the request once more. The 402 is unsigned: what a forged one buys is one state of one price per
-  call the agent makes, inside `max_sats` and the budgets.
-- **An offer's expiry window has a floor**: the channel must last at least the offer's own floor,
-  longer than `refund_margin_blocks`, and at least 144 blocks (or `channel_expiry_blocks` when that
-  is lower), or it is refused before funding (`deny/expiry`). A negative price is refused.
-- **A channel leaves the refund watch only when the node shows its funding spent in a block.** A
-  close that is only in the mempool is closed but unproven (`close_proven: false`), not replaced by
-  a new channel, proven by its block, and refunded at expiry if it leaves the mempool unmined; the
-  refund answers `close_unconfirmed` meanwhile. (Not on the light backend, where only a proven,
-  confirmed spend was evidence already.)
-- **Forward rail: a lot belongs to the channel its pre-signature was made on.** `forward_recover`
-  and the watcher look that channel up by its id, live or archived, so a lot is recovered from the
-  close that paid for it after a plain call opened the next channel, and the next channel's refund
-  does not void it. A void lot's ledger row is never lowered below what the close that voided it
-  paid (a stream's hash-locked last chunk or a routed lock may have closed the channel). A refunded
-  channel's lot is void once the refund is in a block, found there on a node without txindex too.
-- **`recover_treasury`** reports a recorded funding at or below the fee and goes on to the others.
-- **A used human signature stays used by the highest clock `human_sigs.json` has seen** (`clock`):
-  an entry leaves only when its expiry is behind it, and a message whose expiry is behind it is
-  refused (`expired`). A missing file is still an empty one: whoever can delete it can write one.
-
-Limits: on the light (Electrum) backend nothing is "the node's own refusal", because the servers are
-not ours: a funding they refuse stays pending until it is opened or an operator removes it, and its
-dest takes no new channel meanwhile. A kept channel funding that can never confirm (its coin was spent
-elsewhere) is closed at its expiry and its destination freed when the node shows that spend in a block;
-otherwise, and always on the light backend, it is answered `funding_unknown` and stays on record. A crash between holding an
-approval and the payment costs the token with no payment made. A second treasury
-funding keeps the first under `earlier_fundings` (corrected by AGP-107: this said it replaces it).
-
-**Review close-out (AGP-107).** The limits of this wallet are in `docs/LIMITS.md`, which points at the
-Rust workspace's file for everything the two share. After fix wave 6 eight of the fourth audit's tests
-were still red here (wave 6 changed the light backend only). Each got one decision; xbt-rs `README.md`,
-"Review close-out", has the rule for a limit test:
-
-| test (as the audit named it), `tests/test_agp102_*.py` | audit item | decision |
-|---|---|---|
-| `ARecoveredLotAndTheNextChannelsLedger` (two `test_hole_` tests) | 5 | open: after a lot is recovered on a channel that was since replaced, the next channel signs states that are not booked. Forward rail, off by default |
-| `ForwardRecoverAndACloseInTheMempool.test_hole_...` | 5 | open: a recovery from a close that is never mined ends that channel's refund watch |
-| `AStreamOneCallBehind.test_hole_...` | 13 | open: a stream on a postpay channel that is one call behind ends at its first chunk |
-| `ARefundThatLosesToTheClose.test_hole_...` | 14 | limit (`test_limit_a_refund_that_lost_to_the_sellers_close_is_not_noticed`) |
-| `ANodeThatCannotBeAskedIsNotABlock.test_hole_...` | 14 | limit (`test_limit_a_mempool_close_is_closed_for_good_when_the_node_failed_two_calls_in_that_tick`) |
-| `AVoidLotAndTheWalletsOwnRefund.test_hole_...` | 14 | limit (`test_limit_a_lot_voided_by_the_wallets_own_refund_after_a_hot_key_rotation_keeps_its_ledger_row`) |
-| `test_agp102_light` `Holes.test_a_scan_of_many_keys_succeeds_...` | 17 | limit (`test_limit_a_scan_of_many_keys_fails_beside_a_server_a_third_of_a_timeout_late`), written down by AGP-106 |
-
-The four open tests keep the rule they assert and are expected to fail (`@unittest.expectedFailure`
-under a comment that starts `open:`); the day one is fixed it reports an unexpected success. Items 5
-and 13 are open and not limits because their own sentences forbid a use until a fix: do not turn the
-forward rail on, and do not rely on buying streams on a postpay channel. Through B1, the wallet's
-payments also get the URL rule ported there (`x402_channel.sendable_url`): a URL whose host could be
-read two ways is refused before anything is paid.
-
-**Keys in memory are not wiped, and Python cannot guarantee that they could be.** The hot key, the
-payer keys and the treasury keys are Python `int`s for as long as the signer runs, the wrapping key
-and the passphrase are `bytes`, and decrypted key files pass through `bytes`, `str` and `json`. All of
-these are immutable: they cannot be overwritten, copies are made freely (every `to_bytes`, every
-big-number step of a signature), and the memory is freed, not zeroed, when the garbage collector gets
-to it. libsecp256k1 (coincurve) and OpenSSL (cryptography) keep their own copies. Zeroing the few
-`bytearray`s that could be introduced would cover a short-lived copy of a secret whose `int` stays in
-the same process, so B2 does not pretend to. What protects a B2 key is the sealed file at rest, the
-0600 modes and the process boundary (the MCP side never holds a key). A deployment that needs keys
-wiped from memory should run the Rust signer (xbt-rs `crates/xbt-signer`), which wipes its hot key,
-payer keys and decrypted plaintext, with the limits stated in its README.
-
-AGP-024 (light client, `agentwallet/chain.py`, `electrum.py`, `headers.py`; `docs/B2_CHAIN_BACKEND.md`):
-the signer reads the chain through a backend. RPC (`KnotsRpc`) is the default and unchanged;
-`B2_CHAIN_BACKEND=electrum` (or `auto` with `B2_ELECTRUM_SERVERS` and no local node) uses Electrum servers
-instead: the wallet keeps its own BLAKE2b header chain from a pinned checkpoint (961640 on mainnet,
-`B2_ELECTRUM_CHECKPOINT` elsewhere), checking PoW and Knots' retarget rules, needs a Merkle proof for every
-transaction it acts on, takes the union of several servers' answers (`B2_ELECTRUM_MIN_SERVERS`, 2 on
-mainnet), broadcasts to all of them, and wakes its watcher on script and header subscriptions. A light
-signer never mines and has no node wallet (`balance.node_wallet: null`; on-chain `pay` is denied).
-`chain_backend` (and `health`) report the checkpoint, tip, servers and verification failures. Servers need
-electrs with the header-v2 patch and `docs/electrs-0.11.1-knots-29.4.2-rpc.patch`.
+MIT OR Apache-2.0. See `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE`.

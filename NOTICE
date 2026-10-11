@@ -1,0 +1,34 @@
+# Notices
+
+The Python agent-wallet reference is licensed under MIT or Apache-2.0, at your option
+(`LICENSE-MIT`, `LICENSE-APACHE`).
+
+Copyright (c) 2026 AwokenLazarus
+
+It includes or builds on the work below. Each keeps its own licence and copyright.
+
+## Included in this repository
+
+### electrs
+
+`docs/electrs-0.11.1-knots-29.4.2-rpc.patch` is a patch against electrs
+(<https://github.com/romanz/electrs>, MIT licence, Copyright (C) 2018, Roman Zeyde) for a Knots
+29.4.2 RPC. The header and proof-of-work code in this tree was written for this project and
+checked against that lineage.
+
+### libsecp256k1
+
+Channel signatures are verified through the `xbt402` reference's `coincurve` backend, which builds
+libsecp256k1 (<https://github.com/bitcoin-core/secp256k1>, MIT licence, Copyright (c) 2013 Pieter
+Wuille).
+
+### Bitcoin Knots test vectors
+
+`tests/vectors/` holds header vectors captured from a Bitcoin Knots BLAKE2b regtest node and used
+to test the header code. They are recorded chain data.
+
+## Python libraries
+
+The tests install the packages in `requirements.txt` (mcp, anyio, cryptography) and import the
+`xbt402` reference. They are not vendored. Their licence texts must accompany any distribution
+that includes them.
