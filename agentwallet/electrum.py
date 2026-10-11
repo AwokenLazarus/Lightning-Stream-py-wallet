@@ -39,6 +39,13 @@ Trust (see docs/B2_CHAIN_BACKEND.md for the full threat model):
     forces one header sync at most. A server is asked only for the transactions it listed itself,
     in parallel with the others; the first it does not supply, or that cannot belong to the
     script, ends its list and flags it. Connecting costs one timeout for TCP and TLS together.
+  * AGP-097. Every entry that makes requests runs under one call budget (`_budget`: `call` and
+    `proven_spend`). A scan asks for the script's history once and for the coins' proofs in one
+    write per server (`_spends`, `_prove_ahead`). A request is written by one deadline (`_write`).
+    A request the call's deadline cuts short, or leaves no time for, hangs up on nobody and flags
+    nobody (`Late`); one that goes a whole timeout unanswered still does. A claim above a server's
+    tip is a lie only against a tip it reported in the sync this call forced (`_Call.round`); an
+    error about the method ("Method not found", JSON-RPC -32601) is never "not there".
 What a malicious server can still do: hide a transaction (a close, a funding) from us until another
 server or a block shows it; if every configured server hides it, gettxout reads it as absent, which
 is why a close is booked on `proven_spend` and not on that. It can make calls fail or slow, never
@@ -58,9 +65,11 @@ import itertools
 import json
 import socket
 import ssl
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -96,11 +105,13 @@ NOTIFY_SLACK = 16 << 10            # bytes a line may hold beyond what the pendi
 VALUE_SLACK = 64                   # the same, in JSON values
 MAX_HISTORY = 10_000               # entries of one script in one server's get_history or listunspent answer
 MAX_TX_BYTES = 1_000_000           # a transaction above this (raw) is not fetched
+TX_BATCH = 16                      # proof requests written to one server together (`_prove_ahead`)
 TX_CACHE_BYTES = 32 << 20          # raw bytes of verified transactions kept; the oldest leave first
 SYNC_DEADLINE_TIMEOUTS = 4         # the default sync_deadline, in request timeouts
 CALL_DEADLINE_TIMEOUTS = 4         # the default call_deadline, in request timeouts
 # a server's words for "I have no such transaction" and "it is not in that block"
 NOT_THERE = ("no such", "not found", "not in block", "not confirmed", "no transaction", "missing")
+METHOD_NOT_FOUND = -32601          # JSON-RPC 2.0: the server has no such method
 NODE_ONLY = {
     "getbalances", "getbalance", "sendtoaddress", "listunspent", "createrawtransaction", "fundrawtransaction",
     "signrawtransactionwithwallet", "getnewaddress", "generatetoaddress", "generatetodescriptor", "generateblock",
@@ -132,6 +143,12 @@ class Unknown(ElectrumError):
     """A server did not answer, so "not there" is not known (AGP-092): nothing is concluded from it."""
 
 
+class Late(ElectrumError):
+    """The call's own deadline came before a request was sent, or before its answer (AGP-097). The
+    deadline is shared by every server of the call, so this says nothing about the one that was
+    being asked: it is not flagged and not hung up on for it."""
+
+
 class _OffCheckpoint(HeaderError):
     pass
 
@@ -139,8 +156,14 @@ class _OffCheckpoint(HeaderError):
 def says_not_there(e: Exception) -> bool:
     """A server's own "I have no such transaction" (or, asked for a proof, "it is not in that block").
     Any other error is no answer: busy, rate-limited, gone, or a wording not known here, which fails
-    closed."""
-    return isinstance(e, ServerError) and any(w in str(e).lower() for w in NOT_THERE)
+    closed.
+
+    An error that speaks of the method is one of those (AGP-097): "Method not found" is JSON-RPC's
+    answer for a method the server does not serve, and two of the words ("not found", "missing")
+    are in it. Such a server has said nothing about this transaction. `ElectrumConnection` puts the
+    error code -32601 into the same words when the server's own do not name the method."""
+    m = str(e).lower()
+    return isinstance(e, ServerError) and "method" not in m and any(w in m for w in NOT_THERE)
 
 
 @dataclass
@@ -151,12 +174,16 @@ class _Call:
     deadline: float
     synced: bool = False
     gone: set = field(default_factory=set)
+    # The sync round this call itself ran when it forced one (0: none, or it found another sync in
+    # flight and ran nothing). Only against a tip a server reported in that round, or a later one,
+    # is a claim above the server's tip a lie (AGP-097).
+    round: int = 0
 
     def left(self, conn) -> float:
-        """The wait for the next request: the request timeout, or less when the deadline is nearer."""
+        """The wait for a connect: the request timeout, or less when the deadline is nearer."""
         t = self.deadline - time.monotonic()
         if t <= 0:
-            raise ElectrumError("call deadline")
+            raise Late("call deadline")
         return min(conn.timeout, t)
 
     @property
@@ -211,6 +238,10 @@ class _Pending:
     cap: AnswerCap
     done: threading.Event = field(default_factory=threading.Event)
     msg: dict | None = None
+    # Its caller stopped waiting at a deadline that was not the server's (`request_by`): the slot
+    # stays so that an answer that still comes is within what the connection allows, and goes when
+    # the answer or the end of the connection does.
+    kept: bool = False
 
 
 @dataclass(frozen=True)
@@ -330,9 +361,11 @@ class ElectrumConnection:
             except OSError:
                 pass
             s.close()
-        for slot in list(self._pending.values()):
+        for rid, slot in list(self._pending.items()):
             slot.msg = {"error": {"message": why}, "closed": True}      # ours, not the server's words
             slot.done.set()
+            if slot.kept:                    # nobody waits for it and no answer can come now
+                self._pending.pop(rid, None)
 
     def _allowance(self) -> AnswerCap:
         """What the next line may hold: the caps of the requests now pending and the slack for a
@@ -388,39 +421,126 @@ class ElectrumConnection:
             if slot is not None:
                 slot.msg = m
                 slot.done.set()
+                if slot.kept:                # its caller gave up at the call's deadline: dropped unread
+                    self._pending.pop(rid, None)
             elif m.get("method") and self.on_notify:
                 try:
                     self.on_notify(self, m["method"], m.get("params") or [])
                 except Exception:
                     pass
 
+    def _write(self, s, line: bytes, timeout: float) -> None:
+        """Write `line`, all of it, within `timeout` seconds.
+
+        The rule (AGP-097): **a request is written by one deadline, however slowly the server
+        reads, or not at all.** The socket has no timeout of its own (its reader blocks on it), and
+        `sendall` on it waited for as long as the server did not read: a broadcast larger than the
+        socket buffers was held for good, under the signer's lock. Each `send` here gets what is
+        left of the deadline as the socket's send timeout (SO_SNDTIMEO: sends only, the reader is
+        untouched). Where that option cannot be set, a timer hangs up at the deadline, which ends
+        the write. A write that fails leaves a line half written: the caller hangs up."""
+        deadline = time.monotonic() + timeout
+        view, guard = memoryview(line), None
+        try:
+            while view:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("the request was not written by its deadline")
+                if guard is None:
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                                     struct.pack("@ll", int(left), max(1, int((left % 1) * 1_000_000))))
+                    except (OSError, AttributeError, struct.error):
+                        guard = threading.Timer(left, self.close, args=("write deadline",))
+                        guard.daemon = True
+                        guard.start()
+                view = view[s.send(view):]
+        finally:
+            if guard is not None:
+                guard.cancel()
+
     def request(self, method: str, *params, timeout: float | None = None):
+        """One request. A server that does not answer within `timeout` (the request timeout if None)
+        is hung up on; the next request reconnects."""
+        got = self._exchange([(method, params)], self.timeout if timeout is None else timeout, False)[0]
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    def request_by(self, deadline: float, method: str, *params):
+        """One request of a call whose requests all end at `deadline` (monotonic).
+
+        The rule (AGP-097): **a server is hung up on only for a request that went a whole timeout
+        unanswered.** The call's deadline is shared by every server it asks. A request it leaves no
+        time for is not sent, and one it cuts short is given up without hanging up: the time was
+        used up elsewhere (by another server, as a rule), and hanging up would cost this server a
+        reconnect and a flag for nothing it did. Both raise `Late`. Before, the second ended as a
+        timeout: the server was dropped and flagged."""
+        got = self.batch_by(deadline, [(method, params)])[0]
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    def batch_by(self, deadline: float, reqs: list) -> list:
+        """`request_by` for several requests written together: [(method, params)] -> each one's
+        result, or the exception it would have raised."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return [Late(f"{self.url}: the call's deadline came before {m} was sent") for m, _ in reqs]
+        return self._exchange(reqs, min(self.timeout, left), left < self.timeout)
+
+    def _exchange(self, reqs: list, timeout: float, shared: bool) -> list:
+        """Write `reqs` and wait `timeout` seconds in all for their answers. `shared`: the wait was
+        shortened by a deadline that is not this server's own; when it runs out the requests are
+        given up (`Late`) and the connection stays."""
         if self._sock is None:
             self.connect(timeout)
-        rid = next(self._ids)
-        slot = _Pending(answer_cap(method, params))
-        self._pending[rid] = slot
+        until = time.monotonic() + timeout
+        slots = []
+        for method, params in reqs:
+            rid = next(self._ids)
+            slots.append((rid, method, _Pending(answer_cap(method, params)),
+                          json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": list(params)})))
+            self._pending[rid] = slots[-1][2]
+        out, lost = [], None
         try:
-            line = (json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": list(params)}) + "\n").encode()
             with self._wlock:
                 s = self._sock
                 if s is None:
                     raise ElectrumError(f"{self.url}: not connected")
-                s.sendall(line)
-            if not slot.done.wait(self.timeout if timeout is None else timeout):
-                self.close()        # a server that stops answering is dropped; the next request reconnects
-                raise ElectrumError(f"{self.url}: {method} timed out")
+                self._write(s, "".join(line + "\n" for _, _, _, line in slots).encode(), max(until - time.monotonic(), 0.001))
+            for rid, method, slot, _ in slots:
+                msg = None
+                if lost is None and not slot.done.wait(max(until - time.monotonic(), 0)):
+                    if shared:
+                        lost = Late(f"{self.url}: the call's deadline came before the answer to {method}")
+                    else:
+                        self.close()    # a server that stops answering is dropped; the next request reconnects
+                        lost = ElectrumError(f"{self.url}: {method} timed out")
+                elif slot.done.is_set():
+                    msg = slot.msg
+                if msg is None:
+                    slot.kept = isinstance(lost, Late)
+                    out.append(lost)
+                elif msg.get("error"):
+                    err = msg["error"]
+                    words = str(err.get("message") if isinstance(err, dict) else err)[:400]
+                    # an error about the method says nothing about what was asked for: its code is
+                    # put in words when the server's own leave the method out (`says_not_there`)
+                    if isinstance(err, dict) and err.get("code") == METHOD_NOT_FOUND and "method" not in words.lower():
+                        words = f"method not found: {words}"
+                    out.append((ElectrumError if msg.get("closed") else ServerError)(words))
+                else:
+                    out.append(msg.get("result"))
         except OSError as e:
             self.close()
             raise ElectrumError(f"{self.url}: {type(e).__name__}") from e
         finally:
-            self._pending.pop(rid, None)
-        msg = slot.msg or {}
-        if msg.get("error"):
-            err = msg["error"]
-            kind = ElectrumError if msg.get("closed") else ServerError
-            raise kind(str(err.get("message") if isinstance(err, dict) else err)[:400])
-        return msg.get("result")
+            for rid, _, slot, _ in slots:
+                # kept only while an answer can still come (one that came meanwhile is done with)
+                if not slot.kept or slot.done.is_set() or self._sock is None:
+                    self._pending.pop(rid, None)
+        return out
 
     def subscribe(self, method: str, *params, timeout: float | None = None):
         self._subs[(method, tuple(params))] = None
@@ -478,6 +598,8 @@ class ElectrumBackend:
         self._sync_gate = threading.Lock()       # the one sync in flight; never held by a caller that only reads
         self._flag_lock = threading.Lock()
         self._last_sync = 0.0
+        self._round = 0                          # sync rounds started (only under _sync_gate)
+        self._tip_round: dict[str, int] = {}     # server url -> the round in which it last reported its tip
         self._tip_dirty = True
         self._changed = threading.Event()
         self._watched: set[str] = set()
@@ -512,10 +634,27 @@ class ElectrumBackend:
             return list(ex.map(run, conns))
 
     def _call(self) -> _Call:
-        """The budget of the call this thread is answering (`call` sets it; a method used on its own
-        gets one of its own)."""
+        """The budget of the call this thread is answering (`_budget` sets it; a helper used with
+        none set gets one of its own, for that one step)."""
         cur = getattr(self._tl, "call", None)
         return cur if cur is not None else _Call(time.monotonic() + self.call_deadline)
+
+    @contextmanager
+    def _budget(self):
+        """One call's budget for everything this thread does inside the block.
+
+        The rule (AGP-097): **every entry into the backend that makes requests runs under one
+        budget**: one deadline for all its requests, one forced header sync, one try at a server
+        that is down. `call` set it; `proven_spend`, which the refund's evidence calls directly,
+        did not, so each of its steps had a deadline of its own and each height a server claimed
+        forced a sync of its own. Entered inside another budget it is that budget."""
+        outer = getattr(self._tl, "call", None)
+        if outer is None:
+            self._tl.call = _Call(time.monotonic() + self.call_deadline)
+        try:
+            yield self._tl.call
+        finally:
+            self._tl.call = outer
 
     def _all_answer(self, answered: int) -> bool:
         """Did every configured server answer? Only then is "none of them shows it" an answer. A server
@@ -533,7 +672,9 @@ class ElectrumBackend:
             self.server_state[c.url].update(proto=c.proto, server=c.server_id)
             for sh in list(self._watched):
                 c.subscribe("blockchain.scripthash.subscribe", sh, timeout=call.left(c))
-        down = [c for c in self.conns if not c.connected and c.url not in call.gone]
+        # a call whose time is over reaches for nobody: a server that is down would only be
+        # flagged for a connect it was given no time for
+        down = [] if call.over else [c for c in self.conns if not c.connected and c.url not in call.gone]
         for c, r in zip(down, self._each(down, up)):
             if isinstance(r, Exception):
                 self._flag(c, f"unreachable: {r}")
@@ -551,6 +692,17 @@ class ElectrumBackend:
             self._flag(conn, f"{method}: {e}")
             raise
 
+    def _ask_by(self, call: _Call, conn, method, *params):
+        """`_ask` inside a call's deadline: a request the deadline cuts short (`Late`) is not the
+        server's doing and is not flagged."""
+        try:
+            return conn.request_by(call.deadline, method, *params)
+        except Late:
+            raise
+        except ElectrumError as e:
+            self._flag(conn, f"{method}: {e}")
+            raise
+
     def _on_notify(self, conn, method: str, params) -> None:
         if method == "blockchain.headers.subscribe":
             self._tip_dirty = True
@@ -560,19 +712,29 @@ class ElectrumBackend:
     def sync(self, force: bool = False) -> int:
         """Bring the header chain up to the most-work tip any live server shows; returns our tip. With a
         verified chain, a call that finds another sync in flight answers from the chain as it is."""
+        self._sync_round(force)
+        return self._believable()
+
+    def _sync_round(self, force: bool = False) -> int:
+        """`sync` without the answer: the number of the round this call ran, 0 when none was due or
+        another sync was in flight (then nothing was run, and the chain is as it was)."""
+        ran = 0
         if force or self._tip_dirty or time.time() - self._last_sync >= self.sync_interval or not self.headers.ready:
             if self._sync_gate.acquire(blocking=not self.headers.ready):
                 try:
-                    self._sync_now()
+                    ran = self._sync_now()
                 finally:
                     self._sync_gate.release()
-        return self._believable()
+        return ran
 
-    def _sync_now(self) -> None:
+    def _sync_now(self) -> int:
+        """One sync round; returns its number."""
         self._tip_dirty = False
+        self._round += 1
+        this = self._round
         live = self._live(_Call(time.monotonic() + self.sync_deadline))
         off_chain = []
-        for c, r in zip(live, self._each(live, self._sync_from)):
+        for c, r in zip(live, self._each(live, lambda c: self._sync_from(c, this))):
             if isinstance(r, _OffCheckpoint):
                 off_chain.append(f"{c.url}: {r}")
                 self._flag(c, f"headers: {r}")
@@ -587,6 +749,7 @@ class ElectrumBackend:
         if not self.headers.ready and off_chain:
             raise CheckpointMismatch(f"no server is on the {self.chain} checkpoint "
                                      f"{self.headers.cp_height}:{self.headers.cp_hash[:16]}.. ({'; '.join(off_chain)[:300]})")
+        return this
 
     def _implausible(self) -> str | None:
         p = self.plausibility
@@ -617,7 +780,7 @@ class ElectrumBackend:
         except (HeaderError, ElectrumError, ValueError, AttributeError) as e:
             raise _OffCheckpoint(str(e)) from e
 
-    def _sync_from(self, conn) -> None:
+    def _sync_from(self, conn, round_no: int = 0) -> None:
         """One server's part of a sync round. It ends at `sync_deadline`, and at the first answer
         with fewer headers than asked for below the tip the server claims; either way the headers
         proven by then are adopted and the server is flagged (by the caller, from what is raised)."""
@@ -641,6 +804,7 @@ class ElectrumBackend:
         th = int(tip["height"])
         tip_h = parse_header(bytes.fromhex(tip["hex"]))
         self.server_state[conn.url].update(tip=th, tip_hash=tip_h.hash)
+        self._tip_round[conn.url] = round_no
         cp = self.headers.cp_height
         if th < cp:
             raise _OffCheckpoint(f"server tip {th} is below the checkpoint {cp}")
@@ -721,7 +885,7 @@ class ElectrumBackend:
         live = self._live(call)
 
         def get(c):
-            return c.request("blockchain.transaction.get", txid, timeout=call.left(c))
+            return c.request_by(call.deadline, "blockchain.transaction.get", txid)
 
         silent = []
         ex = ThreadPoolExecutor(max_workers=len(live))
@@ -733,7 +897,8 @@ class ElectrumBackend:
                     raw = f.result()
                 except Exception as e:       # noqa: BLE001 - judged per server just below
                     if not says_not_there(e):
-                        self._flag(c, f"transaction.get: {e}")
+                        if not isinstance(e, Late):      # the call ran out of time: not its doing
+                            self._flag(c, f"transaction.get: {e}")
                         silent.append(c.url)
                     continue
                 tx = self._verify_raw(txid, raw)
@@ -767,7 +932,7 @@ class ElectrumBackend:
         """One server's get_history or listunspent answer for a script, or None when it has none we
         can use: no answer, or more than MAX_HISTORY entries (flagged)."""
         try:
-            rows = self._ask(conn, method, sh, timeout=call.left(conn)) or []
+            rows = self._ask_by(call, conn, method, sh) or []
         except ElectrumError:
             return None
         name = method.rsplit(".", 1)[-1]
@@ -856,17 +1021,29 @@ class ElectrumBackend:
         def part(c) -> bool:
             """True when the server went silent."""
             todo = work[c]
+            # Was this server asked for anything in this part? Only then is running into the
+            # call's deadline flagged (a list too long, or supplied too slowly). A server whose
+            # part began when the time was already used up was never asked (AGP-097).
+            asked = False
+
+            def late(n: int) -> bool:
+                if asked:
+                    self._flag(c, f"transaction.get: {len(todo) - n} of the transactions it listed were not "
+                                  f"supplied by the call deadline ({self.call_deadline:g} s)")
+                return True
+
             for n, txid in enumerate(todo):
                 if txid in self._tx:
                     continue
                 if call.over:
-                    self._flag(c, f"transaction.get: {len(todo) - n} of the transactions it listed were not "
-                                  f"supplied by the call deadline ({self.call_deadline:g} s)")
-                    return True
+                    return late(n)
+                asked = True
                 try:
-                    raw = c.request("blockchain.transaction.get", txid, timeout=call.left(c))
+                    raw = c.request_by(call.deadline, "blockchain.transaction.get", txid)
                 except ServerError:
                     raw = None
+                except Late:
+                    return late(n)
                 except ElectrumError as e:
                     self._flag(c, f"transaction.get: {e}")
                     return True
@@ -895,6 +1072,57 @@ class ElectrumBackend:
         for c in liars.values():
             self._flag(c, "get_history lists a transaction that neither pays nor spends the script")
 
+    @staticmethod
+    def _proves(txid: str, hdr, height: int, m) -> str:
+        """Does the server's get_merkle answer tie the transaction to our header at `height`? ""
+        when it does, else why not."""
+        try:
+            root = merkle_root_from_proof(txid, list(m["merkle"]), int(m["pos"]), hdr.txcount)
+            at = int(m.get("block_height", height))
+        except (HeaderError, KeyError, TypeError, ValueError, AttributeError) as e:
+            return str(e) or type(e).__name__
+        return "" if root == hdr.merkle_root and at == height else "proof does not reach our header"
+
+    def _prove_ahead(self, items: list) -> None:
+        """Ask every server, in one write each and all servers at once, for the proofs of the claims
+        it made about `items` ([(txid, claims)]) at heights we hold a header for, and keep those
+        that hold. Nothing is judged here: a claim this leaves unproven is asked for again, judged
+        and flagged by `_confirmed`, one request at a time.
+
+        Why (AGP-097): a scan proved its coins one request after another, each from the first
+        server that claimed it. With N coins that is N round trips to one server inside one call
+        deadline, so a server that answers every request well inside the timeout still used the
+        deadline up, and the scan of an address with many coins failed."""
+        call = self._call()
+        work: dict = {}
+        for txid, claims in items:
+            if txid in self._conf:
+                continue
+            for c, height in claims:
+                hdr = self.headers.at(height) if height > 0 else None
+                if hdr is not None:
+                    work.setdefault(c, []).append((txid, height, hdr))
+
+        def part(c) -> None:
+            todo = work[c]
+            for at in range(0, len(todo), TX_BATCH):
+                # proven by another server meanwhile: not asked for again
+                want = [w for w in todo[at:at + TX_BATCH] if w[0] not in self._conf]
+                if not want or call.over:
+                    continue
+                answers = c.batch_by(call.deadline, [("blockchain.transaction.get_merkle", (t, h)) for t, h, _ in want])
+                for (txid, height, hdr), m in zip(want, answers):
+                    if isinstance(m, Exception) or self._proves(txid, hdr, height, m):
+                        continue
+                    with self._cache_lock:
+                        # kept only with its transaction, and while its block is on our chain
+                        mine = self.headers.at(height)
+                        if txid in self._tx and mine is not None and mine.hash == hdr.hash:
+                            self._conf[txid] = (height, hdr.hash)
+
+        conns = list(work)
+        self._each(conns, part)
+
     def _confirmed(self, txid: str, claims: list) -> tuple:
         """(status, checked). status: (height, blockhash) once a Merkle proof ties txid to our header
         at a claimed height; 0 if only mempool claims remain; None if no claim holds. `checked` is
@@ -915,31 +1143,36 @@ class ElectrumBackend:
             hdr = self.headers.at(height)
             if hdr is None and not call.synced:
                 call.synced = True
-                self.sync(force=True)
+                call.round = self._sync_round(force=True)
+                self._believable()
                 hdr = self.headers.at(height)
             if hdr is None:
-                # above its own tip it is a lie; at or below, a block we could not fetch: not known
-                own_tip = (self.server_state.get(c.url) or {}).get("tip")
+                # The rule (AGP-097): a claim is a lie only against a tip the server reported after
+                # it made the claim. That is a tip it reported in the round this call forced, or in
+                # a later one. When the forced sync found another in flight and ran nothing, or the
+                # server did not report its tip in our round, the tip we hold for it is older than
+                # its claim: a block may have come in between (both servers then list it,
+                # truthfully). That is "not known", never "above the tip it reports". Before, the
+                # old tip was used, the claim was called a lie and the lookup answered "not there".
+                fresh = call.round and self._tip_round.get(c.url, 0) >= call.round
+                own_tip = (self.server_state.get(c.url) or {}).get("tip") if fresh else None
+                # above the tip it then reported it is a lie; at or below, a block we could not
+                # fetch: not known
                 if own_tip is not None and height > int(own_tip):
                     self._flag(c, f"get_history: {txid[:16]}.. at height {height}, above the tip it reports")
                 else:
                     checked = False
                 continue
             try:
-                m = self._ask(c, "blockchain.transaction.get_merkle", txid, height, timeout=call.left(c))
+                m = self._ask_by(call, c, "blockchain.transaction.get_merkle", txid, height)
             except ElectrumError as e:
-                # "not in that block", in its own words, withdraws its claim (flagged by _ask); busy,
-                # gone or silent leaves the claim unjudged
+                # "not in that block", in its own words, withdraws its claim (flagged by _ask_by);
+                # busy, gone, silent or cut short by the call's deadline leaves the claim unjudged
                 checked = checked and says_not_there(e)
                 continue
-            try:
-                root = merkle_root_from_proof(txid, list(m["merkle"]), int(m["pos"]), hdr.txcount)
-                at = int(m.get("block_height", height))
-            except (HeaderError, KeyError, TypeError, ValueError, AttributeError) as e:
-                self._flag(c, f"get_merkle {txid[:16]}@{height}: {e}")
-                continue
-            if root != hdr.merkle_root or at != height:
-                self._flag(c, f"get_merkle {txid[:16]}@{height}: proof does not reach our header")
+            why = self._proves(txid, hdr, height, m)
+            if why:
+                self._flag(c, f"get_merkle {txid[:16]}@{height}: {why}")
                 continue
             with self._cache_lock:
                 if txid in self._tx:                    # evicted meanwhile: proven, but not kept
@@ -974,17 +1207,23 @@ class ElectrumBackend:
         spks = [o.script_pubkey for o in tx.outputs if o.script_pubkey and o.script_pubkey[0] != 0x6A]
         return spks[:2]
 
-    def _spender(self, txid: str, vout: int, spk: bytes, *, mempool: bool) -> tuple[str, int] | None:
-        """(spending txid, height or 0) from the union of the script's histories. A confirmed spend
-        comes before a mempool one, which is returned only with `mempool`.
+    def _spends(self, spk: bytes) -> _Hist:
+        """The union of the servers' histories of `spk`, with the transactions it lists fetched and
+        the invented ones flagged: what the search for a spend reads. One round of requests for a
+        script, however many of its outputs are then looked at."""
+        hist = self._history(spk)
+        self._supply(hist, spk)
+        self._flag_invented(spk, hist)
+        return hist
+
+    def _spender(self, hist: dict, txid: str, vout: int, *, mempool: bool) -> tuple[str, int] | None:
+        """(spending txid, height or 0) from the union of the script's histories (`_spends`). A
+        confirmed spend comes before a mempool one, which is returned only with `mempool`.
 
         This search does not wait for every server: a spend that only a silent server lists, or whose
         proof went unanswered, is not reported. Were it an error, one server could hold a refund back
         by listing a spend and never proving it; the answer "unspent" can only be acted on by a
         broadcast, which the network refuses if it is wrong."""
-        hist = self._history(spk)
-        self._supply(hist, spk)
-        self._flag_invented(spk, hist)
         unconfirmed = None
         for t in sorted(hist):
             stx = self._tx.get(t)
@@ -1006,14 +1245,16 @@ class ElectrumBackend:
         funding. `spk` is the outpoint's script, so the question can be asked while the funding
         transaction itself is hidden; without it the transaction is fetched for it (Unknown if no
         server supplies it)."""
-        self.sync()
+        self.sync()                         # the header sync has its own deadline; the call's starts after it
         txid, vout = str(txid).lower(), int(vout)
-        if spk is None:
-            tx = self._fetch_tx(txid)
-            if tx is None or not 0 <= vout < len(tx.outputs):
-                raise Unknown(f"no server shows transaction {txid[:16]}..: whether its output is spent is not known")
-            spk = tx.outputs[vout].script_pubkey
-        return self._spender(txid, vout, bytes.fromhex(spk) if isinstance(spk, str) else bytes(spk), mempool=False)
+        with self._budget():                # as `call` does (AGP-097): it is called on its own
+            if spk is None:
+                tx = self._fetch_tx(txid)
+                if tx is None or not 0 <= vout < len(tx.outputs):
+                    raise Unknown(f"no server shows transaction {txid[:16]}..: whether its output is spent is not known")
+                spk = tx.outputs[vout].script_pubkey
+            hist = self._spends(bytes.fromhex(spk) if isinstance(spk, str) else bytes(spk))
+            return self._spender(hist, txid, vout, mempool=False)
 
     def _address(self, spk: bytes) -> str | None:
         if len(spk) in (22, 34) and spk[0] in (0x00, 0x51) and spk[1] == len(spk) - 2:
@@ -1056,12 +1297,8 @@ class ElectrumBackend:
             raise LightBackendError(f"{method} is not served by the light Electrum backend")
         if m in ("gettxout", "gettxspendingprevout", "getrawtransaction", "scantxoutset"):
             self.sync()                     # the header sync has its own deadline; the call's starts after it
-        outer = getattr(self._tl, "call", None)
-        self._tl.call = _Call(time.monotonic() + self.call_deadline)
-        try:
+        with self._budget():
             return fn(*params)
-        finally:
-            self._tl.call = outer
 
     def _rpc_getblockchaininfo(self):
         tip = self.sync()
@@ -1108,7 +1345,7 @@ class ElectrumBackend:
                               "did not answer for it (see verification_failures)")
             return None
         out = tx.outputs[int(vout)]
-        if self._spender(str(txid).lower(), int(vout), out.script_pubkey, mempool=False):
+        if self._spender(self._spends(out.script_pubkey), str(txid).lower(), int(vout), mempool=False):
             return None                      # proven spent (a mempool-only spend is not proof: see docstring)
         height = st[0] if isinstance(st, tuple) else 0
         tip = self.headers.tip()
@@ -1124,7 +1361,7 @@ class ElectrumBackend:
             row = {"txid": txid, "vout": vout}
             tx = self._fetch_tx(txid)
             if tx is not None and vout < len(tx.outputs):
-                sp = self._spender(txid, vout, tx.outputs[vout].script_pubkey, mempool=True)
+                sp = self._spender(self._spends(tx.outputs[vout].script_pubkey), txid, vout, mempool=True)
                 if sp:
                     row["spendingtxid"] = sp[0]
             res.append(row)
@@ -1150,7 +1387,7 @@ class ElectrumBackend:
         call = self._call()
         for c in self._live(call):
             try:
-                got = c.request("blockchain.transaction.broadcast", hex_tx, timeout=call.left(c))
+                got = c.request_by(call.deadline, "blockchain.transaction.broadcast", hex_tx)
             except ElectrumError as e:
                 errors.append(str(e))
                 continue
@@ -1188,6 +1425,16 @@ class ElectrumBackend:
             for (txid, _), cl in claims.items():
                 listed.setdefault(txid, []).extend(x for x in cl if not any(k is x[0] for k, _ in listed[txid]))
             silent = self._supply(listed)
+            # The rule (AGP-097): what a scan asks a server for does not grow with the number of
+            # coins beyond what each coin needs once. The call's deadline covers the whole scan,
+            # and anyone can add coins to an address by paying it dust. So the coins' proofs are
+            # asked for in one write per server (`_prove_ahead`), and the script's history, which
+            # every coin's search for a spend reads, once for the scan (`_spends`). Before, every
+            # server was asked for the whole history once per coin and the proofs came one request
+            # at a time: with 20 coins, one honest server a third of the timeout late made every
+            # scan fail.
+            self._prove_ahead([(t, cl) for t, cl in sorted(listed.items()) if t in self._tx])
+            hist = None                         # asked for once, when a coin needs it
             # A coin a server lists is left out only on an answer: the server does not supply its
             # transaction, the output does not pay the script, the claims were checked and none is a
             # proof, or a confirmed spend is proven. If the server went silent instead, the scan
@@ -1209,7 +1456,9 @@ class ElectrumBackend:
                         raise Unknown(f"whether a block holds transaction {txid[:16]}.. is not known: a server "
                                       "did not answer for it")
                     continue
-                if self._spender(txid, n, spk, mempool=False):
+                if hist is None:
+                    hist = self._spends(spk)
+                if self._spender(hist, txid, n, mempool=False):
                     continue
                 value = tx.outputs[n].value
                 total += value
@@ -1227,7 +1476,7 @@ class ElectrumBackend:
         call = self._call()
         for c in self._live(call):
             try:
-                fee = float(self._ask(c, "blockchain.estimatefee", int(blocks), timeout=call.left(c)))
+                fee = float(self._ask_by(call, c, "blockchain.estimatefee", int(blocks)))
             except (ElectrumError, TypeError, ValueError):
                 continue
             if fee > 0:
@@ -1247,6 +1496,8 @@ class ElectrumBackend:
                 for sh in new:
                     try:
                         c.subscribe("blockchain.scripthash.subscribe", sh, timeout=call.left(c))
+                    except Late:
+                        pass                    # no time left in this call (as before, minus the flag)
                     except ElectrumError as e:
                         self._flag(c, f"subscribe: {e}")
             self._watched.update(new)
