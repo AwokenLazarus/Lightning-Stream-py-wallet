@@ -433,7 +433,8 @@ class UnprovenClose(unittest.TestCase):
             if honest:                                 # the close spends the funding on our own node
                 self.rpc.utxos.pop((rec.funding_txid, 0))
                 self.rpc.spenders[(rec.funding_txid, 0)] = "cc" * 32
-                self.rpc.txs["cc" * 32] = {"txid": "cc" * 32, "hex": "", "vout": []}
+                # AGP-095: in a block (a close that is only in the mempool is no longer "proven")
+                self.rpc.txs["cc" * 32] = {"txid": "cc" * 32, "hex": "", "vout": [], "confirmations": 1}
             return 200, {}, json.dumps({"txid": "cc" * 32, "cum": 0, "unpaidMsat": 0}).encode()
 
         p = mock.patch.object(XbtChannelClient, "http", staticmethod(http))
@@ -486,7 +487,8 @@ class UnprovenClose(unittest.TestCase):
         s.handle({"method": "close_channel", "params": {"counterparty": API}})
         self.rpc.utxos.pop((rec.funding_txid, 0))      # the close reaches our node after all, under another txid
         self.rpc.spenders[(rec.funding_txid, 0)] = "dd" * 32
-        self.rpc.txs["dd" * 32] = {"txid": "dd" * 32, "hex": "", "vout": []}
+        self.rpc.txs["dd" * 32] = {"txid": "dd" * 32, "hex": "", "vout": [], "confirmations": 1}   # AGP-095: in a block,
+        self.rpc.height += 1                                                                      # the next one
         acts = s.handle({"method": "watch_tick"})["actions"]
         self.assertEqual([a.get("close_proven") for a in acts if "close_proven" in a], ["dd" * 32])
         got = s.channels.get(API)

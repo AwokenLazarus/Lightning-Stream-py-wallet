@@ -223,10 +223,13 @@ class ForwardSession(Xbt402Session):
     def _delivered(self, dest: str, tx, via: str = "http"):
         with self.book._lock, self.fwd.lock:
             p = self.fwd.data["pending"].pop(dest)
-            rec = self.book._records[dest]
-            rec.used_sats = max(rec.used_sats, p["cum"])
-            rec.spent_sats = max(rec.spent(), p["cum"])
-            self.book._persist()
+            rec = self.book._records.get(dest)
+            if rec is not None and rec.chan == p["chan"]:
+                rec.used_sats = max(rec.used_sats, p["cum"])
+                rec.spent_sats = max(rec.spent(), p["cum"])
+                self.book._persist()
+            else:       # AGP-095: the lot's channel was replaced; the dest's record is another channel
+                self.book.raise_archived_used_locked(p["chan"], p["cum"])
             self.fwd.data["delivered"][p["offer"]["outpoint"]] = {
                 "txid": tx.txid(), "hex": tx.hex(), "deliverHeight": p["offer"]["deliverHeight"], "price": p["price"],
                 "chan": p["chan"], "cum": p["cum"], "via": via, "dest": dest, "at": p.get("at", time.time())}
@@ -250,7 +253,12 @@ class ForwardSession(Xbt402Session):
         with self.fwd.lock:
             pend = dict(self.fwd.data["pending"])
         for dest, p in pend.items():
-            rec = self.book.get(dest)
+            # AGP-095 (audit item 9), the rule: **a lot belongs to the channel its pre-signature was
+            # made on, and is settled by what happens to that channel's funding.** The lookup was by
+            # dest, which is the dest's current channel: once the lot's channel was closed and a
+            # plain call opened the next one, the close that paid for the lot was answered "closes no
+            # channel with a pending forward purchase", and the transfer it carries was never built.
+            rec, live = self.book.record_of_chan(p["chan"])
             inp = spent.get((rec.funding_txid, rec.funding_vout)) if rec else None
             if inp is None:
                 continue
@@ -260,7 +268,8 @@ class ForwardSession(Xbt402Session):
                 if y is not None:
                     tx = transfer_with(lot, y)
                     if tx is not None:
-                        self.book.mark_closed(dest, close_txid)
+                        if live:
+                            self.book.mark_closed(dest, close_txid)
                         self._delivered(dest, tx, via=f"close {close_txid}")
                         return {"recovered": True, "dest": dest, "outpoint": p["offer"]["outpoint"], "price": p["price"],
                                 "chan": p["chan"], "cum": p["cum"],
@@ -273,12 +282,21 @@ class ForwardSession(Xbt402Session):
                 return {"recovered": False, "void": False, "unconfirmed": True, "dest": dest, "chan": p["chan"], "cum": p["cum"],
                         "reason": "this close is not in a block yet: the lot stays pending and booked; ask again "
                                   "once a close has confirmed"}
-            self.book.mark_closed(dest, close_txid)
+            if live:
+                self.book.mark_closed(dest, close_txid)
             with self.fwd.lock:
                 self.fwd.data["pending"].pop(dest, None)
                 self.fwd.data["void"][p["offer"]["outpoint"]] = {"close": close_txid, "cum": p["cum"], "lot": p}
                 self.fwd.save()
-            return {"recovered": False, "dest": dest, "void": True, "chan": p["chan"], "cum": p["cum"],
+            # AGP-095 (audit item 17): what this close, in a block, pays away from us, as a cumulative
+            # amount: every output that is not our change, plus the close fee where the payee's output
+            # carries it. A state other than the lot's may have closed the channel (a stream's
+            # hash-locked last chunk, a routed lock), and the release of the lot's booking must leave
+            # what it was paid.
+            paid = sum(int(o.value) for o in close.outputs if o.script_pubkey.hex() != rec.payer_spk)
+            if rec.close_fee_payer == "payee":
+                paid += int(rec.close_fee)
+            return {"recovered": False, "dest": dest, "void": True, "chan": p["chan"], "cum": p["cum"], "paid": paid,
                     "reason": "the close does not carry the adaptor state: the lot was not paid for"}
         return {"recovered": False, "reason": "the transaction closes no channel with a pending forward purchase"}
 

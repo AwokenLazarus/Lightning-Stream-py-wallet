@@ -241,8 +241,10 @@ class Treasury:
         """CSV recovery of one recorded funding (the current one unless `outpoint` names another, from
         `outpoints()`): valid once that UTXO is older(csv). Signed 0x21."""
         op = outpoint or {"txid": self.funding_txid, "vout": self.funding_vout, "capacity": self.capacity}
-        if not op["txid"] or op["capacity"] <= fee:
+        if not op["txid"]:
             raise RuntimeError("treasury is not funded")
+        if op["capacity"] <= fee:
+            raise RuntimeError(f"this funding holds {op['capacity']} sat, not more than the {fee} sat fee")
         tx = Tx(
             version=2,
             inputs=[TxIn(bytes.fromhex(op["txid"])[::-1], op["vout"], sequence=self.csv)],

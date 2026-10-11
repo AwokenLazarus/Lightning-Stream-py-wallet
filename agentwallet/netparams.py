@@ -108,17 +108,19 @@ def block_of(rpc, txid: str, vout: int) -> tuple[int, str] | None:
     return height, rpc.call("getblockhash", height)
 
 
-def find_spender(rpc, txid: str, vout: int, from_height: int = 0, *, limit: int = SPENDER_SCAN_MAX) -> str | None:
-    """The txid spending (txid, vout): the mempool first (gettxspendingprevout), then the blocks from
-    `from_height` on (at most `limit` of them, newest last). Works on a pruned node for blocks it
-    still has; None if not found."""
+def mempool_spender(rpc, txid: str, vout: int) -> str | None:
+    """The mempool transaction spending (txid, vout): gettxspendingprevout, which a node answers for
+    mempool spends only. None: none there, or a node without the call."""
     try:
         r = rpc.call("gettxspendingprevout", [{"txid": txid, "vout": int(vout)}])
-        sp = (r[0] or {}).get("spendingtxid") if r else None
-        if sp:
-            return sp
+        return ((r[0] or {}).get("spendingtxid") if r else None) or None
     except Exception:
-        pass
+        return None
+
+
+def block_spender(rpc, txid: str, vout: int, from_height: int = 0, *, limit: int = SPENDER_SCAN_MAX) -> str | None:
+    """The transaction that spent (txid, vout) in a block, from `from_height` on (at most `limit`
+    blocks, newest last). Works on a pruned node for blocks it still has; None if not found."""
     if from_height <= 0:
         return None
     try:
@@ -135,3 +137,24 @@ def find_spender(rpc, txid: str, vout: int, from_height: int = 0, *, limit: int 
                 if vin.get("txid") == txid and int(vin.get("vout", -1)) == int(vout):
                     return tx.get("txid")
     return None
+
+
+def spent_in_mempool_only(rpc, txid: str, vout: int) -> bool:
+    """AGP-095: (txid, vout) is spent, by this node's view, only by a transaction that is in no block:
+    the output is still in the confirmed UTXO set, or a mempool transaction is named as its spender.
+    Such a spend may never be mined. A node that cannot be asked answers False (the caller's other
+    checks decide)."""
+    try:
+        if rpc.call("gettxout", txid, int(vout), False):
+            return True
+    except Exception:
+        pass
+    return mempool_spender(rpc, txid, vout) is not None
+
+
+def find_spender(rpc, txid: str, vout: int, from_height: int = 0, *, limit: int = SPENDER_SCAN_MAX) -> str | None:
+    """The txid spending (txid, vout): the mempool first (gettxspendingprevout), then the blocks from
+    `from_height` on (at most `limit` of them, newest last). Works on a pruned node for blocks it
+    still has; None if not found. A caller that must know the spend is in a block asks
+    `block_spender`."""
+    return mempool_spender(rpc, txid, vout) or block_spender(rpc, txid, vout, from_height, limit=limit)

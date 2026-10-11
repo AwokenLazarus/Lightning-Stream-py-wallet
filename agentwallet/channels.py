@@ -233,6 +233,35 @@ class ChannelBook:
         with self._lock:
             return dest in self._records
 
+    def record_of_chan(self, chan: str) -> tuple[ChannelRecord | None, bool]:
+        """AGP-095: the record of the channel `chan`, wherever it is: (the live record, True), or
+        (the newest archived one, False) once a later channel to the same dest replaced it, or
+        (None, False). A lookup by dest answers the dest's current channel, which is another one
+        after a replacement."""
+        with self._lock:
+            for r in self._records.values():
+                if r.chan == chan:
+                    return ChannelRecord(**asdict(r)), True
+            for a in reversed(self._archived):
+                if a.get("chan") == chan:
+                    try:
+                        return ChannelRecord(**a), False
+                    except TypeError:
+                        return None, False
+        return None, False
+
+    def raise_archived_used_locked(self, chan: str, cum: int) -> None:
+        """AGP-095: a forward lot recovered after its channel was replaced: the archived record's
+        signed and spent amounts reach the lot's state, as a live record's would. The caller holds
+        the book's lock."""
+        for a in reversed(self._archived):
+            if a.get("chan") == chan:
+                a["used_sats"] = max(int(a.get("used_sats") or 0), int(cum))
+                spent = int(a.get("spent_sats", -1))
+                a["spent_sats"] = max(spent if spent >= 0 else int(a.get("used_sats") or 0), int(cum))
+                self._persist()
+                return
+
     def find_dest(self, counterparty: str) -> str | None:
         """Resolve an origin, dest, or channel id to the book key."""
         from .policy import normalize_dest

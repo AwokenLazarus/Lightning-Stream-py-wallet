@@ -167,14 +167,28 @@ def load_public_key(path: Path) -> bytes:
     return x2b(raw.decode("ascii"))
 
 
+class SigExpired(RuntimeError):
+    """A human signature whose expiry is behind the highest clock the used-signature file has seen."""
+
+
 class UsedSigs:
     """AGP-089, the rule for human signatures: **one signed message authorises one operation, once.**
     Every message the human signs carries an expiry and no nonce, so whoever held a signature could
     run its operation again until it expired (a second sweep, a second treasury funding). The
     message's hash is written here, fsynced, before its operation runs, and a message found here is
-    refused. Entries leave when their expiry has passed (the expiry check refuses them from then on).
-    Keyed by the message, not the signature bytes, so another encoding of a signature is the same
-    entry. A file that cannot be read refuses the operation: it is never taken for empty."""
+    refused. Keyed by the message, not the signature bytes, so another encoding of a signature is the
+    same entry. A file that cannot be read refuses the operation: it is never taken for empty.
+
+    AGP-095 (audit item 16): **an entry leaves only when its expiry is behind the highest clock this
+    file has seen, and a message whose expiry is behind that clock is refused.** Entries were dropped
+    by the wall clock alone, so after a step back (a wrong RTC at boot, an NTP correction) a used and
+    pruned signature was inside its window again and ran a second time. The highest clock is written
+    with every use (`clock`), in the same write that prunes.
+
+    Limit, not fixed: a file that is missing is an empty one. Whoever can delete it can also write an
+    empty one, so refusing a missing file would only stop an accident (a run directory restored from
+    before a signature was used), and the note that "this wallet has used signatures" would have to
+    live in that same directory."""
 
     def __init__(self, path):
         import threading
@@ -182,23 +196,32 @@ class UsedSigs:
         self.path, self._lock = Path(path), threading.Lock()
 
     def spend(self, message: bytes, expiry: int, now: float) -> bool:
-        """Record `message` as used. False: it was used before."""
+        """Record `message` as used. False: it was used before. Raises SigExpired when its expiry is
+        behind the highest clock this file has seen (it may be a used entry that was pruned)."""
         import hashlib
         import json
         from .keystore import write_private
         with self._lock:
-            used = {}
+            used, seen = {}, 0
             if self.path.exists():
                 try:
-                    used = json.loads(self.path.read_text(encoding="utf-8"))["used"]
+                    doc = json.loads(self.path.read_text(encoding="utf-8"))
+                    used = doc["used"]
+                    seen = doc.get("clock", 0)       # a file from before AGP-095 has none: it starts at this call's
                     if not isinstance(used, dict):
                         raise ValueError("used is not an object")
-                except (OSError, ValueError, KeyError, TypeError) as e:
+                    if isinstance(seen, bool) or not isinstance(seen, (int, float)):
+                        raise ValueError("clock is not a number")
+                except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
                     raise RuntimeError(f"{self.path}: unreadable, so no human-signed operation runs") from e
             key = hashlib.sha256(message).hexdigest()
             if key in used:
                 return False
-            used = {k: v for k, v in used.items() if isinstance(v, (int, float)) and v >= now}
+            clock = max(int(seen), int(now))
+            if int(expiry) < clock:
+                raise SigExpired("the signature expired by the latest time this signer has seen "
+                                 "(its clock has gone back since)")
+            used = {k: v for k, v in used.items() if isinstance(v, (int, float)) and v >= clock}
             used[key] = int(expiry)
-            write_private(self.path, json.dumps({"used": used}, indent=2, sort_keys=True))
+            write_private(self.path, json.dumps({"used": used, "clock": clock}, indent=2, sort_keys=True))
             return True
