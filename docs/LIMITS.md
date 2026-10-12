@@ -5,6 +5,10 @@ design, and what no review has covered, are stated once, in `docs/LIMITS.md` of 
 (Lightning Stream). Every sentence there about the agent wallet, the light client and the
 Lightning rail holds here too, unless this file says otherwise. Read that file first.
 
+Direction, decided on 2026-10-11: Lightning Stream is being rebuilt on Lightning (stream tickets
+on ordinary XBT Lightning channels, in design). The on-chain channel this wallet pays over is
+**frozen**: kept and tested, off the main path, with no new work. The hub was retired on that day.
+
 Status: reference, test networks only. Nobody outside the project has reviewed the fixes that
 followed the external review of October 2026.
 
@@ -41,6 +45,11 @@ the limit holds and fails when someone lifts it.
 - Used as a library, `RouteSigner` keeps a new channel's key in memory until it is attached: an
   embedder that funds the channel and is then refused, or stops, has no key for that funding. The
   wallet's own signer does not open channels this way.
+- The routed signing (`agentwallet/routing.py`, the `routing` policy section, the signer's lock
+  methods) is still in this tree and has nothing to pay: the hub was removed from the channel
+  reference and from the Rust workspace, and the Rust signer no longer answers the lock methods.
+  Its tests run on this wallet's own adaptor code (`agentwallet/fwd/adaptor.py`), since the
+  channel reference no longer has one.
 
 ### Approvals and keys
 
