@@ -36,6 +36,18 @@ PYTHONPATH=".:/path/to/b1" .venv/bin/python -m unittest discover -s tests
 Regtest needs `XBT_BIN` pointing at a Bitcoin Knots 29.4.2 build and a throwaway datadir. Nothing
 here starts a miner on a shared node.
 
+## Credits
+
+The agent's tools are spoken in the Model Context Protocol (Anthropic; now the Agentic AI
+Foundation). Giving an app a wallet connection it may spend from within limits is Nostr Wallet
+Connect's idea (NIP-47); here the limits are an owner-signed policy. The channels are Jeremy
+Spilman's one-way channels, by way of the `xbt402` reference. The header and proof-of-work
+rules follow Bitcoin Knots (maintained by Luke Dashjr, whose BLAKE2b proof of work this is), and
+the light backend talks to electrs by Roman Zeyde. The references, and the prior art of the
+design that replaced the on-chain channel, are in the Rust repository's
+[`docs/REFERENCES.md`](https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/REFERENCES.md).
+Code and data from others, with their licences: `NOTICE`.
+
 ## Licence
 
 MIT OR Apache-2.0. See `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE`.

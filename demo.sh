@@ -131,7 +131,7 @@ STRANGER="$(cli -rpcwallet="$B2_WALLET" getnewaddress "stranger" bech32)"
 export B2_STRANGER="$STRANGER"
 export B2_RECOVERY="$RECOVERY"
 
-# Merchant = secp payee we register so pay() opens a Spillman channel.
+# Merchant = secp payee we register so pay() opens a Spilman channel.
 MERCHANT="$("$B2_PYTHON" - <<'PY'
 import secrets, os, sys
 sys.path.insert(0, os.environ["B1_ROOT"])

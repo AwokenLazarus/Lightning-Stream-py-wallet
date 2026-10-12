@@ -19,8 +19,10 @@ regtest) and accepts a header only when:
 Of competing branches the one with the most work wins (first seen wins a tie). Testnet3, testnet4
 (BIP94) and signet have no rules here: rules_for refuses them, so a light client there fails closed.
 
-The header format and the staged hash port electrs' `headerv2.rs` (the header-v2 patch in
-~/Bitcoin/patches), checked against its published vectors in tests/vectors/.
+The header format and the staged hash port `headerv2.rs` of this project's header-v2 patch to
+electrs 0.11.1 (patches/electrs-0.11.1-header-v2.patch in github.com/AwokenLazarus/Bitcoin; electrs
+is Roman Zeyde's), checked against its published vectors in tests/vectors/. The difficulty rules
+port Bitcoin Knots' src/pow.cpp (MIT; see NOTICE).
 
 `merkle_root_from_proof` checks an Electrum `get_merkle` proof. A v2 header commits the block's
 transaction count, so the proof's depth and position must fit it (no CVE-2017-12842 64-byte
