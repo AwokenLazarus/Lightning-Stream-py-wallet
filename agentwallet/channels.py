@@ -1,4 +1,4 @@
-"""Per-counterparty Spillman channels used as the policy budget.
+"""Per-counterparty Spilman channels used as the policy budget.
 
 The signer holds every payer secret. MCP responses list cap / used / expiry only.
 A channel increment is serialized so concurrent pays cannot exceed the cap.

@@ -13,8 +13,25 @@ It includes or builds on the work below. Each keeps its own licence and copyrigh
 
 `docs/electrs-0.11.1-knots-29.4.2-rpc.patch` is a patch against electrs
 (<https://github.com/romanz/electrs>, MIT licence, Copyright (C) 2018, Roman Zeyde) for a Knots
-29.4.2 RPC. The header and proof-of-work code in this tree was written for this project and
-checked against that lineage.
+29.4.2 RPC. It holds our changed lines with the lines of electrs around them, and is under
+electrs' MIT licence. The header format and staged hash in `agentwallet/headers.py` are a port
+of `headerv2.rs`, a file of our own header-v2 patch to electrs 0.11.1
+(`patches/electrs-0.11.1-header-v2.patch` in <https://github.com/AwokenLazarus/Bitcoin>, MIT).
+
+### Bitcoin Knots: rules ported into the Python
+
+The difficulty and header rules in `agentwallet/headers.py` are our port of Bitcoin Knots'
+(`src/pow.cpp` `GetNextWorkRequired`, `CalculateNextWorkRequired`,
+`PermittedDifficultyTransition`; the checkpoint, assumed-valid block and minimum chain work of
+its chain parameters). Knots (<https://github.com/bitcoinknots/bitcoin>, maintained by Luke
+Dashjr, whose BLAKE2b proof of work this is) is under the MIT licence, Copyright (c) 2009-2025
+The Bitcoin Core developers, Copyright (c) 2009-2025 Bitcoin Developers. `agentwallet/fwd/tx.py`
+ports Knots' unified opt-in signature hash (Kyle Santiago).
+
+### MuSig2
+
+`agentwallet/fwd/musig2.py` is a pure-Python test oracle that follows the algorithms of BIP 327
+(MuSig2) by name. The credit for the scheme is the BIP's authors'.
 
 ### libsecp256k1
 
@@ -24,11 +41,11 @@ Wuille).
 
 ### Bitcoin Knots test vectors
 
-`tests/vectors/` holds header vectors captured from a Bitcoin Knots BLAKE2b regtest node and used
-to test the header code. They are recorded chain data.
+`tests/vectors/` holds header vectors captured from a Bitcoin Knots BLAKE2b regtest node and from
+XBT mainnet through a Knots node, used to test the header code. They are recorded chain data.
 
 ## Python libraries
 
-The tests install the packages in `requirements.txt` (mcp, anyio, cryptography) and import the
-`xbt402` reference. They are not vendored. Their licence texts must accompany any distribution
+The tests install the packages in `requirements.txt`: mcp (MIT), anyio (MIT) and cryptography
+(Apache-2.0 or BSD-3-Clause), and import the `xbt402` reference. They are not vendored. Their licence texts must accompany any distribution
 that includes them.

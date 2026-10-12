@@ -181,7 +181,7 @@ Can (and how it is bounded):
 
 ## Operation notes
 
-- Server requirements: electrs 0.11.1 with `~/Bitcoin/patches/electrs-0.11.1-header-v2.patch`
+- Server requirements: electrs 0.11.1 (by Roman Zeyde) with `patches/electrs-0.11.1-header-v2.patch` from <https://github.com/AwokenLazarus/Bitcoin>
   (protocol 1.8, 164-byte headers) and, for Knots 29.4.2 (the `difficulty` field was renamed
   `difficulty_blake2b`), `docs/electrs-0.11.1-knots-29.4.2-rpc.patch` (raw `getblockchaininfo` and
   `getblock` reads; without it `get_merkle` fails with "failed to get block txids"). The Lazarus hub's
