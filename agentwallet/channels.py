@@ -109,13 +109,14 @@ class ChannelRecord:
     # AGP-063: cumulative sats already in the policy ledger. -1 (a record from before this field)
     # means booked through used_sats, so an upgrade does not book history again. A new channel is 0.
     ledger_booked_sats: int = -1
-    # AGP-021: the one adaptor-locked state out on this channel (a routed payment through a hub):
-    # {cum, pre, r, T, T1, route, at, prev_used}. Written before the pre-signature leaves (write-ahead).
+    # A pre-signed state above used_sats that an earlier version's routed signing (retired with the
+    # hub) left pending: {cum, pre, r, T, T1, route, at, prev_used}. Nothing writes one any more. It is
+    # still read, so such a record keeps its bytes and a plain state below the pre-signed amount is
+    # still refused (ChannelBook._plain_over_lock_locked); the channel is refunded at its expiry.
     pending_lock: dict = field(default_factory=dict)
-    given_up: list = field(default_factory=list)     # recent voided locks {cum, at}: adopt_lock only takes these
-    # AGP-055: the last resolved (or adopted) locks {key, amount, hub, lockId, at}, written with the resolve
-    # itself. RouteSigner books each one (spend row, ledger row) under its key, and at start books any that
-    # a crash left unbooked. key = "lock:<chan>:<cum>": the signer's own id for a lock, never the caller's
+    # As pending_lock: locks an earlier version gave up, and the bookings it kept of its resolved
+    # locks, kept as that version wrote them.
+    given_up: list = field(default_factory=list)
     resolved: list = field(default_factory=list)
     # AGP-022: the close's change to the hot key. "pending" until it is counted ("counted"), proven
     # spent ("spent") or absent ("none"); "" on records from before AGP-022. close_scan_from is the next
@@ -544,162 +545,15 @@ class ChannelBook:
             self._persist()
             return sig
 
-    # --- AGP-021: adaptor-locked states (routed payments) -------------------------------------------
     def _plain_over_lock_locked(self, rec: ChannelRecord, cum: int) -> None:
-        """A plain state under a pending lock would sit below it (refused); one at or above it
-        dominates the lock, which is then no longer pending."""
+        """A plain state under a pending lock (one an earlier version's routed signing left in the
+        record) would sit below it (refused); one at or above it dominates the lock, which is then
+        no longer pending."""
         lk = rec.pending_lock
         if lk and cum < int(lk["cum"]):
             raise ChannelError("lock_outstanding", f"a lock for {lk['cum']} is pending on this channel")
         if lk:
             rec.pending_lock = {}
-
-    def sign_state_adaptor(self, dest: str, cum: int, point: str, route: dict | None = None, *,
-                           booked: bool = False) -> dict:
-        """Pre-sign state(cum) under T1 = T + r*G (T = `point`, the provider's invoice point, r fresh
-        here). One pending lock per channel. (lock, r, T) are persisted before this returns, so a
-        restart can still read t + r off the hub's ch1 close (recover_lock).
-
-        AGP-080 (`booked`, the Rust signer's fields): the lock is written with "booked": true and
-        "booked_sats": what `cum` adds to the channel's booked high-water mark (0 when it rides on an
-        earlier, voided lock), and the record is booked through `cum`. The caller writes the two rows
-        (ledger and routed spend, key lock:<chan>:<cum>) before it hands the pre-signature on; a
-        restart books a lock whose rows a crash lost (`booked_locks`)."""
-        from .routing import adaptor_mod, point_add
-        A = adaptor_mod()
-        with self._lock:
-            rec = self._rec_locked(dest)
-            if rec.pending_lock:
-                raise ChannelError("lock_outstanding", "one adaptor lock per channel at a time")
-            if cum <= rec.used_sats:
-                raise ChannelError("stale_amount", f"a lock must raise the signed amount {rec.used_sats}")
-            if cum > rec.cap_sats:
-                raise ChannelCapError(rec.used_sats, cum - rec.used_sats, rec.cap_sats)
-            payer = self._payer_locked(rec)
-            if cum > payer.params.max_amount:
-                raise ChannelCapError(rec.used_sats, cum - rec.used_sats, payer.params.max_amount)
-            T = A.dec(bytes.fromhex(point))
-            r = secrets.randbelow(ecc.N - 1) + 1
-            T1 = point_add(T, A.point_of(r))
-            z = payer.params.sighash(payer.params.state_tx(cum))
-            delta = max(0, int(cum) - max(rec.used_sats, booked_through(rec)))
-            pre = A.presign(payer.secret, z, T1)
-            rec.pending_lock = {"cum": int(cum), "pre": pre.to_json(), "r": f"{r:064x}", "T": point.lower(),
-                                "T1": A.enc(T1).hex(), "route": dict(route or {}), "prev_used": rec.used_sats,
-                                "at": round(__import__("time").time(), 3),
-                                **({"booked": True, "booked_sats": delta} if booked else {})}
-            if booked:
-                rec.ledger_booked_sats = max(rec.ledger_booked_sats, int(cum))
-            self.audit.record("adaptor_presig", sig=pre.R + pre.s1.to_bytes(32, "big"), chan=rec.chan, dest=rec.dest,
-                              cum=cum, sighash="0x21", point=A.enc(T1).hex(), route=dict(route or {}))
-            self._persist()                                   # write-ahead: before the pre-signature leaves
-            return {"adaptor": pre.to_json(), "point": A.enc(T1).hex(), "tweak": f"{r:064x}", "cum": int(cum)}
-
-    def resolve_lock(self, dest: str, secret: str) -> dict:
-        """The lock was paid: `secret` is t + r (the hub's answer) or t (the provider's receipt). It
-        must open T1 or T. The locked amount becomes the signed (and spent) amount."""
-        from .routing import adaptor_mod
-        A = adaptor_mod()
-        with self._lock:
-            rec = self._rec_locked(dest)
-            lk = rec.pending_lock
-            if not lk:
-                raise ChannelError("no_state", "no pending lock on this channel")
-            y, r = int(secret, 16) % ecc.N, int(lk["r"], 16)
-            if y and A.point_of(y) == A.dec(bytes.fromhex(lk["T1"])):
-                t = (y - r) % ecc.N
-            elif y and A.point_of(y) == A.dec(bytes.fromhex(lk["T"])):
-                t = y
-            else:
-                raise ChannelError("bad_secret", "the secret opens neither T1 nor T")
-            rec.used_sats = max(rec.used_sats, int(lk["cum"]))
-            rec.spent_sats = max(rec.spent(), int(lk["cum"]))
-            rec.acked_sats = rec.used_sats                   # the hub holds the completed state
-            rec.last_sig = ""
-            rec.pending_lock = {}
-            # a lock booked when it was pre-signed (AGP-080) has nothing left to book
-            booking = None if lk.get("booked") else self._note_resolved_locked(
-                rec, int(lk["cum"]), int(lk["cum"]) - int(lk["prev_used"]), lk.get("route") or {})
-            self._persist()
-            return {"t": f"{t:064x}", "cum": int(lk["cum"]), "amount": int(lk["cum"]) - int(lk["prev_used"]),
-                    "route": lk.get("route") or {}, "booking": booking}
-
-    RESOLVED_KEPT = 16
-
-    @staticmethod
-    def _note_resolved_locked(rec: ChannelRecord, cum: int, amount: int, route: dict) -> dict:
-        """Record a resolved lock in its channel record (the caller persists): what there is to book."""
-        booking = {"key": f"lock:{rec.chan}:{cum}", "amount": int(amount), "hub": route.get("hub", ""),
-                   "lockId": route.get("lockId", ""), "at": round(__import__("time").time(), 3)}
-        rec.resolved = (rec.resolved + [booking])[-ChannelBook.RESOLVED_KEPT:]
-        return booking
-
-    def booked_locks(self) -> list[tuple[str, dict]]:
-        """(chan, booking) for every pending or given-up lock that was booked when it was pre-signed
-        (AGP-080) with a non-zero amount: what a restart checks its two ledgers against."""
-        out = []
-        with self._lock:
-            for r in self._records.values():
-                for lk in ([r.pending_lock] if r.pending_lock else []) + list(r.given_up):
-                    if lk.get("booked") and int(lk.get("booked_sats") or 0) > 0:
-                        route = lk.get("route") or {}
-                        out.append((r.chan, {"key": f"lock:{r.chan}:{int(lk['cum'])}", "amount": int(lk["booked_sats"]),
-                                             "hub": route.get("hub", ""), "lockId": route.get("lockId", ""),
-                                             "at": float(lk.get("at") or 0)}))
-        return out
-
-    def resolved_bookings(self) -> list[tuple[str, dict]]:
-        """(chan, booking) for the resolved locks every record still remembers, whatever its state."""
-        with self._lock:
-            return [(r.chan, dict(b)) for r in self._records.values() for b in r.resolved]
-
-    def void_lock(self, dest: str) -> dict:
-        """Give the pending lock up (the hub refused it, or its invoice expired unanswered)."""
-        with self._lock:
-            rec = self._rec_locked(dest)
-            lk, rec.pending_lock = rec.pending_lock, {}
-            if lk:
-                rec.given_up = (rec.given_up + [{"cum": int(lk["cum"]), "prev_used": int(lk.get("prev_used", 0)),
-                                                 "route": lk.get("route") or {}, "at": round(__import__("time").time(), 3),
-                                                 **({"booked": True, "booked_sats": int(lk.get("booked_sats") or 0)}
-                                                    if lk.get("booked") else {})}])[-16:]
-                self._persist()
-            return lk
-
-    def adopt_lock(self, dest: str, cum: int) -> dict:
-        """A lock we gave up was completed after all (the hub read t off the provider's close): its
-        amount is now signed and spent. Only the cum of a lock this book pre-signed is accepted."""
-        with self._lock:
-            rec = self._rec_locked(dest)
-            g = next((g for g in rec.given_up if int(g["cum"]) == int(cum)), None)
-            if g is None:
-                raise ChannelError("bad_amount", "not a lock this wallet pre-signed")
-            if rec.pending_lock:
-                raise ChannelError("lock_outstanding", "resolve or void the pending lock first")
-            amount = max(0, int(cum) - rec.used_sats)
-            rec.used_sats = max(rec.used_sats, int(cum))
-            rec.spent_sats = max(rec.spent(), int(cum))
-            rec.acked_sats = rec.used_sats
-            rec.given_up = [x for x in rec.given_up if x is not g]
-            booking = (self._note_resolved_locked(rec, int(cum), amount, g.get("route") or {})
-                       if amount and not g.get("booked") else None)
-            self._persist()
-            return {"cum": int(cum), "amount": amount, "route": g.get("route") or {}, "booking": booking}
-
-    def recover_lock(self, dest: str, close_witness) -> dict:
-        """After a restart: the hub closed ch1 with our completed pre-signature; t + r is in it."""
-        from .routing import adaptor_mod
-        A = adaptor_mod()
-        with self._lock:
-            lk = dict(self._rec_locked(dest).pending_lock)
-        if not lk:
-            raise ChannelError("no_state", "no pending lock on this channel")
-        pre, T1 = A.PreSig.from_json(lk["pre"]), A.dec(bytes.fromhex(lk["T1"]))
-        for item in close_witness or []:
-            y = A.extract(pre, bytes(item), T1)
-            if y is not None:
-                return self.resolve_lock(dest, f"{y:064x}")
-        raise ChannelError("bad_secret", "this close does not carry our lock")
 
     def resend_state(self, dest: str) -> tuple[ChannelRecord, bytes]:
         """Re-hand the last signed-but-unacknowledged state (same cum, same sig, fresh seq)."""

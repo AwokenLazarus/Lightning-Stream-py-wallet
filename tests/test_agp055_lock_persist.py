@@ -1,13 +1,13 @@
-"""AGP-055: the lock path writes only what changed, and a crash at any write step loses nothing signed.
+"""AGP-055: the wallet's append-only files (the log format and the policy ledger).
 
-  * the keys file is not rewritten by a lock (or any state), only when a key is added or dropped;
-  * a resolved lock is booked once per key, and a restart books one a crash left unbooked;
-  * routed-spend rows and ledger payments are appended (applog.py): one line, one fsync, no rename;
+  * ledger payments are appended (applog.py): one line, one fsync, no rename;
   * a torn last line is cut off at open, a damaged complete line refuses to load, compaction is
-    atomic, and old-format files are converted once (and again safely after a crash in between);
-  * `Crash`: every os.write / os.fsync / os.replace / os.ftruncate of a lock (sign_state_adaptor +
-    resolve_lock) is made the last thing the process does, in turn, both cleanly and with the write
-    torn in half. The wallet is then opened again from its files and checked.
+    atomic, and an old-format ledger is converted once (and again safely after a crash in between);
+  * `Crash`: a write step is made the last thing the process does, both cleanly and with the write
+    torn in half, and the file is then opened again and checked.
+
+The routed-lock half of this file (the routed-spend log, the keys file under a lock, a crash at
+every write step of a lock) went with the routed signing it tested (AGP-128); the file keeps its name.
 """
 
 from __future__ import annotations
@@ -15,22 +15,36 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-from lock_io import HUB, Count, lock, rig
-
 from agentwallet import applog
 from agentwallet import policy as policy_mod
-from agentwallet import routing as routing_mod
 from agentwallet.applog import AppendLog, LogError
 from agentwallet.policy import LedgerEntry, PolicyStore
-from agentwallet.routing import DAY_S, RouteSpend, adaptor_mod, point_add
-from agentwallet.sigaudit import check_chain
 
-A = adaptor_mod()
+
+class Count:
+    """How many fsyncs and renames a block of code makes."""
+
+    def __init__(self):
+        self.fsync = self.replace = 0
+        self._f, self._r = os.fsync, os.replace
+
+    def __enter__(self):
+        def fsync(fd):
+            self.fsync += 1
+            return self._f(fd)
+
+        def replace(*a, **k):
+            self.replace += 1
+            return self._r(*a, **k)
+        os.fsync, os.replace = fsync, replace
+        return self
+
+    def __exit__(self, *exc):
+        os.fsync, os.replace = self._f, self._r
 
 
 class Crash(BaseException):
@@ -134,65 +148,6 @@ class Log(unittest.TestCase):
             self.assertGreater(step, 2)
 
 
-class Spend(unittest.TestCase):
-    def test_add_appends_one_line_with_one_fsync_and_no_rename(self):
-        p = tmpdir() / "routing.json"
-        s = RouteSpend(p)
-        now = time.time()
-        s.add({"at": now, "amount": 5, "chan": "c"})
-        size = p.stat().st_size
-        with Count() as c:
-            s.add({"at": now, "amount": 6, "chan": "c"})
-        self.assertEqual((c.fsync, c.replace), (1, 0))
-        self.assertEqual(p.read_bytes()[size:], applog._line({"at": now, "amount": 6, "chan": "c"}))
-        self.assertEqual(RouteSpend(p).since(now - 1), 11)
-
-    def test_old_format_is_converted_once_and_a_crash_in_between_keeps_every_row(self):
-        now = time.time()
-        rows = [{"at": now - 10, "amount": 3, "chan": "c"}, {"at": now - 5, "amount": 4, "chan": "c"}]
-        step = 0
-        while True:
-            p = tmpdir() / "routing.json"
-            p.write_text(json.dumps({"resolved": rows}))
-            try:
-                with crash_at(step, torn=True):
-                    RouteSpend(p)
-                break
-            except Crash:
-                self.assertEqual(RouteSpend(p).since(now - DAY_S), 7, f"step {step}")
-            step += 1
-        s = RouteSpend(p)
-        self.assertEqual(s.since(now - DAY_S), 7)
-        self.assertEqual(p.read_bytes().split(b"\n")[0], applog.header("route-spend").rstrip())
-
-    def test_a_row_without_its_fields_refuses_to_load(self):
-        p = tmpdir() / "routing.json"
-        for bad in ({"amount": 1}, {"at": 1.0}, {"at": "x", "amount": 1}):
-            p.write_bytes(applog.header("route-spend") + applog._line(bad))
-            with self.assertRaises(LogError):
-                RouteSpend(p)
-
-    def test_window_is_bounded_and_the_file_is_compacted(self):
-        p = tmpdir() / "routing.json"
-        now = time.time()
-        old_every, routing_mod.PRUNE_EVERY = routing_mod.PRUNE_EVERY, 8
-        self.addCleanup(setattr, routing_mod, "PRUNE_EVERY", old_every)
-        s = RouteSpend(p)
-        for i in range(40):                               # 8 days old: outside the 7 day window
-            s.add({"at": now - 8 * DAY_S, "amount": 1, "chan": "old"})
-        for i in range(4):
-            s.add({"at": now, "amount": 10, "chan": "new"})
-        for i in range(8):
-            s.add({"at": now, "amount": 10, "chan": "new"})
-        self.assertEqual(len(s.rows), 12)                 # memory: the window only
-        lines = len(p.read_bytes().splitlines()) - 1      # file: compacted, at most 2 x live + PRUNE_EVERY
-        self.assertTrue(12 <= lines <= 2 * 12 + 8 < 52, lines)
-        self.assertEqual(RouteSpend(p).since(now - DAY_S), 120)
-        with open(p, "ab") as f:
-            f.write(b'{"at": 1')                          # a torn row
-        self.assertEqual(RouteSpend(p).since(now - DAY_S), 120)
-
-
 class Ledger(unittest.TestCase):
     def entry(self, i, ts=None):
         return LedgerEntry(dest="http://api.test", amount_sats=10 + i, ts=ts or 1000.0 + i, txid=f"t{i}", memo="m")
@@ -265,121 +220,6 @@ class Ledger(unittest.TestCase):
             f.write(applog._line({"amend": "nope", "amount_sats": 1}))
         with self.assertRaises(LogError):
             PolicyStore(d / "ledger.json")
-
-
-class Keys(unittest.TestCase):
-    def test_a_lock_does_not_rewrite_the_keys_file_and_a_new_key_does(self):
-        for setup in ("keyfile", "passphrase", "bare"):
-            with self.subTest(setup):
-                r = rig(setup)
-                keys = r.d / "channel_keys.json"
-                before, ino = keys.read_bytes(), keys.stat().st_ino
-                _, y = lock(r.rs, r.chan, 1000, "L1")
-                r.rs.resolve_lock(r.chan, y)
-                r.book.sign_state(HUB, 1500)
-                r.book.fresh_seq(HUB)
-                self.assertEqual((keys.read_bytes(), keys.stat().st_ino), (before, ino))
-                from _agp013 import FakeRpc, fund_channel
-                fund_channel(r.book, FakeRpc(), "http://other.test", secret=0xB0B0)
-                self.assertNotEqual(keys.read_bytes(), before)
-                again = rig(setup, d=r.d, ks=r.ks, chan=r.chan)   # both keys open after a restart
-                again.book.sign_close(HUB)
-                again.book.sign_close("http://other.test")
-
-    def test_fsyncs_per_lock(self):
-        want = {"bare": 5, "keyfile": 9}                  # 2 of each: the directory fsync after a records rename
-        for setup, n in want.items():
-            r = rig(setup)
-            _, y = lock(r.rs, r.chan, 1000, "warm")
-            r.rs.resolve_lock(r.chan, y)
-            with Count() as c:
-                _, y = lock(r.rs, r.chan, 1010, "L")
-                r.rs.resolve_lock(r.chan, y)
-            self.assertEqual((setup, c.fsync), (setup, n))
-
-
-class CrashAtEveryStep(unittest.TestCase):
-    CUM = 2000
-
-    def one(self, step: int, torn: bool) -> tuple[bool, int]:
-        """A wallet with one resolved lock; the next lock dies at `step`. Returns (lock finished, syscalls)."""
-        r = rig("keyfile", ledger=2)
-        first, y = lock(r.rs, r.chan, 1000, "L0")
-        r.rs.resolve_lock(r.chan, y)
-        seq0 = r.book.get(HUB).seq
-        spent0, paid0 = r.rs.spend.since(0), len(r.rs.engine.store.payments())
-        out = secret = None
-        resolved = False
-        tag = f"step {step} torn={torn}"
-        try:
-            with crash_at(step, torn=torn) as seen:
-                out, secret = lock(r.rs, r.chan, self.CUM, "L1")
-                r.rs.resolve_lock(r.chan, secret)
-                resolved = True
-        except Crash:
-            pass
-        r.rs.spend._log.close()
-        r.rs.engine.store._log.close()
-
-        b = rig("keyfile", d=r.d, ks=r.ks, chan=r.chan)   # the restart: every file loads
-        rec = b.book.get(HUB)
-        lk = rec.pending_lock
-        self.assertTrue(check_chain(b.d / "signatures.jsonl")["ok"], tag)
-        self.assertGreaterEqual(rec.seq, seq0, tag)
-        if out is not None:                               # a pre-signature left: its record is durable
-            self.assertTrue(rec.used_sats == self.CUM or lk.get("pre") == out["adaptor"], tag)
-        if lk:                                            # a pending lock is whole, and logged
-            self.assertEqual(int(lk["cum"]), self.CUM, tag)
-            self.assertEqual(point_add(A.dec(bytes.fromhex(lk["T"])), A.point_of(int(lk["r"], 16))),
-                             A.dec(bytes.fromhex(lk["T1"])), tag)
-            self.assertEqual(rec.used_sats, 1000, tag)
-            rows = [json.loads(x) for x in (b.d / "signatures.jsonl").read_text().splitlines()]
-            self.assertTrue(any(x["kind"] == "adaptor_presig" and x.get("cum") == self.CUM for x in rows), tag)
-            with self.assertRaises(Exception) as e:       # never a second pre-signature for a state
-                lock(b.rs, b.chan, self.CUM, "again")
-            self.assertEqual(e.exception.code, "lock_outstanding", tag)
-        elif rec.used_sats != self.CUM:
-            self.assertEqual(rec.used_sats, 1000, tag)    # nothing happened
-        spent, paid = b.rs.spend.since(0) - spent0, len(b.rs.engine.store.payments()) - paid0
-        if resolved:
-            self.assertEqual((rec.used_sats, lk), (self.CUM, {}), tag)
-        # AGP-080: a lock is booked when it is pre-signed. One that reached disk (pending, or resolved)
-        # is in both budgets exactly once, whether its rows were written before the crash or by the
-        # restart (b.rs.recovered_bookings); nothing else is booked
-        want = (1000, 1) if lk or rec.used_sats == self.CUM else (0, 0)
-        self.assertEqual((spent, paid), want, tag)
-        again = rig("keyfile", d=r.d, ks=r.ks, chan=r.chan)   # a second restart books nothing more
-        self.assertEqual((again.rs.recovered_bookings, again.rs.spend.since(0) - spent0), (0, want[0]), tag)
-        again.rs.spend._log.close()
-        again.rs.engine.store._log.close()
-        b = rig("keyfile", d=r.d, ks=r.ks, chan=r.chan)
-
-        # the wallet goes on: finish or replace the lock; no nonce and no tweak is used twice
-        if lk and secret:
-            b.rs.resolve_lock(b.chan, secret)
-        elif lk:                                          # on disk, but it never left: the caller gives it up
-            b.rs.void_lock(b.chan)
-        nxt, y = lock(b.rs, b.chan, self.CUM + 500, "L2")
-        b.rs.resolve_lock(b.chan, y)
-        pres = [first, nxt] + ([out] if out else []) + ([{"adaptor": lk["pre"], "tweak": lk["r"]}] if lk else [])
-        uniq = {(p["adaptor"]["R1"], p["tweak"]) for p in pres}
-        self.assertEqual(len({u[0] for u in uniq}), len(uniq), tag)
-        self.assertEqual(len({u[1] for u in uniq}), len(uniq), tag)
-        self.assertEqual(b.book.get(HUB).used_sats, self.CUM + 500, tag)
-        self.assertTrue(check_chain(b.d / "signatures.jsonl")["ok"], tag)
-        return resolved, seen.n
-
-    def test_crash_at_every_write_step_of_a_lock(self):
-        for torn in (False, True):
-            step, total = 0, None
-            while True:
-                done, n = self.one(step, torn)
-                if done:
-                    total = n
-                    break
-                step += 1
-            self.assertEqual(step, total)                 # every syscall of the lock was the last one once
-            self.assertEqual(total, 9 + 7 + 2)            # 9 fsyncs, 7 writes, 2 renames
 
 
 if __name__ == "__main__":
