@@ -4,10 +4,19 @@ Python reference for the Lightning Stream agent wallet: keys stay in a signer pr
 server spends only after the policy engine allows it. Channels use the `xbt402` reference (the
 sibling `b1` tree) and settle as x402 v2 `batch-settlement` on XBT.
 
-**Direction (2026-10-11).** Lightning Stream is being rebuilt on Lightning: it adds stream tickets
-to ordinary XBT Lightning channels (in design, not built; see the Rust repository). The on-chain
-channel this wallet pays over is frozen: kept and tested, off the main path, with no new work.
-The hub was retired the same day and removed from the Rust workspace and from the channel
+**Direction.** On 2026-10-11 Lightning Stream was redirected onto Lightning: it adds stream
+tickets to ordinary XBT Lightning channels, and tickets and a lottery now run end to end on
+regtest in the Rust repository. The on-chain channel this wallet pays over was frozen that day,
+and in October 2026 it was removed from the Rust wallet, which now pays over Lightning only (its
+channel code is in that repository's git history, last at commit `2a31170`). **This Python wallet
+still has the channel rail and nothing else to pay a seller with**: no Lightning rail, no tickets,
+no lottery. It is kept as it is, as the reference the Rust wallet's policy engine, custody formats
+and MCP protocol handling were written against, and gets no new work. The Rust wallet no longer
+has four of this wallet's ten MCP tools (`close_channel`, `xbt402_refund`, `forward_status`,
+`forward_recover`), and its checks against this wallet cover the protocol and the six tools both
+have.
+
+The hub was retired on 2026-10-11 and removed from the Rust workspace and from the channel
 reference. The routed signing that paid through a hub (`agentwallet/routing.py`, the signer's
 lock methods) was removed from this wallet too, as it was from the Rust signer: a `policy.json`
 that still has a `routing` section loads, and the signer says it ignores the section
