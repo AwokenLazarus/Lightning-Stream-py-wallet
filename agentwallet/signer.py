@@ -41,7 +41,7 @@ from .channels import ChannelBook, ChannelCapError
 from .forward import ForwardPolicy, ForwardSession
 from .hot import HotCapError, HotWallet
 from .keystore import KeyStore, KeyStoreError
-from .policy import Payment, PolicyConfig, PolicyEngine, PolicyStore, AuditLog, Verdict, normalize_dest
+from .policy import Payment, PolicyConfig, PolicyEngine, PolicyStore, AuditLog, Verdict, normalize_dest, policy_warnings
 from .rpc import KnotsRpc, KnotsRpcError, KnotsRpcRefused
 
 from xbt402.channel import ChannelError  # noqa: E402  (B1 on sys.path through .channels)
@@ -119,6 +119,10 @@ class Signer:
         cfg_path = self.root / "policy.json"
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
         self.config = PolicyConfig.from_dict(raw)
+        # what the policy file holds that this signer does not act on: said at start and in `health`
+        self.policy_warnings = policy_warnings(raw)
+        for w in self.policy_warnings:
+            print(f"warning: {w}", flush=True)
         self.engine = PolicyEngine(
             self.config,
             PolicyStore(run / "ledger.json"),
@@ -175,9 +179,6 @@ class Signer:
         # AGP-063 W1: the signed increase is committed before the signature is sent.
         self._xbt402.set_spend_book(self._book_signed_delta)
         self._xbt402.set_spend_check(lambda dest, asked, delta: self._floor_check(dest, asked, delta, human=False))
-        from .routing import RoutePolicy, RouteSigner
-        self.routing = RouteSigner(self.channels, RoutePolicy.from_dict(self.config.routing),
-                                   state_path=run / "routing.json", engine=self.engine)
         self._settle_treasury_funding()     # AGP-085: a funding written ahead before a crash
         self._open_tried: dict[str, float] = {}
         self._watch_stop = threading.Event()
@@ -267,6 +268,8 @@ class Signer:
             return sanitize(self._recover_signed(params))
         if method == "health":
             out = {"ok": True, "wallet": self.rpc.wallet, "chain": self.chain, "hrp": self.hrp, "mining": self.mining}
+            if self.policy_warnings:
+                out["warnings"] = list(self.policy_warnings)
             if self.light:
                 out["chain_backend"] = self.rpc.status()
             return out
@@ -305,34 +308,6 @@ class Signer:
         if method == "xbt402_sign_state_a3":
             with self._spend_lock:
                 return sanitize(self._xbt402_sign_state_a3(params))
-        # --- AGP-021: routed (adaptor-locked) states through a hub ------------------------------------
-        if method == "xbt402_sign_state_adaptor":
-            with self._spend_lock:
-                return sanitize(self._xbt402_sign_state_adaptor(params))
-        if method == "xbt402_resolve_lock":
-            with self._spend_lock:
-                try:
-                    return sanitize({"t": self.routing.resolve_lock(params.get("chan") or "", params.get("secret") or "")})
-                except ChannelError as e:
-                    return _deny(e.code, str(e))
-        if method == "xbt402_void_lock":
-            with self._spend_lock:
-                try:
-                    return sanitize({"voided": bool(self.routing.void_lock(params.get("chan") or ""))})
-                except ChannelError as e:
-                    return _deny(e.code, str(e))
-        if method == "xbt402_adopt_lock":
-            with self._spend_lock:
-                try:
-                    self.routing.adopt_lock(params.get("chan") or "", int(params.get("cum") or 0))
-                    return {"adopted": True}
-                except ChannelError as e:
-                    return _deny(e.code, str(e))
-        if method == "xbt402_recover_lock":
-            with self._spend_lock:
-                return sanitize(self._xbt402_recover_lock(params))
-        if method == "routing_status":
-            return sanitize(self.routing.status())
         if method == "close_channel":
             with self._spend_lock:
                 return sanitize(self._close_channel_locked(params))
@@ -1223,33 +1198,6 @@ class Signer:
         if denied:
             return denied
         return {"sig": sig.hex() if isinstance(sig, bytes) else sig}
-
-    def _xbt402_sign_state_adaptor(self, params: dict) -> dict:
-        """AGP-021: pre-sign a routed lock under the routing policy and the ordinary policy engine."""
-        try:
-            chan, cum, point = params.get("chan") or "", int(params.get("cum") or 0), params.get("point") or ""
-            route = params.get("route") if isinstance(params.get("route"), dict) else {}
-            sigaudit.set_rule("policy:routing")
-            out = self.routing.sign_state_adaptor(chan, cum, point, route)
-        except ChannelCapError as e:
-            return _deny("channel_cap", str(e))
-        except ChannelError as e:
-            return _deny(e.code, str(e))
-        except (TypeError, ValueError) as e:
-            return _deny("bad_request", str(e)[:200])
-        return {"verdict": "allow", **out}
-
-    def _xbt402_recover_lock(self, params: dict) -> dict:
-        """After a restart: t + r from the hub's ch1 close (by txid; blockhash on a pruned node)."""
-        from .netparams import get_tx
-        from xbt402.tx import Tx
-        raw = (get_tx(self.rpc, params.get("txid") or "", params.get("blockhash") or "") or {}).get("hex")
-        if not raw:
-            return _deny("unknown_tx", "close transaction not found")
-        try:
-            return {"t": self.routing.recover_lock(params.get("chan") or "", Tx.parse(bytes.fromhex(raw)))}
-        except ChannelError as e:
-            return _deny(e.code, str(e))
 
     def _close_channel_locked(self, params: dict) -> dict:
         raw = params.get("counterparty") or params.get("dest") or params.get("to") or ""

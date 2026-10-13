@@ -1,8 +1,8 @@
 """AGP-080: the wallet side paths the closure audit (AGP-077) found, one test per hole.
 
 W1  every signing path books the signed amount before the signature leaves: 0xA3 states (the audit's
-    failing test, 750a3e8), the stream's hash-locked last chunk, adaptor pre-signatures (routed locks
-    and forward lots). A voided lock releases nothing.
+    failing test, 750a3e8), the stream's hash-locked last chunk, adaptor pre-signatures (forward
+    lots; the routed locks went with the routed signing, AGP-128).
 W3  a close the chain never saw does not stop the refund watcher; `fund_treasury` needs the human's
     signature and a `recover_treasury` signature binds its destination.
 X1  a seller-supplied URL off the origin is refused before any request; a redirect is not followed.
@@ -36,9 +36,6 @@ from xbt402.channel import DERIVATION, ChannelError
 from xbt402.x402_channel import FACILITATOR_VERIFY, SCHEME, XbtChannelClient, b64json, unb64json
 
 API = "http://api.test"
-HUB = "http://hub.test"
-ROUTING = {"hubs": {HUB: {"max_fee_ppm": 5_000, "max_fee_base_msat": 2_000}}, "max_lock_sats": 20_000,
-           "daily_budget_sats": 3_000}
 
 
 def ledger_sum(s: Signer) -> int:
@@ -204,94 +201,6 @@ class SignedAhead(unittest.TestCase):
         t.rpc.txs[r["txid"]]["confirmations"] = 1
         t.s.watch_tick()
         self.assertEqual(ledger_sum(t.s), 0, "our refund spent the funding, in a block: the pre-signature is void")
-
-
-class AdaptorBooking(unittest.TestCase):
-    def setUp(self):
-        from test_routing import invoice_point
-
-        self.point = invoice_point
-        self.rpc = FakeRpc(height=1000)
-        self.s = signer(Path(tempfile.mkdtemp()), self.rpc, routing=ROUTING, allowlist=[API, HUB])
-        self.p = fund_channel(self.s.channels, self.rpc, HUB)
-        self.chan = self.p.channel_id
-
-    def lock(self, cum: int):
-        t, T = self.point()
-        r = self.s.handle({"method": "xbt402_sign_state_adaptor", "params": {
-            "chan": self.chan, "cum": cum, "point": T, "route": {"hub": HUB, "amount": 900, "fee": 2, "lockId": f"L{cum}"}}})
-        return t, r
-
-    def void(self):
-        return self.s.handle({"method": "xbt402_void_lock", "params": {"chan": self.chan}})
-
-    def test_w1_an_adaptor_pre_signature_is_booked_before_it_leaves_and_a_void_does_not_release_it(self):
-        at_sign, real = [], self.s.routing.sign_state_adaptor
-
-        def presign(chan, cum, point, route=None):      # what the route signer hands on: the ledger holds it
-            out = real(chan, cum, point, route)
-            at_sign.append((cum, ledger_sum(self.s)))
-            return out
-
-        self.s.routing.sign_state_adaptor = presign
-        out = []
-        for cum in range(1_000, 5_001, 1_000):        # five pre-signatures, each voided: the hub may hold all five
-            _, r = self.lock(cum)
-            out.append(r.get("rule") or r["verdict"])
-            self.void()
-        self.assertEqual(out[:3], ["allow"] * 3, out)
-        self.assertEqual(out[3:], ["route_daily_budget"] * 2, "the routing budget (3,000) stops the fourth")
-        self.assertTrue(all(held >= cum for cum, held in at_sign), at_sign)
-        self.assertEqual(ledger_sum(self.s), 3_000, "a void released nothing")
-        self.assertEqual(self.s.handle({"method": "routing_status"})["spent_24h_sats"], 3_000)
-        # a lock at a voided cum rides on its booking: one close can claim only one state
-        t, r = self.lock(3_000)
-        self.assertEqual(r["verdict"], "allow", r)
-        self.assertEqual(ledger_sum(self.s), 3_000)
-        secret = (t + int(r["tweak"], 16)) % ecc.N
-        self.assertIn("t", self.s.handle({"method": "xbt402_resolve_lock",
-                                          "params": {"chan": self.chan, "secret": f"{secret:064x}"}}))
-        self.assertEqual(ledger_sum(self.s), 3_000, "the resolve does not book it again")
-        self.assertEqual(self.s.handle({"method": "routing_status"})["spent_24h_sats"], 3_000)
-        self.assertEqual(self.s.channels.get(HUB).used_sats, 3_000)
-        # and a restart books nothing more
-        s2 = Signer(self.s.root, rpc=self.rpc)
-        self.assertEqual((ledger_sum(s2), s2.routing.recovered_bookings), (3_000, 0))
-
-    def test_w1_a_booked_lock_whose_rows_a_crash_lost_is_booked_at_start(self):
-        with mock.patch.object(self.s.routing, "_book", side_effect=RuntimeError("crash")):
-            with self.assertRaises(RuntimeError):
-                self.s.routing.sign_state_adaptor(self.chan, 1_000, self.point()[1], {"hub": HUB, "amount": 900, "fee": 2})
-        lk = self.s.channels.get(HUB).pending_lock
-        self.assertEqual((lk["booked"], lk["booked_sats"], ledger_sum(self.s)), (True, 1_000, 0))
-        self.s.routing.spend._log.close()
-        self.s.engine.store._log.close()
-        s2 = Signer(self.s.root, rpc=self.rpc)
-        self.assertEqual((ledger_sum(s2), s2.routing.recovered_bookings, s2.routing.spend.since(0)), (3_000 // 3, 1, 1_000))
-        self.assertEqual(Signer(self.s.root, rpc=self.rpc).routing.recovered_bookings, 0)
-
-    def test_w1_a_lock_pre_signed_before_the_upgrade_is_booked_when_it_resolves(self):
-        t, r = self.lock(1_000)
-        with self.s.channels._lock:                    # as a book from before AGP-080 left it: no flag, no rows
-            rec = self.s.channels._records[HUB]
-            rec.pending_lock.pop("booked", None)
-            rec.pending_lock.pop("booked_sats", None)
-            rec.ledger_booked_sats = 0
-            self.s.channels._persist()
-        self.s.engine.store.amend(f"lock:{self.chan}:1000", None)
-        self.s.routing.spend.rows.clear()
-        self.s.routing.spend._keys.clear()
-        self.assertEqual(self.s.routing.pending_sats(), 1_000, "an unbooked pending lock counts against the budget")
-        secret = (t + int(r["tweak"], 16)) % ecc.N
-        self.s.handle({"method": "xbt402_resolve_lock", "params": {"chan": self.chan, "secret": f"{secret:064x}"}})
-        self.assertEqual(ledger_sum(self.s), 1_000)
-        self.assertEqual(self.s.handle({"method": "routing_status"})["spent_24h_sats"], 1_000)
-
-    def test_w1_a_plain_state_over_a_booked_lock_books_only_the_rest(self):
-        self.lock(1_000)
-        r = self.s.handle({"method": "sign_state", "params": {"chan": self.chan, "cum": 1_400}})
-        self.assertEqual(r["verdict"], "allow", r)
-        self.assertEqual(ledger_sum(self.s), 1_400)
 
 
 class SellerUrls(unittest.TestCase):

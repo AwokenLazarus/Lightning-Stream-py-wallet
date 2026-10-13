@@ -42,14 +42,29 @@ the limit holds and fails when someone lifts it.
   transaction that spent one of its inputs, and never on the light backend.
 - Stream chunks, the last chunk and forward lots are paid without a signed receipt; each is bound
   by a Merkle proof, a hash lock or a transfer signature instead.
-- Used as a library, `RouteSigner` keeps a new channel's key in memory until it is attached: an
-  embedder that funds the channel and is then refused, or stops, has no key for that funding. The
-  wallet's own signer does not open channels this way.
-- The routed signing (`agentwallet/routing.py`, the `routing` policy section, the signer's lock
-  methods) is still in this tree and has nothing to pay: the hub was removed from the channel
-  reference and from the Rust workspace, and the Rust signer no longer answers the lock methods.
-  Its tests run on this wallet's own adaptor code (`agentwallet/fwd/adaptor.py`), since the
-  channel reference no longer has one.
+- The routed signing that paid through a hub (`agentwallet/routing.py`, the signer's lock methods)
+  was removed with nothing left for it to pay, as it was from the Rust signer. The code is in the
+  git history, last at commit `9fd710f`. What the removal leaves behind:
+  - A policy file that still has a `routing` section loads; the signer ignores the section and
+    says so in a warning, at start and in `health`.
+  - The signer socket no longer answers `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`,
+    `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` or `routing_status`: each is
+    an unknown method.
+  - A channel record that an earlier version left with a pending routed lock keeps it: the signer
+    signs no plain state below the locked amount, and has no method left to complete or give up
+    the lock. The channel is refunded at its expiry.
+  - A lock that an earlier version resolved and had not yet booked when it stopped (a crash
+    between the two writes) is booked by nothing now: the budgets count that one lock's amount
+    short, as the Rust signer's do. Earlier versions booked it at the next start.
+  - `.run/routing.json` (the routed-spend log) is neither read nor written; it can be deleted.
+  - `agentwallet/fwd/adaptor.py` stays: the forward rail signs with it.
+- Nothing a seller wrote is in a result outside `untrusted_provider_response`: the wallet's errors
+  name a seller's error code only when it is one of the protocol's own
+  (`agentwallet.xbt402.PROTOCOL_CODES`; a code is a place for words too), and a stream's id and
+  root only when they are hex. Held by reading the code and by `tests/test_l12_error_text.py`,
+  not by construction; a channel's `open_error` stored by an earlier version is read back as it
+  was written. The Rust repository's `docs/LIMITS.md` ("What a seller wrote") has the rule in
+  full; this wallet has no Lightning rail and no ticket path.
 
 ### Approvals and keys
 
@@ -116,7 +131,7 @@ behaviour and is expected to fail; searching this tree for `open: AGP-102` finds
 
 ## Not reviewed by anyone
 
-The project's fourth audit did not re-read the vault, the anchoring code, the routed-lock code or
+The project's fourth audit did not re-read the vault, the anchoring code or
 the approval code (the fix round it audited had not changed them), and no audit ran this wallet
 against a real node or a real network: every "in a block" result is on a test double. The light backend was run against a simulator and, in one
 script, a regtest Electrum server.

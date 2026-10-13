@@ -8,10 +8,10 @@ sibling `b1` tree) and settle as x402 v2 `batch-settlement` on XBT.
 to ordinary XBT Lightning channels (in design, not built; see the Rust repository). The on-chain
 channel this wallet pays over is frozen: kept and tested, off the main path, with no new work.
 The hub was retired the same day and removed from the Rust workspace and from the channel
-reference. This wallet still carries the routed signing that paid through a hub
-(`agentwallet/routing.py`, the `routing` section of `policy.json`, the signer's lock methods);
-there is no hub left for it to pay, and the Rust signer no longer has it. It is kept here only
-until this reference is brought in line or retired.
+reference. The routed signing that paid through a hub (`agentwallet/routing.py`, the signer's
+lock methods) was removed from this wallet too, as it was from the Rust signer: a `policy.json`
+that still has a `routing` section loads, and the signer says it ignores the section
+(`docs/LIMITS.md` has what the removal leaves behind).
 
 **Status: reference, test networks only.** It has had an internal review, and it carries the fixes that followed an external review of the Rust tree and four follow-up audits of our own; some findings end as stated limits and two items are open (`docs/LIMITS.md`). None of this is an independent audit. Do not
 use it with mainnet funds. The Rust wallet is [Lightning Stream](https://github.com/AwokenLazarus/Lightning-Stream).

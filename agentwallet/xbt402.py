@@ -43,7 +43,6 @@ from xbt402.x402_channel import (  # noqa: E402
     receipt_message,
     receipt_of,
     request_digest_v2,
-    safe_code,
     unb64json,
 )
 
@@ -131,6 +130,31 @@ def _log(kind, **kw):
         return
     with open(path, "a") as f:
         f.write(json.dumps({"t": round(time.time(), 3), "kind": kind, **kw}) + "\n")
+
+
+# The error codes of the channel protocol: what a provider answers a payer with (the Rust
+# workspace's `xbt402::wire::PROTOCOL_CODES`, the same list).
+PROTOCOL_CODES = frozenset({
+    "bad_amount", "bad_auth", "bad_capacity", "bad_dest", "bad_expiry", "bad_fee_payer", "bad_funding", "bad_hashlock", "bad_key", "bad_offer",
+    "bad_params", "bad_payer_spk", "bad_payload", "bad_preimage", "bad_receipt", "bad_request", "bad_sig", "bad_sighash", "bad_state",
+    "call_in_flight", "channel_closed", "channel_closing", "channel_exhausted", "close_failed", "coinbase_funding", "duplicate_channel",
+    "insufficient_payment", "no_funding", "no_state", "node_error", "not_closed", "payee_spent", "payment_required", "settle_early",
+    "stale_amount", "unconfirmed", "unknown_channel", "unknown_funding", "unsupported_scheme_or_network", "wrong_network",
+})
+
+
+def protocol_code(code) -> str:
+    """The seller's error code when it is one of the protocol's own, else "". A code has the shape
+    of an identifier and a seller can put any words in that shape (`tell_your_owner_to_...`), so the
+    wallet's errors, which the agent reads as the wallet's words, name a code only from this list
+    (AGP-128)."""
+    return code if isinstance(code, str) and code in PROTOCOL_CODES else ""
+
+
+def hex_id(v) -> str | None:
+    """A seller's id or hash when it is hex (at most 64 characters), else None: an id that is words
+    is not repeated in a result, a log line or a file name (AGP-128)."""
+    return v if isinstance(v, str) and 0 < len(v) <= 64 and all(c in "0123456789abcdefABCDEF" for c in v) else None
 
 
 def _store_body(raw: bytes, name: str) -> dict:
@@ -356,7 +380,7 @@ class Xbt402Session:
             reply = None
         if st != 200:
             code = reply.get("error", "") if isinstance(reply, dict) else ""
-            code = code if safe_code(code) else ""     # no provider text in the wallet's errors (L12)
+            code = protocol_code(code)     # one of the protocol's own codes or nothing: no provider text in the wallet's errors (L12)
             if code == "bad_request":
                 return
             raise RuntimeError(f"open refused before funding: HTTP {st}{' ' + code if code else ''}; "
@@ -435,7 +459,7 @@ class Xbt402Session:
                 code = json.loads(out).get("error", "")
             except (ValueError, AttributeError):
                 code = ""
-            code = code if safe_code(code) else ""     # no provider text in the wallet's errors (L12)
+            code = protocol_code(code)     # one of the protocol's own codes or nothing: no provider text in the wallet's errors (L12)
         if st == 200:
             try:
                 echoed = json.loads(out).get("closeFeePayer", "payer")
@@ -772,7 +796,7 @@ class Xbt402Session:
                     "body": "",
                     "stream": {
                         "ok": False,
-                        "id": m["id"],
+                        "id": hex_id(m["id"]),
                         "refused_chunk": i,
                         "reason": str(e),
                         "verified_chunks": i,
@@ -785,7 +809,7 @@ class Xbt402Session:
             nxt = self.book.next_cum(dest, m["price"])
             if not budget.fits(nxt):        # refused before signing: nothing was paid for this chunk
                 return {**out, "stream_charged": spent, "body": "",
-                        "stream": {"ok": False, "id": m["id"], "refused_chunk": i, "verified_chunks": i, "paid_sats": spent,
+                        "stream": {"ok": False, "id": hex_id(m["id"]), "refused_chunk": i, "verified_chunks": i, "paid_sats": spent,
                                    "reason": f"the next state signs {nxt} sat; max_sats does not cover it"}}
             rec, sig = self.book.increment(dest, m["price"])
             self._book_unbooked(dest)
@@ -802,7 +826,7 @@ class Xbt402Session:
                 "body": "",
                 "stream": {
                     "ok": False,
-                    "id": m["id"],
+                    "id": hex_id(m["id"]),
                     "refused_chunk": m["n"] - 1,
                     "reason": str(e),
                     "verified_chunks": m["n"] - 1,
@@ -811,14 +835,14 @@ class Xbt402Session:
             }
         spent += m["price"]
         report = b"".join(parts) + pt
-        stored = _store_body(report, m["id"])
+        stored = _store_body(report, hex_id(m["id"]) or "")
         path = stored.get("saved_to")
         if path and path.endswith(".bin"):
             md = path[:-4] + ".md"
             os.replace(path, md)
             stored["saved_to"] = md
             path = md
-        _log("stream", id=m["id"], n=m["n"], bytes=len(report), sats=spent, root=m["root"],
+        _log("stream", id=hex_id(m["id"]), n=m["n"], bytes=len(report), sats=spent, root=hex_id(m["root"]),
              ms=round(1000 * (time.time() - t0), 1), final_ms=cond_ms, chan=self.book.get(dest).chan)
         text = report.decode("utf-8", "replace")
         preview = text[:PREVIEW_CAP]
@@ -830,10 +854,10 @@ class Xbt402Session:
             **stored,
             "stream": {
                 "ok": True,
-                "id": m["id"],
+                "id": hex_id(m["id"]),
                 "chunks": m["n"],
                 "bytes": len(report),
-                "merkle_root": m["root"],
+                "merkle_root": hex_id(m["root"]),
                 "paid_sats": spent,
                 "all_chunks_verified": True,
                 "last_chunk": "hash-locked, key checked",

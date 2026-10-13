@@ -30,14 +30,14 @@ SRC = Path(__file__).resolve().parents[1] / "agentwallet" / "signer.py"
 # every method `Signer._handle` accepts on 7eeedd6, and what authorises it
 DISPATCH = {
     # read-only
-    "balance", "quote_payment", "history", "health", "chain_backend", "channels", "hot_address", "routing_status",
+    "balance", "quote_payment", "history", "health", "chain_backend", "channels", "hot_address",
     "forward_status", "forward_pending", "forward_transfers", "signatures", "anchor_status",
     # policy engine, booked before the signature
-    "pay", "sign_state", "xbt402_pay", "xbt402_sign_state_a3", "xbt402_sign_state_adaptor", "open_channel",
+    "pay", "sign_state", "xbt402_pay", "xbt402_sign_state_a3", "open_channel",
     # human signature
     "approve", "recover_vault", "fund_treasury", "recover_treasury", "rotate_hot_key", "sweep_hot",
     # unsigned, no new amount (see the audit's table)
-    "fund", "xbt402_request_auth", "xbt402_resolve_lock", "xbt402_void_lock", "xbt402_adopt_lock", "xbt402_recover_lock",
+    "fund", "xbt402_request_auth",
     "close_channel", "xbt402_refund", "refund_channel", "watch_tick", "forward_recover", "notice_hot_txid",
     "anchor_now", "hot_reconcile",
 }
